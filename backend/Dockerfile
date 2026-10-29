@@ -2,7 +2,8 @@ FROM python:3.12-slim
 
 WORKDIR /code
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# The pip the base image ships has known vulnerabilities (pip-audit): a fixed one, pinned like everything else
+RUN pip install --no-cache-dir --upgrade pip==26.2.2 && pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 
 # Run without root; the uploads folder (a volume) belongs to that user
