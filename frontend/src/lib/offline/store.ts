@@ -13,7 +13,7 @@ export interface Snapshot {
     is_kit: boolean; stock: string | null }[];
   price_lists: { id: string; name: string; percent: string; tiers: Record<string, [string, string][]> }[];
   customers: { id: string; full_name: string; price_list_id: string | null }[];
-  payment_methods: { id: string; description: string }[];
+  payment_methods: { id: string; description: string; is_cash: boolean }[];
 }
 
 export interface QueuedSale {

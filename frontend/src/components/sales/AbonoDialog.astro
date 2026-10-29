@@ -9,7 +9,7 @@ interface Props {
   locale: Locale;
   saleId: string;
   balance: number;
-  methods: { id: string; description: string }[];
+  methods: { id: string; description: string; is_cash: boolean }[];
   /** The page to come back to */
   back: string;
   open?: boolean;
@@ -19,7 +19,7 @@ interface Props {
 const { locale, saleId, balance, methods, back, open = false, error } = Astro.props;
 const t = useTranslations(locale);
 const a = t.sales.abono;
-const cash = methods.find((m) => m.description === 'Cash')?.id ?? '';
+const cash = methods.find((m) => m.is_cash)?.id ?? '';
 const label = (d: string) => t.cash.methodNames[d] ?? d;
 ---
 

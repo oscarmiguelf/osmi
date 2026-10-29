@@ -155,3 +155,29 @@ def test_cash_flow(branch):
     assert [h["action"] for h in client.get(f"{base}/history", headers=HA).json()["items"]][:2] == ["RESTORE", "DELETE"]
     for reg in (r1, r2):
         client.delete(f"/cash-registers/{reg['id']}", headers=HA)
+
+
+def test_cash_is_a_flag_not_a_name(branch):
+    """Renaming (or translating) the cash method breaks nothing: it's marked by payment_methods.is_cash."""
+    H = {**A, "X-Branch-Id": branch}
+    methods = client.get("/payment-methods", headers=A).json()
+    cash = next(m for m in methods if m["is_cash"])
+    assert sum(m["is_cash"] for m in methods) == 1 and not cash["is_credit"]
+    reg = client.post("/cash-registers", json={"name": "Caja renombre"}, headers=H).json()
+    client.post(f"/cash-registers/{reg['id']}/occupy", headers=H)
+    client.post(f"/cash-registers/{reg['id']}/movements", json={"movement_type": "Cash In", "payment_method_id": cash["id"], "amount": 100}, headers=H)
+    renamed = client.patch(f"/payment-methods/{cash['id']}", json={"description": f"Efectivo {secrets.token_hex(2)}"}, headers=A)
+    try:
+        assert renamed.status_code == 200
+        cut = client.post(f"/cash-registers/{reg['id']}/cuts", json={"counts": [{"payment_method_id": cash["id"], "counted": 100}],
+                                                                   "withdrawal": 40}, headers=H)
+        assert cut.status_code == 201, cut.text  # the withdrawal comes from the cash, found by its flag
+        left = {b["payment_method_id"]: b for b in client.get(f"/cash-registers/{reg['id']}/balances", headers=H).json()}
+        assert Decimal(str(left[cash["id"]]["balance"])) == 60 and left[cash["id"]]["is_cash"]
+    finally:
+        client.patch(f"/payment-methods/{cash['id']}", json={"description": cash["description"]}, headers=A)
+        client.post(f"/cash-registers/{reg['id']}/occupy", headers=H)
+        client.post(f"/cash-registers/{reg['id']}/movements", json={"movement_type": "Cash Out", "payment_method_id": cash["id"], "amount": 60,
+                                                                   "notes": "Limpieza"}, headers=H)
+        client.post(f"/cash-registers/{reg['id']}/release", headers=H)
+        client.delete(f"/cash-registers/{reg['id']}", headers=H)

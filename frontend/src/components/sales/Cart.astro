@@ -53,7 +53,7 @@ const t = useTranslations(locale);
 const c = t.sales.cart;
 const methodName = (d: string) => t.cash.methodNames[d] ?? d;
 // Cash first (it's the one that gives change), credit last
-const rank = (m: PaymentMethod) => (m.description === 'Cash' ? 0 : m.is_credit ? 2 : 1);
+const rank = (m: PaymentMethod) => (m.is_cash ? 0 : m.is_credit ? 2 : 1);
 ---
 
 <div
@@ -151,7 +151,7 @@ const rank = (m: PaymentMethod) => (m.description === 'Cash' ? 0 : m.is_credit ?
           <div class="charge-total"><span>{c.total}</span><strong class="num" data-ch-total>—</strong></div>
           <div class="methods">
             {[...methods].sort((a, b) => rank(a) - rank(b)).map((m) => {
-              const kind = m.is_credit ? 'credit' : m.description === 'Cash' ? 'cash' : 'other';
+              const kind = m.is_credit ? 'credit' : m.is_cash ? 'cash' : 'other';
               return (
                 <div class="method" data-ch-method={m.id} data-kind={kind}>
                   <label class="method-name" for={`ch-${m.id}`}>{methodName(m.description)}</label>

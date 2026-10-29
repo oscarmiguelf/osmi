@@ -7491,3 +7491,16 @@ ALTER TABLE cash_cuts ADD CONSTRAINT chk_cash_cuts_withdrawn CHECK (withdrawn >=
 INSERT INTO permissions (module_id, code, name)
 SELECT m.id, 'own', 'Only their own appointments' FROM modules m WHERE m.code = 'appointments'
 ON CONFLICT (module_id, code) DO NOTHING;
+
+-- =====================================================================
+-- payment_methods.is_cash: THE cash method (the one that stays in the drawer, takes change, pays expenses from the
+-- register). Marked by a flag, not by its name: renaming "Cash" (or translating it) must not break anything.
+-- At most one, and it can't be the credit method.
+-- =====================================================================
+ALTER TABLE payment_methods ADD COLUMN IF NOT EXISTS is_cash BOOLEAN NOT NULL DEFAULT FALSE;
+UPDATE payment_methods SET is_cash = TRUE
+ WHERE description = 'Cash' AND NOT is_credit AND deleted_at IS NULL
+   AND NOT EXISTS (SELECT 1 FROM payment_methods WHERE is_cash AND deleted_at IS NULL);
+ALTER TABLE payment_methods DROP CONSTRAINT IF EXISTS chk_payment_methods_cash_not_credit;
+ALTER TABLE payment_methods ADD CONSTRAINT chk_payment_methods_cash_not_credit CHECK (NOT (is_cash AND is_credit));
+CREATE UNIQUE INDEX IF NOT EXISTS uq_payment_methods_cash ON payment_methods (is_cash) WHERE is_cash AND deleted_at IS NULL;

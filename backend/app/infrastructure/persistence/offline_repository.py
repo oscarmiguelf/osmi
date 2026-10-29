@@ -44,7 +44,7 @@ class SqlOfflineRepository:
             FROM customers c WHERE c.deleted_at IS NULL ORDER BY c.full_name
         """)
         methods = self._all("""
-            SELECT id, description FROM payment_methods WHERE deleted_at IS NULL AND is_enabled AND NOT is_credit ORDER BY description
+            SELECT id, description, is_cash FROM payment_methods WHERE deleted_at IS NULL AND is_enabled AND NOT is_credit ORDER BY description
         """)
         return {"branch": branch, "products": products, "price_lists": lists, "customers": customers, "payment_methods": methods}
 

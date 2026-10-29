@@ -16,7 +16,7 @@ class OutgoingPaymentsSql:
 
     def lock_cash(self, register_id):
         method = self.session.execute(text(
-            "SELECT id FROM payment_methods WHERE description = 'Cash' AND NOT is_credit AND deleted_at IS NULL")).scalar_one()
+            "SELECT id FROM payment_methods WHERE is_cash AND deleted_at IS NULL")).scalar_one()
         balance = self.session.execute(text("""
             SELECT balance FROM cash_register_balances WHERE cash_register_id = :r AND payment_method_id = :m FOR UPDATE
         """), {"r": register_id, "m": method}).scalar()

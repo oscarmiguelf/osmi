@@ -4,7 +4,6 @@ from app.application.errors import Conflict, Forbidden, Invalid, NotFound
 from app.application.ports.cash_repository import CashRepository
 
 MODULE = "cash"
-CASH = "Cash"  # the payment method that stays in the drawer after a cut (the others are handed in)
 CUT_WITHDRAWAL = "Retiro de corte"
 MANUAL_TYPES = ("Cash In", "Cash Out")  # Sale / Return come from DB triggers; no manual adjustments: corrections are an in or an out
 
@@ -176,7 +175,7 @@ class CashService:
         if missing:
             raise Invalid({"message": "count every payment method that has money in the register", "missing": missing})
         counted = dict(counts)
-        cash = next((mid for mid, m in methods.items() if m["description"] == CASH), None)
+        cash = next((mid for mid, m in methods.items() if m["is_cash"]), None)  # stays in the drawer; the others are handed in
         if withdrawal > (counted.get(cash, Decimal(0)) if cash else Decimal(0)):
             raise Invalid({"message": "the withdrawal is more than the cash counted", "field": "withdrawal",
                            "cash": counted.get(cash, Decimal(0)) if cash else Decimal(0)})

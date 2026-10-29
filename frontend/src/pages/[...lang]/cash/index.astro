@@ -86,8 +86,7 @@ const params = Astro.url.searchParams;
 const time = new Intl.DateTimeFormat(t.intl, { hour: 'numeric', minute: '2-digit', timeZone: session.user.timezone });
 const methodName = (d: string) => ca.methodNames[d] ?? d;
 // Cash first (it's what a register is mostly about), then the rest by their translated name
-const byMethod = (a: string, b: string) => Number(a !== 'Cash') - Number(b !== 'Cash') || methodName(a).localeCompare(methodName(b), t.intl);
-methods.sort((a, b) => byMethod(a.description, b.description));
+methods.sort((a, b) => Number(!a.is_cash) - Number(!b.is_cash) || methodName(a.description).localeCompare(methodName(b.description), t.intl));
 const elsewhere = mySession && branch && mySession.branch_id !== branch.id;
 ---
 

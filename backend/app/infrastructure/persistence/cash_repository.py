@@ -106,7 +106,7 @@ class SqlCashRepository:
             SELECT s.id, s.cash_register_id, s.started_at, r.name AS cash_register, r.branch_id, b.name AS branch,
                    -- cash in the drawer: what an expense or a purchase can take from it
                    COALESCE((SELECT cb.balance FROM cash_register_balances cb JOIN payment_methods pm ON pm.id = cb.payment_method_id
-                              WHERE cb.cash_register_id = r.id AND pm.description = 'Cash'), 0) AS cash_balance
+                              WHERE cb.cash_register_id = r.id AND pm.is_cash), 0) AS cash_balance
             FROM cash_register_sessions s
             JOIN cash_registers r ON r.id = s.cash_register_id
             JOIN branches b ON b.id = r.branch_id
@@ -135,13 +135,13 @@ class SqlCashRepository:
 
     def payment_methods(self, include_disabled):
         return self._all("""
-            SELECT id, description, is_enabled, is_credit FROM payment_methods
+            SELECT id, description, is_enabled, is_credit, is_cash FROM payment_methods
             WHERE deleted_at IS NULL AND (is_enabled OR :all) ORDER BY description
         """, all=include_disabled)
 
     def payment_method(self, method_id):
         return self._one("""
-            SELECT id, description, is_enabled, is_credit FROM payment_methods
+            SELECT id, description, is_enabled, is_credit, is_cash FROM payment_methods
             WHERE id = :id AND deleted_at IS NULL
         """, id=method_id)
 
@@ -158,7 +158,7 @@ class SqlCashRepository:
     def balances(self, register_id):
         # Every method that can hold money here: the enabled ones (0 if never used) plus any with a balance row
         return self._all("""
-            SELECT pm.id AS payment_method_id, pm.description, pm.is_enabled, COALESCE(b.balance, 0) AS balance
+            SELECT pm.id AS payment_method_id, pm.description, pm.is_enabled, pm.is_cash, COALESCE(b.balance, 0) AS balance
             FROM payment_methods pm
             LEFT JOIN cash_register_balances b ON b.payment_method_id = pm.id AND b.cash_register_id = :id
             WHERE pm.deleted_at IS NULL AND NOT pm.is_credit AND (pm.is_enabled OR b.balance IS NOT NULL)

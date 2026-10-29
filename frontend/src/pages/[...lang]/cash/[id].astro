@@ -139,7 +139,7 @@ const time = new Intl.DateTimeFormat(t.intl, { hour: 'numeric', minute: '2-digit
 const methodName = (d: string) => ca.methodNames[d] ?? d;
 // Cash first (it's what a register is mostly about), then the rest by their translated name
 balances.sort((a, b) =>
-  Number(a.description !== 'Cash') - Number(b.description !== 'Cash') || methodName(a.description).localeCompare(methodName(b.description), t.intl));
+  Number(!a.is_cash) - Number(!b.is_cash) || methodName(a.description).localeCompare(methodName(b.description), t.intl));
 const link = (p: Record<string, string | number | undefined>) => {
   const q = new URLSearchParams(Object.entries(p).filter(([, v]) => v !== undefined).map(([k, v]) => [k, String(v)]));
   return `${selfPath}${q.size ? `?${q}` : ''}#movements`;
@@ -415,7 +415,7 @@ const enabledMethods = balances.filter((b) => b.is_enabled);
               ))}
             </tbody>
           </table>
-          <div class="withdrawal" data-cash-id={balances.find((b) => b.description === 'Cash')?.payment_method_id ?? ''}>
+          <div class="withdrawal" data-cash-id={balances.find((b) => b.is_cash)?.payment_method_id ?? ''}>
             <Field label={ca.withdrawal} name="withdrawal" id="cut-withdrawal" inputmode="decimal" autocomplete="off" value={cutWithdrawal}
               placeholder="0.00" hint={ca.withdrawalHint} />
             <Field label={ca.withdrawalReason} name="withdrawal_reason" id="cut-withdrawal-reason" maxlength={200} value={cutReason}

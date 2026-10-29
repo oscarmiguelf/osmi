@@ -28,6 +28,8 @@ export interface PaymentMethod {
   id: string;
   description: string;
   is_enabled: boolean;
+  /** THE cash method (stays in the drawer, takes change); a flag, so renaming it breaks nothing */
+  is_cash: boolean;
   is_credit: boolean;
 }
 
@@ -35,6 +37,8 @@ export interface Balance {
   payment_method_id: string;
   description: string;
   is_enabled: boolean;
+  /** THE cash method (stays in the drawer, takes change); a flag, so renaming it breaks nothing */
+  is_cash: boolean;
   balance: number;
 }
 
