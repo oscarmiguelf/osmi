@@ -1811,6 +1811,7 @@ export default {
     privacyNoticeHint: 'The text patients sign when their record is opened. A copy is kept with each signature.',
   },
   share: {
+    quoteText: 'Hi {name}, here is your quote {folio} from {business}, valid until {date}.',
     whatsapp: 'Send by WhatsApp',
     pdf: 'Download PDF',
     preparing: 'Preparing the PDF…',

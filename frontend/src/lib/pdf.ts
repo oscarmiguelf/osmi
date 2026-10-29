@@ -2,7 +2,8 @@
 import { PDFDocument, rgb, StandardFonts, type PDFFont, type PDFImage } from 'pdf-lib';
 import { fmt, money, type Dict, type Locale } from '@/i18n';
 import type { Prescription } from './clinical';
-import type { Sale } from './sales';
+import { formatPhone } from './customers';
+import type { Quote, Sale } from './sales';
 
 type Align = 'left' | 'center' | 'right';
 type Op = { y: number } & ({ kind: 'text'; text: string; x: number; size: number; font: PDFFont }
@@ -196,6 +197,78 @@ export async function prescriptionPdf(rx: Prescription, t: Dict, timeZone: strin
   f.ops.push({ kind: 'rule', y: f.y, thick: 0.8, x1: f.width - 220, x2: f.width });
   f.y += 4;
   f.text(c.rxSignature, { size: 8.5, x: f.width - 220, width: 220, align: 'center' });
+  f.paint(pdf, W, M, H);
+  return pdf.save();
+}
+
+/** A letter-size quote: the business (logo, branch), folio, dates, customer, lines, totals, notes and the fine print. */
+export async function quotePdf(q: Quote, t: Dict, locale: Locale, timeZone: string, logo: Uint8Array | null) {
+  const qt = t.quotes;
+  const c = t.sales.cart;
+  const title = fmt(qt.detailTitle, { folio: q.folio });
+  const { pdf, regular, bold, img } = await start(title, logo);
+  const [W, H, M] = [612, 792, 54];
+  const f = new Flow(W - 2 * M, regular, bold);
+  const day = new Intl.DateTimeFormat(t.intl, { dateStyle: 'long', timeZone });
+  const m = (n: number) => money(locale, Number(n));
+  // Head: the business on the left (with its logo), the quote on the right
+  const top = f.y;
+  if (img) {
+    f.image(img, 110, 56, 'left');
+    f.y += 4;
+  }
+  f.text(q.branch, { size: 12, bold: true, width: 280 });
+  if (q.branch_address) f.text(q.branch_address, { size: 8.5, width: 280 });
+  if (q.branch_phone) f.text(formatPhone(q.branch_phone), { size: 8.5, width: 280 });
+  const left = f.y;
+  f.y = top;
+  f.text(title, { size: 13, bold: true, align: 'right' });
+  f.text(fmt(qt.issued, { date: day.format(new Date(q.created_at)) }), { size: 9, align: 'right' });
+  f.text(fmt(qt.validLong, { date: day.format(new Date(q.valid_until)) }), { size: 9, bold: true, align: 'right' });
+  f.y = Math.max(left, f.y);
+  f.rule(1.2, 8);
+  f.text(qt.customer.toUpperCase(), { size: 7 });
+  f.text(q.customer ?? qt.noCustomer, { size: 11, bold: true });
+  if (q.customer_phone) f.text(formatPhone(q.customer_phone), { size: 9 });
+  if (q.customer_email) f.text(q.customer_email, { size: 9 });
+  f.y += 10;
+  // Lines: product | quantity | price | amount
+  const cols = [{ x: 0, w: 250 }, { x: 250, w: 90 }, { x: 340, w: 80 }, { x: 420, w: f.width - 420 }];
+  const row = (cells: string[], opts: { size?: number; bold?: boolean } = {}) => {
+    const start = f.y;
+    let end = start;
+    cells.forEach((text, n) => {
+      f.y = start;
+      f.text(text, { ...opts, x: cols[n].x, width: cols[n].w - (n === 0 ? 8 : 0), align: n === 0 ? 'left' : 'right' });
+      end = Math.max(end, f.y);
+    });
+    f.y = end;
+  };
+  row([c.product, c.quantity, c.price, c.lineTotal], { size: 8, bold: true });
+  f.rule(0.6, 3);
+  for (const i of q.items) {
+    row([i.product, `${Number(i.quantity)} ${t.products.unitNames[i.unit] ?? i.unit}`, m(i.unit_price), m(i.line_total)], { size: 9.5 });
+    if (Number(i.discount) > 0) f.text(fmt(qt.lineDiscount, { amount: m(i.discount) }), { size: 8, width: 240 });
+    f.y += 4;
+  }
+  f.rule(0.6, 4);
+  const sums = { x: 300, width: f.width - 300 };
+  const sum = (label: string, value: string, opts: { size?: number; bold?: boolean } = {}) => {
+    const start = f.y;
+    f.text(label, { ...opts, x: sums.x, width: 120 });
+    f.y = start;
+    f.text(value, { ...opts, x: sums.x, width: sums.width, align: 'right' });
+  };
+  sum(c.subtotal, m(q.subtotal), { size: 9.5 });
+  if (Number(q.discount) > 0) sum(c.discount, `-${m(q.discount)}`, { size: 9.5 });
+  sum(c.total, m(q.total), { size: 12, bold: true });
+  sum(qt.taxNote, m(q.tax_breakdown.reduce((s, x) => s + Number(x.tax_amount), 0)), { size: 8 });
+  if (q.notes) {
+    f.y += 12;
+    f.text(q.notes, { size: 9.5 });
+  }
+  f.y += 16;
+  f.text(qt.fine, { size: 7.5 });
   f.paint(pdf, W, M, H);
   return pdf.save();
 }

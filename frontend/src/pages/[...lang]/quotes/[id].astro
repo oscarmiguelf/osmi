@@ -12,6 +12,7 @@ import { formatPhone } from '@/lib/customers';
 import { cancelQuote, getQuote, getSale, quoteHistory, type Quote } from '@/lib/sales';
 import { listPaymentMethods } from '@/lib/cash';
 import AbonoDialog from '@/components/sales/AbonoDialog.astro';
+import WhatsAppShare from '@/components/ui/WhatsAppShare.astro';
 
 import { setFlash, takeFlash } from '@/lib/session';
 import { HIDDEN_MODULES } from '@/i18n/giro';
@@ -96,6 +97,9 @@ const timeline = history.filter((h) => h.entity_type === 'quote').map((h) => ({
     </div>
     <div class="ui-actions">
       <Button variant="secondary" icon="printer" data-print>{t.sales.detail.print}</Button>
+      <WhatsAppShare pdf={`/api/quotes/${id}/pdf?lang=${locale}`} fileName={`cotizacion-${quote.folio}.pdf`} phone={quote.customer_phone}
+        text={fmt(t.share.quoteText, { name: (quote.customer ?? '').split(' ')[0], folio: quote.folio, business: quote.branch,
+          date: day.format(new Date(quote.valid_until)) }).replace(/ ,/, ',')} labels={t.share} />
       {can('quotes', 'create') && <Button variant="secondary" icon="copy" href={`${localePath(locale, '/quotes/new')}?from=${id}`}>{open ? qt.edit : qt.duplicate}</Button>}
       {open && can('quotes', 'update') && (
         <form method="post" data-confirm={qt.cancelText} data-confirm-title={qt.cancelTitle} data-confirm-action={qt.cancel}>

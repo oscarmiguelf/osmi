@@ -1810,6 +1810,7 @@ export default {
     privacyNoticeHint: 'El texto que firma el paciente al abrir su expediente (LFPDPPP). Se guarda una copia con cada firma.',
   },
   share: {
+    quoteText: 'Hola {name}, te compartimos tu cotización {folio} de {business}, vigente hasta el {date}.',
     whatsapp: 'Enviar por WhatsApp',
     pdf: 'Descargar PDF',
     preparing: 'Preparando el PDF…',
