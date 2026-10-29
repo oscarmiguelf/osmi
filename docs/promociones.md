@@ -16,6 +16,8 @@ Una promoción es un descuento que el punto de venta ofrece solo mientras está 
 3. **Empieza** y **Termina:** deja de aplicarse en ese momento.
 4. **Productos** a los que aplica.
 5. **Sucursales:** si no marcas ninguna, aplica en todas.
+6. **Activa:** si la desmarcas, la promoción queda pausada desde el inicio.
+7. **Guardar promoción.**
 
 ## Estados
 
@@ -25,9 +27,12 @@ Las pestañas muestran las promociones **Vigentes**, **Programadas** (empiezan d
 
 - Cuánto se ha usado: renglones vendidos, piezas y descuento dado (sin contar ventas devueltas por completo).
 - **Editar:** los cambios aplican a las ventas nuevas; las pasadas conservan su descuento.
-- **Pausar / activar.**
+- **Pausar** (y luego **Activar**).
+- Los productos a los que aplica.
 - Historial de cambios.
 
-Se eliminan y restauran desde la lista. Eliminar una promoción no cambia las ventas que ya la usaron.
+Se eliminan desde la lista; **Mostrar eliminados** las muestra para restaurarlas. Eliminar una promoción no cambia las ventas que ya la usaron.
 
-En el punto de venta, un renglón lleva una promoción o un descuento manual, no los dos.
+## En el punto de venta
+
+Al agregar un producto con promoción vigente en la sucursal, **el punto de venta la aplica sola**: el renglón muestra la promoción y el descuento. Si no corresponde, en la columna *Promoción o descuento* se cambia a **Sin promoción** o a un descuento manual. Un renglón lleva una promoción o un descuento manual, no los dos.

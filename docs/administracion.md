@@ -6,12 +6,17 @@
 
 **Usuarios** (con el permiso del módulo).
 
+La lista tiene pestañas: **Activos + Suspendidos**, **Activos**, **Suspendidos** y **Eliminados**, y un buscador.
+
 ### Crear un usuario
 
-**Nuevo usuario:** nombre, usuario o correo y contraseña. Si dejas la contraseña vacía se genera una **temporal**, que se muestra una sola vez: cópiala y dásela a la persona. Al entrar, el sistema le pide cambiarla.
+**Nuevo usuario:** nombre, apellidos, correo electrónico y, opcional, una contraseña temporal. Si la dejas vacía se genera una. Al guardar se abre la ficha del usuario con la **contraseña temporal**, que se muestra una sola vez: cópiala y dásela a la persona. Al entrar, el sistema le pide cambiarla.
+
+Un usuario nuevo no tiene sucursales ni módulos: asígnaselos en su ficha para que pueda trabajar.
 
 ### La ficha del usuario
 
+- **Editar:** nombre, apellidos, correo y zona horaria.
 - **Sucursales:** en cuáles puede trabajar. Solo puedes asignar sucursales a las que tú perteneces.
 - **Accesos:** marca cada módulo y lo que puede hacer en él: **Ver**, **Crear**, **Editar**, **Eliminar** y, según el módulo, permisos especiales:
   - **Exportar** (reportes).
@@ -19,21 +24,23 @@
   - **Precios** (productos): precios, listas de precios, paquetes y membresías.
   - **Solo sus citas** (citas): ver solo las citas asignadas a la persona o que ella agendó.
   
-  Solo puedes dar permisos que tú tienes.
-- **Suspender:** la persona no puede entrar y sus sesiones se cierran; su información se conserva.
-- **Resetear contraseña:** genera una contraseña temporal y cierra sus sesiones.
+  Marcar un permiso marca también su módulo; desmarcar el módulo quita sus permisos. Guarda con **Guardar cambios**. Solo puedes dar permisos que tú tienes.
+- **Suspender:** la persona no puede entrar y sus sesiones se cierran; su información se conserva. **Reactivar** la deja entrar de nuevo.
+- **Resetear contraseña:** genera una contraseña temporal, que se muestra una sola vez, y cierra sus sesiones.
 - **Cerrar sus sesiones:** tendrá que volver a entrar en todos sus dispositivos.
-- Su historial de accesos y de cambios.
+- **Sesiones activas**, **Accesos recientes** e **Historial de cambios**.
 
-Los usuarios se eliminan y restauran desde la lista; sus documentos y movimientos se conservan.
+Los usuarios se eliminan desde la lista (el botón de cada renglón) y se restauran desde la pestaña **Eliminados** con **Restaurar**. Sus documentos y movimientos se conservan.
 
 ## Sucursales
 
 **Sucursales → Nueva sucursal:** nombre, **código** (letras y números, hasta 10; aparece en los folios, por ejemplo `SUC1-000123`), teléfono y dirección. Cuando ya se emitieron folios con un código, ya no se puede cambiar.
 
-En la sucursal, **Usuarios asignados**: solo ellos pueden elegirla al entrar. **Asignar usuario** y quitar (no se puede quitar a alguien con trabajo abierto ahí, como una caja ocupada).
+Quien crea la sucursal queda asignado a ella. En la sucursal, **Usuarios asignados**: solo ellos pueden elegirla al entrar. **Asignar usuario** (busca por nombre o correo) y quitar con el botón de cada persona. Lo que registró ahí se conserva. No se puede quitar a alguien con trabajo abierto en la sucursal, como una caja ocupada.
 
-No se puede eliminar una sucursal con productos en existencia, cajas abiertas, conteos abiertos o traspasos en camino. Su historial se conserva y se puede restaurar.
+Las sucursales se eliminan desde la lista; **Mostrar eliminadas** las muestra con su botón **Restaurar**.
+
+No se puede eliminar una sucursal con productos en existencia, cajas abiertas, conteos abiertos o traspasos en camino. Su historial se conserva.
 
 ## Configuración
 
@@ -61,7 +68,8 @@ Es una página para tus clientes, **sin iniciar sesión**, en la dirección de O
 
 - **Nuevo calendario** con nombre, descripción y color.
 - **Nuevo evento:** título, inicio y fin, lugar, cliente (opcional) y descripción.
-- **Compartir:** agrega personas con permiso **Puede editar** (crea, cambia y elimina eventos) o **Solo lectura**.
+- **Compartir:** busca a la persona y elige **Puede editar** (crea, cambia y elimina eventos) o **Solo lectura**. En la misma ventana se ve quién tiene acceso, se cambia su permiso o se le quita el acceso.
+- **Editar:** nombre, descripción, color, o eliminar el calendario.
 - Eliminar un calendario elimina sus eventos para todos con quienes se compartió.
 
 ## Formas de pago y cajas

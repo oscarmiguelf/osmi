@@ -23,7 +23,7 @@ Los precios los pone el sistema: el precio del producto, el de la lista de preci
 
 ## Descuentos y promociones
 
-- **Promociones:** si un producto tiene una promoción vigente (por ejemplo 15 % menos o un 3x2), el punto de venta la ofrece en ese renglón. Ver [Promociones](promociones.md).
+- **Promociones:** si un producto tiene una promoción vigente (por ejemplo 15 % menos o un 3x2), el punto de venta **la aplica sola** al agregarlo. En la columna *Promoción o descuento* se puede cambiar a *Sin promoción*. Ver [Promociones](promociones.md).
 - **Descuento por renglón:** un monto menos en ese producto. Un renglón lleva promoción o descuento, no los dos.
 - **Descuento a toda la venta:** se reparte entre los renglones al calcular el IVA y las devoluciones.
 

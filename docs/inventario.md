@@ -41,18 +41,21 @@ La pestaña **Resumen** muestra las compras del periodo por proveedor.
 
 Para mover mercancía entre sucursales.
 
-1. **Traspasos → Enviar traspaso:** la sucursal destino y los productos con cantidad (solo productos con existencia en tu sucursal). Al enviarlo, la mercancía sale de tu sucursal y queda **en camino**.
-2. En la sucursal destino aparece el aviso de traspasos en camino. Al llegar, **Recibir**: la mercancía se suma tal como se envió. Si llegó algo diferente, se corrige después con un ajuste.
-3. Mientras está en camino, el envío se puede **cancelar** y la mercancía regresa a la sucursal de origen.
+1. **Traspasos → Enviar traspaso:** la sucursal destino, notas (opcional) y los productos con cantidad (busca el producto, escribe la cantidad y **Agregar**; solo productos con existencia en tu sucursal). Pulsa **Enviar**. El traspaso recibe un folio (por ejemplo `SUC1-T000001`), la mercancía sale de tu sucursal y queda **En tránsito**.
+2. En la sucursal destino aparece el aviso "N traspasos en camino a esta sucursal". Al llegar la mercancía, abre el traspaso y pulsa **Recibir traspaso**: se suma tal como se envió. Si llegó algo diferente, se corrige después con un ajuste.
+3. Mientras está en tránsito, la sucursal que lo envió puede **Cancelar traspaso** y la mercancía regresa a ella.
+
+La lista se filtra por enviados o recibidos y por estado (en tránsito, recibido, cancelado).
 
 ## Conteos físicos
 
 Para comparar lo que hay en el anaquel contra el sistema y corregir la existencia.
 
-1. **Conteos físicos → Iniciar conteo** (con una nota, por ejemplo "Conteo mensual, pasillo 3"). Solo puede haber un conteo abierto por sucursal.
-2. **Contar:** escanea el código (o busca), escribe la cantidad y Enter. Quien cuenta **no ve** las cantidades del sistema (conteo ciego).
-3. El supervisor ve las pestañas **Contados**, **Diferencias** y **Sin contar**.
-4. **Completar conteo:** la existencia de cada producto contado queda **igual a lo contado**. Los productos que no se contaron no se tocan. No se puede deshacer.
+1. **Conteos físicos → Iniciar conteo** (con una nota, por ejemplo "Conteo mensual, pasillo 3"). Solo puede haber un conteo abierto por sucursal; aparece arriba de la lista para seguir contando.
+2. **Contar** (permiso *Crear* de Conteos): escanea el código y Enter (o busca el producto), escribe la cantidad contada y Enter. Se guarda al momento y se puede seguir con el siguiente. Si un producto se cuenta dos veces, se corrige la cantidad.
+3. Quien solo cuenta **no ve** las cantidades del sistema (conteo ciego). El supervisor (permiso *Editar* de Conteos) ve las pestañas **Contados**, **Diferencias** y **Sin contar**, con lo contado, lo que dice el sistema y la diferencia, y puede quitar un producto del conteo.
+4. **Hoja de conteo (CSV)** descarga la lista de productos para contar en papel.
+5. El supervisor pulsa **Completar conteo:** la existencia de cada producto contado queda **igual a lo contado**. Los productos que no se contaron no se tocan. No se puede deshacer.
 
 Lo ideal es contar sin vender. Si se vende mientras se cuenta, al completar gana lo contado. **Cancelar** un conteo no cambia ninguna existencia.
 

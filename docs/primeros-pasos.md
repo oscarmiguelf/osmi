@@ -30,9 +30,8 @@ El menú de la izquierda (en el celular, el botón ☰) muestra solo los módulo
 
 En la parte de abajo del menú, pulsa tu nombre para abrir **Mi perfil**. Ahí puedes:
 
-- Cambiar tu nombre.
-- Elegir tu **zona horaria**: las horas de ventas, citas y reportes se muestran en ella.
-- Cambiar tu contraseña.
+- **Mis datos:** nombre, apellidos y **zona horaria** (las horas de ventas, citas y reportes se muestran en ella). Tu correo se muestra, pero solo un administrador lo puede cambiar.
+- **Contraseña:** escribe la actual y dos veces la nueva.
 
 ## Cerrar sesión
 
