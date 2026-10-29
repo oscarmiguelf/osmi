@@ -10,21 +10,23 @@ MAX_IN_RANGE = 1000  # a calendar range (a month) never needs more
 
 
 class AppointmentService:
-    def __init__(self, repo: AppointmentRepository, fields: CustomFieldRepository):
+    def __init__(self, repo: AppointmentRepository, fields: CustomFieldRepository, only=None):
         self.repo = repo
         self.fields = fields  # the business's data of each appointment (custom fields, entity 'appointment')
+        # appointments.own: who is asking sees (and so can act on) only what's assigned to them or they booked
+        self.only = only
 
     def search(self, branch, filters):
         if filters["from"] and filters["to"] and filters["to"] <= filters["from"]:
             raise Invalid({"message": "'to' must be after 'from'", "field": "to"})
-        return self.repo.search(branch, filters, MAX_IN_RANGE)
+        return self.repo.search(branch, {**filters, "only": self.only}, MAX_IN_RANGE)
 
     def staff(self, branch):
         return self.repo.staff(branch)
 
     def get(self, branch, appointment_id):
         appointment = self.repo.get(appointment_id)
-        if appointment is None or appointment["branch_id"] != branch:
+        if appointment is None or appointment["branch_id"] != branch or not self._visible(appointment):
             raise NotFound("appointment not found")
         return appointment
 
@@ -96,10 +98,13 @@ class AppointmentService:
         return self.get(branch, appointment_id)
 
     def customer_appointments(self, uid, customer_id, page, page_size):
-        rows = self.repo.customer_appointments(uid, customer_id, page_size + 1, (page - 1) * page_size)
+        rows = self.repo.customer_appointments(uid, customer_id, page_size + 1, (page - 1) * page_size, self.only)
         return {"items": rows[:page_size], "page": page, "page_size": page_size, "has_more": len(rows) > page_size}
 
     # --- helpers ---
+    def _visible(self, appointment):
+        return self.only is None or self.only in (appointment["assigned_id"], appointment["created_by_id"])
+
     def _services(self, lines):
         """What the appointment will charge: services only (no stock of their own, not kits), each once."""
         ids = [line["product_id"] for line in lines]

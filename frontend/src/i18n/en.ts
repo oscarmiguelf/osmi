@@ -579,7 +579,7 @@ export default {
     },
     changed: '(changed)',
     noLogins: 'Hasn’t signed in yet.',
-    permissionNames: { read: 'View', create: 'Create', update: 'Edit', delete: 'Delete', export: 'Export', credit: 'Credit limit', prices: 'Prices' },
+    permissionNames: { read: 'View', create: 'Create', update: 'Edit', delete: 'Delete', export: 'Export', credit: 'Credit limit', prices: 'Prices', own: 'Only their own' },
   },
   products: {
     duration: 'Duration (minutes)',

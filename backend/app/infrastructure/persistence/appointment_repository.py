@@ -9,7 +9,7 @@ from app.infrastructure.persistence.sale_repository import db_rules
 APPOINTMENT = """
     a.id, a.branch_id, a.customer_id, c.full_name AS customer, c.phone AS customer_phone, a.title, a.notes,
     a.starts_at, a.ends_at, a.status, a.cancel_reason, a.reschedule_count, a.assigned_to AS assigned_id,
-    NULLIF(TRIM(CONCAT(au.first_name, ' ', au.last_name)), '') AS assigned_to, cu.email AS created_by, a.created_at,
+    NULLIF(TRIM(CONCAT(au.first_name, ' ', au.last_name)), '') AS assigned_to, cu.email AS created_by, a.created_by AS created_by_id, a.created_at,
     a.sale_id, sa.folio AS sale_folio, sa.total AS sale_total, fn_sale_credit_outstanding(sa.id) AS sale_balance, a.reminded_at, a.extra,
     a.quote_id, q.folio AS quote_folio, q.total AS quote_total, qs.name AS quote_status, (qs.name = 'OPEN' AND q.valid_until < NOW()) AS quote_expired,
     (SELECT STRING_AGG(p.name, ', ' ORDER BY s.sort_order) FROM appointment_services s JOIN products p ON p.id = s.product_id
@@ -45,8 +45,9 @@ class SqlAppointmentRepository:
               AND (NOT :hide_cancelled OR a.status <> 'CANCELLED')
               AND (CAST(:customer_id AS uuid) IS NULL OR a.customer_id = CAST(:customer_id AS uuid))
               AND (CAST(:assigned_to AS uuid) IS NULL OR a.assigned_to = CAST(:assigned_to AS uuid))
+              AND (CAST(:only AS uuid) IS NULL OR a.assigned_to = CAST(:only AS uuid) OR a.created_by = CAST(:only AS uuid))
             ORDER BY a.starts_at, a.id LIMIT :limit
-        """, b=branch_id, **filters, limit=limit)
+        """, b=branch_id, **{"only": None, **filters}, limit=limit)
 
     def get(self, appointment_id):
         appointment = self._one(f"SELECT {APPOINTMENT} FROM {FROM} WHERE a.id = :id", id=appointment_id)
@@ -142,15 +143,16 @@ class SqlAppointmentRepository:
         self.session.execute(text("INSERT INTO appointment_notes (appointment_id, note, created_by) VALUES (:a, :n, :uid)"),
                              {"a": appointment_id, "n": note, "uid": user_id})
 
-    def customer_appointments(self, user_id, customer_id, limit, offset):
+    def customer_appointments(self, user_id, customer_id, limit, offset, only=None):
         """A customer's follow-up: their appointments in the branches the person belongs to, newest first."""
         return self._all(f"""
             SELECT {APPOINTMENT}, b.name AS branch,
                    (SELECT COUNT(*) FROM appointment_notes n WHERE n.appointment_id = a.id) AS note_count
             FROM {FROM} JOIN branches b ON b.id = a.branch_id
             WHERE a.customer_id = :c AND fn_user_in_branch(:uid, a.branch_id)
+              AND (CAST(:only AS uuid) IS NULL OR a.assigned_to = CAST(:only AS uuid) OR a.created_by = CAST(:only AS uuid))
             ORDER BY a.starts_at DESC, a.id LIMIT :limit OFFSET :offset
-        """, c=customer_id, uid=user_id, limit=limit, offset=offset)
+        """, c=customer_id, uid=user_id, limit=limit, offset=offset, only=only)
 
     def commit(self):
         self.session.commit()

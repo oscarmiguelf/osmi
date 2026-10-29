@@ -578,7 +578,7 @@ export default {
     } as Record<string, string>,
     changed: '(cambió)',
     noLogins: 'Todavía no ha iniciado sesión.',
-    permissionNames: { read: 'Ver', create: 'Crear', update: 'Editar', delete: 'Eliminar', export: 'Exportar', credit: 'Límite de crédito', prices: 'Precios' } as Record<string, string>,
+    permissionNames: { read: 'Ver', create: 'Crear', update: 'Editar', delete: 'Eliminar', export: 'Exportar', credit: 'Límite de crédito', prices: 'Precios', own: 'Solo sus citas' } as Record<string, string>,
   },
   products: {
     duration: 'Duración (minutos)',

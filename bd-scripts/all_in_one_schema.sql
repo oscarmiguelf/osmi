@@ -7483,3 +7483,11 @@ ALTER TABLE cash_cuts ADD COLUMN IF NOT EXISTS withdrawn NUMERIC(12,2) NOT NULL 
 ALTER TABLE cash_cuts ADD COLUMN IF NOT EXISTS withdrawal_reason VARCHAR(200);
 ALTER TABLE cash_cuts DROP CONSTRAINT IF EXISTS chk_cash_cuts_withdrawn;
 ALTER TABLE cash_cuts ADD CONSTRAINT chk_cash_cuts_withdrawn CHECK (withdrawn >= 0);
+
+-- =====================================================================
+-- appointments.own: the person sees only the appointments assigned to them or that they booked (a doctor, a
+-- therapist). Without it, everything of the branch (front desk, managers). Not granted to anyone by default.
+-- =====================================================================
+INSERT INTO permissions (module_id, code, name)
+SELECT m.id, 'own', 'Only their own appointments' FROM modules m WHERE m.code = 'appointments'
+ON CONFLICT (module_id, code) DO NOTHING;

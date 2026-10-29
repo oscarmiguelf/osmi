@@ -11,7 +11,9 @@ from app.application.quote_service import QuoteService
 from app.infrastructure.api.quotes import get_service as quote_service
 from app.infrastructure.api.sales import get_service as sale_service
 from app.infrastructure.api.fields import optional_text
+from app.infrastructure.api.auth import current_user_id
 from app.infrastructure.api.permissions import CurrentBranch, require_permission
+from app.infrastructure.persistence.permissions import has_permission
 from app.infrastructure.persistence.appointment_repository import SqlAppointmentRepository
 from app.infrastructure.persistence.custom_field_repository import SqlCustomFieldRepository
 from app.infrastructure.persistence.database import SessionLocal
@@ -64,9 +66,10 @@ class NoteIn(BaseModel):
     note: Note
 
 
-def get_service():
+def get_service(uid: Annotated[uuid.UUID, Depends(current_user_id)]):
     with SessionLocal() as session:
-        yield AppointmentService(SqlAppointmentRepository(session), SqlCustomFieldRepository(session))
+        own = has_permission(session, uid, "appointments", "own")  # only theirs (a doctor, a therapist)
+        yield AppointmentService(SqlAppointmentRepository(session), SqlCustomFieldRepository(session), uid if own else None)
 
 
 Svc = Annotated[AppointmentService, Depends(get_service)]
