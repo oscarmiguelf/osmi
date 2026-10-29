@@ -36,6 +36,7 @@ const availabilityText = { one: s.lastOne, few: s.lastFew, plenty: s.inStock };
     data-labels={JSON.stringify({ ...s.message, needName: s.needName, sentHint: s.sentHint, maxReached: s.maxReached, orderCount: s.orderCount,
       less: s.less, plus: s.plus, remove: s.remove, added: s.added, add: s.add })}>
     <header class="head">
+      {info.logo && <img class="logo" src={`/api/catalog/logo?v=${info.logo}`} alt="" />}
       <div>
         <h1>{s.title}</h1>
         <p class="ui-muted">{info.ordering ? s.intro : ''}</p>
@@ -258,7 +259,19 @@ const availabilityText = { one: s.lastOne, few: s.lastFew, plenty: s.inStock };
     padding: var(--space-6) var(--space-4) 6rem;
   }
   .head {
+    display: flex;
+    align-items: center;
+    gap: var(--space-4);
     margin-bottom: var(--space-4);
+  }
+  .head h1 {
+    margin: 0;
+  }
+  .logo {
+    width: auto;
+    max-width: 8rem;
+    max-height: 4rem;
+    object-fit: contain;
   }
   .filters {
     display: flex;

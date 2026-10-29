@@ -1,13 +1,13 @@
 import re
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, File, UploadFile
+from fastapi import APIRouter, Depends, File, Query, Response, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, BeforeValidator, StringConstraints
 
 from app.application.settings_service import SettingsService
 from app.application.errors import Invalid
-from app.infrastructure.images import logo_png
+from app.infrastructure.images import logo_icon, logo_png
 from app.infrastructure.persistence.image_storage import LocalImageStorage
 from app.infrastructure.api.permissions import require_permission
 from app.infrastructure.persistence.custom_field_repository import SqlCustomFieldRepository
@@ -36,7 +36,7 @@ class SettingsPatch(BaseModel):
 
 def get_service():
     with SessionLocal() as session:
-        yield SettingsService(SqlSettingsRepository(session), SqlCustomFieldRepository(session), LocalImageStorage(folder="branding"), logo_png)
+        yield SettingsService(SqlSettingsRepository(session), SqlCustomFieldRepository(session), LocalImageStorage(folder="branding"), logo_png, logo_icon)
 
 
 Svc = Annotated[SettingsService, Depends(get_service)]
@@ -73,3 +73,14 @@ def delete_logo(uid: Update, svc: Svc):
 @router.get("/logo")
 def logo(svc: Svc):
     return FileResponse(svc.logo(), media_type="image/png", headers={"Cache-Control": "public, max-age=300"})
+
+
+ICON_SIZES = (180, 192, 512)  # apple-touch-icon, and the manifest's two
+
+
+# Public: the installed app's icon (home screen), made from the logo. 404 without a logo (the app keeps its own)
+@router.get("/logo/icon/{size}")
+def logo_app_icon(size: int, svc: Svc, maskable: Annotated[bool, Query()] = False):
+    if size not in ICON_SIZES:
+        raise Invalid({"message": f"the icon sizes are {ICON_SIZES}", "field": "size"})
+    return Response(svc.logo_icon(size, maskable), media_type="image/png", headers={"Cache-Control": "public, max-age=300"})

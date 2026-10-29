@@ -24,8 +24,19 @@ def test_logo():
         assert got.status_code == 200 and got.headers["content-type"] == "image/png"
         img = Image.open(io.BytesIO(got.content))
         assert img.format == "PNG" and max(img.size) == 600 and not img.info.get("exif")
+        # The installed app's icon, made from it (public): square, white, any of the sizes the manifest uses
+        for size, maskable in ((180, False), (192, False), (512, True)):
+            icon = client.get(f"/settings/logo/icon/{size}", params={"maskable": maskable})
+            pic = Image.open(io.BytesIO(icon.content))
+            assert icon.status_code == 200 and pic.size == (size, size) and pic.getpixel((0, 0))[:3] == (255, 255, 255)
+        assert client.get("/settings/logo/icon/100").status_code == 422
+        assert client.get("/public/catalog").json()["logo"] == r.json()["logo_file"]  # the catalog shows it
         assert client.delete("/settings/logo", headers=A).status_code == 204
         assert client.get("/settings/logo").status_code == 404
-    finally:
+        assert client.get("/settings/logo/icon/192").status_code == 404  # the app keeps its own icon
+        assert client.get("/public/catalog").json()["logo"] is None
+    finally:  # as it was, even after a failure half-way
         if previous:
             client.put("/settings/logo", files={"file": ("l.png", previous, "image/png")}, headers=A)
+        else:
+            client.delete("/settings/logo", headers=A)

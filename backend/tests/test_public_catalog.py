@@ -55,7 +55,7 @@ def test_settings_and_public_catalog():
 
         # No number: the catalog still shows, ordering is off
         client.patch("/settings", json={"whatsapp_number": ""}, headers=A)
-        assert client.get("/public/catalog").json() | {"categories": []} == {"whatsapp_number": None, "ordering": False, "categories": []}
+        assert client.get("/public/catalog").json() | {"categories": [], "logo": None} == {"whatsapp_number": None, "ordering": False, "categories": [], "logo": None}
     finally:
         client.patch("/settings", json={"whatsapp_number": before}, headers=A)
         for p in (with_stock, no_stock):

@@ -9,11 +9,12 @@ from app.application.ports.settings_repository import SettingsRepository
 class SettingsService:
     """Business settings changed from the app (module "settings"). Validation of each value lives in the API model."""
 
-    def __init__(self, repo: SettingsRepository, fields: CustomFieldRepository, storage=None, to_png=None):
+    def __init__(self, repo: SettingsRepository, fields: CustomFieldRepository, storage=None, to_png=None, to_icon=None):
         self.repo = repo
         self.fields = fields
         self.storage = storage  # ImageStorage for the logo
         self.to_png = to_png  # bytes -> clean PNG bytes | None
+        self.to_icon = to_icon  # (logo PNG, size, maskable) -> square icon PNG
 
     def get(self):
         return self.repo.all()
@@ -57,3 +58,7 @@ class SettingsService:
         if not name or not self.storage.path(name).exists():
             raise NotFound("no logo")
         return self.storage.path(name)
+
+    def logo_icon(self, size: int, maskable: bool):
+        """The installed app's icon, made from the logo."""
+        return self.to_icon(self.logo().read_bytes(), size, maskable)

@@ -9,7 +9,7 @@ const LOGIN_PATHS = new Set(['/login', '/en/login']);
 const BRANCH_PATHS = new Set(['/branch', '/en/branch']);
 const PASSWORD_PATHS = new Set(['/change-password', '/en/change-password']);
 // Public: the customer catalog and its images, no sign-in
-const PUBLIC_PATHS = new Set(['/catalog', '/en/catalog']);
+const PUBLIC_PATHS = new Set(['/catalog', '/en/catalog', '/manifest.webmanifest']); // the manifest: the login page links it too
 const OFFLINE_POS = '/pos-offline';
 // Anyone can open the catalog: a cap per visitor stops scraping and floods (a page is 1 request + up to 24 images)
 const publicLimit = rateLimiter(300, 60_000);

@@ -49,6 +49,9 @@ class SqlPublicCatalogRepository:
             WHERE {VISIBLE} ORDER BY c.name
         """)).mappings()]
 
+    def logo_file(self):
+        return self.session.execute(text("SELECT value FROM settings WHERE key = 'logo_file'")).scalar() or ""
+
     def whatsapp_number(self):
         return self.session.execute(text("SELECT value FROM settings WHERE key = 'whatsapp_number'")).scalar() or ""
 

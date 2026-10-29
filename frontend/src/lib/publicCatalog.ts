@@ -24,7 +24,7 @@ async function get<T>(path: string): Promise<T> {
 }
 
 export const catalogInfo = () =>
-  get<{ whatsapp_number: string | null; ordering: boolean; categories: { id: string; name: string }[] }>('/public/catalog');
+  get<{ whatsapp_number: string | null; ordering: boolean; categories: { id: string; name: string }[]; logo: string | null }>('/public/catalog');
 export const catalogProducts = (p: { q?: string; category_id?: string; kind?: string; page?: number }) =>
   get<{ items: CatalogProduct[]; has_more: boolean }>(`/public/catalog/products?${new URLSearchParams(
     Object.entries({ page_size: 24, ...p }).filter(([, v]) => v !== undefined && v !== '').map(([k, v]) => [k, String(v)]))}`);

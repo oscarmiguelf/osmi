@@ -41,3 +41,17 @@ def logo_png(data: bytes) -> bytes | None:
             return out.getvalue()
     except (UnidentifiedImageError, Image.DecompressionBombError, OSError, ValueError, SyntaxError):
         return None
+
+
+def logo_icon(png: bytes, size: int, maskable: bool = False) -> bytes:
+    """The app icon from the logo: a white square with the logo centred (a maskable icon keeps it inside the
+    middle 80%, the part Android always shows; others use most of the square)."""
+    with Image.open(io.BytesIO(png)) as img:
+        logo = img.convert("RGBA")
+        room = int(size * (0.62 if maskable else 0.84))
+        logo.thumbnail((room, room), Image.LANCZOS)
+        icon = Image.new("RGB", (size, size), "white")
+        icon.paste(logo, ((size - logo.width) // 2, (size - logo.height) // 2), logo)
+        out = io.BytesIO()
+        icon.save(out, "PNG", optimize=True)
+        return out.getvalue()

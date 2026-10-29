@@ -13,7 +13,8 @@ class PublicCatalogService:
 
     def info(self):
         number = self.repo.whatsapp_number()
-        return {"whatsapp_number": number or None, "ordering": bool(number), "categories": self.repo.categories()}
+        return {"whatsapp_number": number or None, "ordering": bool(number), "categories": self.repo.categories(),
+                "logo": self.repo.logo_file() or None}
 
     def products(self, q, category_id, kind, page, page_size):
         rows = self.repo.products(q.strip(), category_id, kind, page_size + 1, (page - 1) * page_size)
