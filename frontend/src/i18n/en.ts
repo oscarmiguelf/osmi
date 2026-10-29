@@ -1319,6 +1319,7 @@ export default {
     followupPayments: 'It had payments: decide in its sale whether they are refunded.',
     followupReturn: 'Return',
     followupRegister: 'Its credit sale is still to be returned: occupy a register and return it from the sale.',
+    requoted: 'A new quote ({folio}) was made with the new services; the previous one stays in the history.',
     errors: {
       has_payments: 'It already has payments: adjust the services from its sale.',
       register: 'Occupy a register to remake its sale.',

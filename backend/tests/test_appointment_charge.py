@@ -195,14 +195,32 @@ def test_event_data_and_quote():
         changed = client.patch(f"/appointments/{appt['id']}", json={"extra": {venue["id"]: "Salón Real", guests["id"]: ""}}, headers=b.H).json()
         assert changed["extra"] == {venue["id"]: "Salón Real"}
 
+        # New services: a new quote with them (what stays keeps its quantity and discount), the sale made again from it
+        lights = b.service("Luces", 3000)
+        old_sale = appt["sale_id"]
+        moved = client.patch(f"/appointments/{appt['id']}", json={"services": [{"product_id": extra["id"]}, {"product_id": lights["id"]}]}, headers=b.H)
+        assert moved.status_code == 200, moved.text
+        moved = moved.json()
+        assert moved["quote_id"] != q["id"] and moved["quote_status"] == "CONVERTED"
+        assert client.get(f"/quotes/{q['id']}", headers=b.H).json()["status"] == "CONVERTED"  # the old one: history
+        new_q = client.get(f"/quotes/{moved['quote_id']}", headers=b.H).json()
+        assert {(i["product_id"], Decimal(str(i["quantity"])), Decimal(str(i["discount"]))) for i in new_q["items"]} == {
+            (extra["id"], 2, 500), (lights["id"], 1, 0)}
+        assert Decimal(str(moved["sale_total"])) == 5500 and b.sale(old_sale)["status"] == "RETURNED"
+
         # A quote made from an event booked without a register: its sale, made later, uses it
         b.release()
         e2 = b.book(cust, [show], start=start, extra={venue["id"]: "Z"}).json()
         assert e2["sale_pending"] == "register"
-        assert client.post(f"/appointments/{e2['id']}/quote", headers=b.H).json()["quote_status"] == "OPEN"
+        first_q = client.post(f"/appointments/{e2['id']}/quote", headers=b.H).json()
+        assert first_q["quote_status"] == "OPEN"
+        # Its services change while the quote is open: a new open quote, the first cancelled
+        e2 = client.patch(f"/appointments/{e2['id']}", json={"services": [{"product_id": show["id"]}, {"product_id": lights["id"]}]}, headers=b.H).json()
+        assert e2["quote_id"] != first_q["quote_id"] and e2["quote_status"] == "OPEN"
+        assert client.get(f"/quotes/{first_q['quote_id']}", headers=b.H).json()["status"] == "CANCELLED"
         b.occupy()
         e2 = client.post(f"/appointments/{e2['id']}/sale", headers=b.H).json()
-        assert e2["quote_status"] == "CONVERTED" and Decimal(str(e2["sale_balance"])) == 10000
+        assert e2["quote_status"] == "CONVERTED" and Decimal(str(e2["sale_balance"])) == 13000
     finally:
         b.cleanup()
         for f in (venue, guests):

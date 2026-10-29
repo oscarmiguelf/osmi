@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from app.application.appointment_service import AppointmentService
@@ -39,7 +40,8 @@ class AppointmentBilling:
         return self.appointments.get(branch, appointment_id)
 
     def change_services(self, uid, branch, appointment_id, fields):
-        """Services of a charged appointment: its sale is made again (only while nothing was paid on it)."""
+        """New services: its quote is made again with them (the old one cancelled, or kept as converted), and so is its
+        sale (only while nothing was paid on it), from the new quote when there is one."""
         appointment = self.appointments.get(branch, appointment_id)
         sale = self._active_sale(branch, appointment)
         if sale:
@@ -48,10 +50,12 @@ class AppointmentBilling:
             if self.sales.repo.current_register(uid, branch) is None:
                 raise Conflict(NO_REGISTER)
         updated = self.appointments.update(uid, branch, appointment_id, fields)
+        if appointment.get("quote_id") and updated["services"]:
+            self._requote(uid, branch, appointment, updated)
         if sale:
             self._return(uid, branch, sale, "Cambio de servicios")
             return self._with(branch, updated, self._make_sale(uid, branch, self.appointments.get(branch, appointment_id)))
-        return updated
+        return self.appointments.get(branch, appointment_id)
 
     def close(self, uid, branch, appointment_id, status, reason=None):
         """Cancelled or missed: its sale goes back if nothing was paid; with deposits paid, someone decides the refund."""
@@ -83,6 +87,25 @@ class AppointmentBilling:
         except AppError as e:
             return _code(e)
         return None
+
+    def _requote(self, uid, branch, before, after):
+        """A new quote with the new services, for the same customer and notes. What stays keeps its quantity and its
+        discount (prices are the catalog's: a quote never takes typed prices); the general discount too, while it fits."""
+        old = self.quotes.get(branch, before["quote_id"])
+        kept = {i["product_id"]: i for i in old["items"]}
+        items = [{"product_id": s["product_id"], "quantity": D(kept[s["product_id"]]["quantity"]) if s["product_id"] in kept else D(s["quantity"]),
+                  "unit_price": None, "discount": D(kept[s["product_id"]]["discount"]) if s["product_id"] in kept else Decimal(0)}
+                 for s in after["services"]]
+        starts = after["starts_at"]
+        body = {"customer_id": old["customer_id"], "notes": old["notes"], "items": items, "discount": D(old["discount"]),
+                "valid_until": starts if starts > datetime.now(timezone.utc) else None}
+        try:
+            new = self.quotes.create(uid, branch, body)
+        except AppError:  # the general discount no longer fits the new total (or a line discount): without them
+            new = self.quotes.create(uid, branch, {**body, "discount": Decimal(0), "items": [{**i, "discount": Decimal(0)} for i in items]})
+        if old["status"] == "OPEN" and not old["is_expired"]:
+            self.quotes.cancel(uid, branch, old["id"])
+        self.appointments.link_quote(uid, branch, before["id"], new["id"])
 
     def _active_sale(self, branch, appointment):
         if not appointment.get("sale_id"):

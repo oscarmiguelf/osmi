@@ -1318,6 +1318,7 @@ export default {
     followupPayments: 'Tenía abonos: decide en su venta si se reembolsan.',
     followupReturn: 'Devolver',
     followupRegister: 'Su venta a crédito quedó pendiente de devolver: ocupa una caja y devuélvela desde la venta.',
+    requoted: 'Se hizo una nueva cotización ({folio}) con los servicios nuevos; la anterior quedó en el historial.',
     errors: {
       has_payments: 'Ya tiene abonos: ajusta los servicios desde su venta.',
       register: 'Ocupa una caja para rehacer su venta.',

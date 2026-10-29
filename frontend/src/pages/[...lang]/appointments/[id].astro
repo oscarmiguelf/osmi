@@ -86,7 +86,11 @@ if (Astro.request.method === 'POST') {
         ...(fields.length > 0 && { extra: edit.extra }) });
     } else if (intent === 'services' && canUpdate) {
       openDialog = 'services';
-      await updateAppointment(accessToken, branch.id, id, { services: data.getAll('service').map((product_id) => ({ product_id: String(product_id) })) });
+      after = await updateAppointment(accessToken, branch.id, id, { services: data.getAll('service').map((product_id) => ({ product_id: String(product_id) })) });
+      if (after.quote_id && after.quote_id !== appointment.quote_id) {  // its quote was made again with the new services
+        setFlash(Astro.cookies, { done: 'services', requoted: after.quote_folio ?? '' });
+        return Astro.redirect(selfPath, 303);
+      }
     } else if (intent === 'sale' && canMakeSale) {
       await makeAppointmentSale(accessToken, branch.id, id);
       setFlash(Astro.cookies, { done: 'sale', open_abono: '1' });
@@ -196,6 +200,7 @@ const doneText: Record<string, string> = { ...ap.done, services: ap.servicesSave
     {flash.done && flash.done !== 'cancel' && <Notice tone={flash.done === 'cancel' || flash.done === 'no-show' ? 'warning' : 'success'}>{doneText[flash.done] ?? t.ui.saved}</Notice>}
     {flash.created && <Notice>{ap.created}</Notice>}
     {flash.paid && <Notice tone="success">{flash.paid}</Notice>}
+    {flash.requoted && <Notice>{fmt(ap.requoted, { folio: flash.requoted })}</Notice>}
     {needsSale && flash.pending && <Notice tone="warning">{fmt(ap.salePending, { reason: ap.salePendingReasons[flash.pending] ?? '' })}</Notice>}
     {flash.followup === 'has_payments' && appointment.sale_id && (
       <Notice tone="warning">{ap.followupPayments} <a href={localePath(locale, `/sales/${appointment.sale_id}/return`)}>{ap.followupReturn}</a></Notice>
