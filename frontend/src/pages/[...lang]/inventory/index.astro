@@ -1,0 +1,206 @@
+---
+import AppLayout from '@/layouts/AppLayout.astro';
+import Badge from '@/components/ui/Badge.astro';
+import Button from '@/components/ui/Button.astro';
+import Dialog from '@/components/ui/Dialog.astro';
+import Field from '@/components/ui/Field.astro';
+import Icon from '@/components/ui/Icon.astro';
+import Notice from '@/components/ui/Notice.astro';
+import { fmt, getLocale, localePath, useTranslations } from '@/i18n';
+import { ApiError } from '@/lib/api';
+import { adjustStock, branchStock, inventoryMovements } from '@/lib/products';
+import { setFlash, takeFlash } from '@/lib/session';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const inv = t.inventory;
+const pr = t.products;
+const { session, accessToken, branch } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'inventory')?.permissions ?? [];
+if (!perms.includes('read')) return Astro.rewrite('/404');
+const canAdjust = perms.includes('create');
+
+const params = Astro.url.searchParams;
+const tab = params.get('tab') === 'movements' ? 'movements' : 'stock';
+const q = (params.get('q') ?? '').trim().slice(0, 100);
+const lowOnly = params.get('low') === 'on';
+const page = Math.max(1, Number.parseInt(params.get('page') ?? '1', 10) || 1);
+const basePath = localePath(locale, '/inventory');
+
+let adjust = { product_id: '', name: '', quantity: '', notes: '' };
+let adjustError: string | undefined;
+if (branch && Astro.request.method === 'POST') {
+  const data = await Astro.request.formData();
+  adjust = Object.fromEntries(Object.keys(adjust).map((k) => [k, String(data.get(k) ?? '').trim()])) as typeof adjust;
+  if (!adjust.quantity || Number(adjust.quantity) === 0) adjustError = inv.quantityRequired;
+  else if (!adjust.notes) adjustError = inv.notesRequired;
+  else {
+    try {
+      await adjustStock(accessToken, branch.id, adjust);
+      setFlash(Astro.cookies, { adjusted: '1' });
+      return Astro.redirect(Astro.url.pathname + Astro.url.search, 303);
+    } catch (e) {
+      if (!(e instanceof ApiError)) throw e;
+      const detail = e.body?.detail;
+      adjustError = detail?.available !== undefined ? fmt(inv.notEnough, { n: Number(detail.available) })
+        : detail?.field === 'quantity' ? inv.wholeUnits : e.status === 403 ? t.ui.forbidden : t.ui.failed;
+    }
+  }
+  Astro.response.status = 422;
+}
+
+const flash = takeFlash(Astro.cookies);
+const stock = branch && tab === 'stock' ? await branchStock(accessToken, branch.id, { q, low_stock: lowOnly || undefined, page }) : undefined;
+const moves = branch && tab === 'movements' ? await inventoryMovements(accessToken, branch.id, { page }) : undefined;
+const when = new Intl.DateTimeFormat(t.intl, { dateStyle: 'medium', timeStyle: 'short', timeZone: session.user.timezone });
+const link = (p: Record<string, string | number>) => `${basePath}?${new URLSearchParams(Object.entries({ tab, ...p }).map(([k, v]) => [k, String(v)]))}`;
+const hasMore = tab === 'stock' ? page * 25 < (stock?.total ?? 0) : moves?.has_more;
+---
+
+<AppLayout title={inv.title} current="/inventory">
+  <header class="ui-header">
+    <div>
+      <h1>{inv.title}</h1>
+      {branch && <p class="ui-sub">{branch.name}</p>}
+    </div>
+    <nav class="ui-tabs" aria-label={inv.title}>
+      <a href={`${basePath}?tab=stock`} aria-current={tab === 'stock' ? 'page' : undefined}>{inv.stock}</a>
+      <a href={`${basePath}?tab=movements`} aria-current={tab === 'movements' ? 'page' : undefined}>{inv.movements}</a>
+    </nav>
+  </header>
+
+  {
+    !branch ? <Notice tone="warning">{t.ui.noBranch}</Notice> : (
+      <>
+        <div class="ui-notices">{flash.adjusted && <Notice>{inv.adjusted}</Notice>}</div>
+
+        {tab === 'stock' && stock && (
+          <>
+            <form method="get" class="ui-filters" role="search" data-filters>
+              <input type="hidden" name="tab" value="stock" />
+              <label class="ui-search">
+                <Icon name="search" size={18} />
+                <span class="visually-hidden">{t.ui.search}</span>
+                <input type="search" name="q" value={q} placeholder={inv.searchPlaceholder} autocomplete="off" autofocus={!!q} />
+              </label>
+              <label class="ui-check"><input type="checkbox" name="low" checked={lowOnly} />{inv.lowStockOnly}</label>
+            </form>
+            {stock.items.length === 0 ? <p class="ui-muted">{inv.empty}</p> : (
+              <div class="ui-table-wrap">
+                <table class="ui-table">
+                  <thead><tr><th scope="col">{inv.colProduct}</th><th scope="col" class="ui-end">{inv.colStock}</th><th scope="col" class="ui-end">{inv.colMin}</th>{canAdjust && <th scope="col"><span class="visually-hidden">{inv.adjust}</span></th>}</tr></thead>
+                  <tbody>
+                    {stock.items.map((p) => (
+                      <tr>
+                        <td data-label={inv.colProduct}>
+                          <a class="ui-strong" href={localePath(locale, `/products/${p.id}`)}>{p.name}</a>
+                          {p.barcode && <span class="ui-line2 num">{p.barcode}</span>}
+                        </td>
+                        <td data-label={inv.colStock} class="ui-end num">
+                          <span class="stock"><strong>{Number(p.current_stock)}</strong> {pr.unitNames[p.unit] ?? p.unit}{p.is_low_stock && <Badge tone="warning">{pr.lowStock}</Badge>}</span>
+                        </td>
+                        <td data-label={inv.colMin} class="ui-end num">{Number(p.min_stock) || '—'}</td>
+                        {canAdjust && (
+                          <td class="ui-row-action ui-end">
+                            <Button variant="tertiary" icon="scale" data-adjust={JSON.stringify({ product_id: p.id, name: p.name })}>{inv.adjust}</Button>
+                          </td>
+                        )}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </>
+        )}
+
+        {tab === 'movements' && moves && (
+          moves.items.length === 0 ? <p class="ui-muted">{inv.noMovements}</p> : (
+            <div class="ui-table-wrap">
+              <table class="ui-table">
+                <thead><tr><th scope="col">{inv.colDate}</th><th scope="col">{inv.colProduct}</th><th scope="col">{inv.colType}</th><th scope="col" class="ui-end">{inv.colQty}</th><th scope="col" class="ui-end">{inv.colAfter}</th><th scope="col">{inv.colBy}</th></tr></thead>
+                <tbody>
+                  {moves.items.map((m) => (
+                    <tr>
+                      <td data-label={inv.colDate} class="num">{when.format(new Date(m.created_at))}</td>
+                      <td data-label={inv.colProduct}><a class="ui-strong" href={localePath(locale, `/products/${m.product_id}`)}>{m.product}</a></td>
+                      <td data-label={inv.colType}>{inv.types[m.movement_type] ?? m.movement_type}{m.notes && <span class="ui-line2">{m.notes}</span>}</td>
+                      <td data-label={inv.colQty} class:list={['ui-end num', Number(m.quantity) > 0 ? 'ui-in' : 'ui-out']}>{Number(m.quantity) > 0 ? '+' : ''}{Number(m.quantity)}</td>
+                      <td data-label={inv.colAfter} class="ui-end num">{Number(m.stock_after)}</td>
+                      <td data-label={inv.colBy} class="ui-muted">{m.created_by_email}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )
+        )}
+
+        {(page > 1 || hasMore) && (
+          <nav class="ui-pager">
+            <span />
+            <span class="ui-actions">
+              {page > 1 && <Button variant="secondary" href={link({ ...(q && { q }), page: page - 1 })}>{t.ui.previous}</Button>}
+              {hasMore && <Button variant="secondary" href={link({ ...(q && { q }), page: page + 1 })}>{t.ui.next}</Button>}
+            </span>
+          </nav>
+        )}
+
+        {canAdjust && (
+          <Dialog id="adjust" title={adjust.name ? fmt(inv.adjustTitle, { name: adjust.name }) : inv.adjust} closeLabel={t.ui.close} open={!!adjustError}>
+            <form method="post" class="ui-form" novalidate data-adjust-form data-title={inv.adjustTitle}>
+              {adjustError && <p class="ui-alert" role="alert">{adjustError}</p>}
+              <input type="hidden" name="product_id" value={adjust.product_id} />
+              <input type="hidden" name="name" value={adjust.name} />
+              <p class="ui-full ui-muted ui-small">{inv.adjustHint}</p>
+              <div class="ui-full"><Field label={inv.quantity} name="quantity" type="number" step="0.001" inputmode="decimal" value={adjust.quantity} required /></div>
+              <div class="ui-full"><Field label={inv.notes} name="notes" value={adjust.notes} placeholder={inv.notesPlaceholder} required maxlength={1000} /></div>
+              <div class="ui-form-actions">
+                <Button variant="tertiary" data-dialog-close>{t.ui.cancel}</Button>
+                <Button type="submit">{inv.adjust}</Button>
+              </div>
+            </form>
+          </Dialog>
+        )}
+      </>
+    )
+  }
+</AppLayout>
+
+<script>
+  const filters = document.querySelector<HTMLFormElement>('[data-filters]');
+  const search = filters?.querySelector<HTMLInputElement>('input[name=q]');
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  search?.addEventListener('input', () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => filters!.requestSubmit(), 350);
+  });
+  filters?.querySelector('input[type=checkbox]')?.addEventListener('change', () => filters.requestSubmit());
+  if (search && document.activeElement === search) search.setSelectionRange(search.value.length, search.value.length);
+
+  // One dialog for every row: fill in the product, then open it
+  const dialog = document.querySelector<HTMLDialogElement>('#adjust');
+  const form = dialog?.querySelector<HTMLFormElement>('[data-adjust-form]');
+  document.querySelectorAll<HTMLElement>('[data-adjust]').forEach((btn) =>
+    btn.addEventListener('click', () => {
+      const { product_id, name } = JSON.parse(btn.dataset.adjust!);
+      (form!.elements.namedItem('product_id') as HTMLInputElement).value = product_id;
+      (form!.elements.namedItem('name') as HTMLInputElement).value = name;
+      (form!.elements.namedItem('quantity') as HTMLInputElement).value = '';
+      (form!.elements.namedItem('notes') as HTMLInputElement).value = '';
+      form!.querySelector('[role=alert]')?.remove();
+      dialog!.querySelector('[data-dialog-title]')!.textContent = form!.dataset.title!.replace('{name}', name);
+      dialog!.showModal();
+    }),
+  );
+</script>
+
+<style>
+  .stock {
+    display: inline-flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    align-items: center;
+    gap: var(--space-2);
+  }
+</style>

@@ -1,0 +1,100 @@
+---
+import AppLayout from '@/layouts/AppLayout.astro';
+import Badge from '@/components/ui/Badge.astro';
+import Button from '@/components/ui/Button.astro';
+import Card from '@/components/ui/Card.astro';
+import Notice from '@/components/ui/Notice.astro';
+import Timeline from '@/components/ui/Timeline.astro';
+import { fmt, getLocale, localePath, useTranslations } from '@/i18n';
+import { ApiError } from '@/lib/api';
+import { setFlash, takeFlash } from '@/lib/session';
+import { changeTransfer, getTransfer, type Transfer } from '@/lib/transfers';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const tr = t.transfers;
+const { session, accessToken, branch } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'transfers')?.permissions ?? [];
+if (!perms.includes('read') || !branch) return Astro.rewrite('/404');
+const id = Astro.params.id!;
+const selfPath = localePath(locale, `/transfers/${id}`);
+
+let pageError: string | undefined;
+if (Astro.request.method === 'POST') {
+  const action = (await Astro.request.formData()).get('action') === 'cancel' ? 'cancel' : 'receive';
+  try {
+    await changeTransfer(accessToken, branch.id, id, action);
+    setFlash(Astro.cookies, { [action]: '1' });
+    return Astro.redirect(selfPath, 303);
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    pageError = e.status === 409 ? tr.notInTransit : e.status === 403 ? t.ui.forbidden : t.ui.failed;
+  }
+}
+
+let transfer: Transfer;
+try {
+  transfer = await getTransfer(accessToken, branch.id, id);
+} catch (e) {
+  if (e instanceof ApiError && (e.status === 404 || e.status === 422)) return Astro.rewrite('/404');
+  throw e;
+}
+const flash = takeFlash(Astro.cookies);
+const when = new Intl.DateTimeFormat(t.intl, { dateStyle: 'medium', timeStyle: 'short', timeZone: session.user.timezone });
+const inTransit = transfer.status === 'IN_TRANSIT';
+const canChange = perms.includes('update') && inTransit;
+const isDestination = transfer.to_branch_id === branch.id;
+const tone = { IN_TRANSIT: 'warning', RECEIVED: 'success', CANCELLED: 'neutral' } as const;
+const timeline = (transfer.history ?? []).map((h) => ({
+  title: tr.status[h.to_status] ?? h.to_status,
+  meta: `${h.changed_by}, ${when.format(new Date(h.changed_at))}`,
+})).reverse();
+---
+
+<AppLayout title={fmt(tr.detail, { folio: transfer.folio })} current="/transfers">
+  <a class="ui-back" href={localePath(locale, '/transfers')}>← {tr.back}</a>
+  <header class="ui-header">
+    <div>
+      <h1 class="num">{fmt(tr.detail, { folio: transfer.folio })}</h1>
+      <p class="ui-sub">{fmt(tr.route, { from: transfer.from_branch, to: transfer.to_branch })} <Badge tone={tone[transfer.status]}>{tr.status[transfer.status]}</Badge></p>
+    </div>
+    {
+      canChange && (isDestination ? (
+        <form method="post" data-confirm={tr.receiveText} data-confirm-title={tr.receiveTitle} data-confirm-action={tr.receive}>
+          <input type="hidden" name="action" value="receive" />
+          <Button type="submit" icon="package-check">{tr.receive}</Button>
+        </form>
+      ) : (
+        <form method="post" data-confirm={tr.cancelText} data-confirm-title={tr.cancelTitle} data-confirm-action={tr.cancel}>
+          <input type="hidden" name="action" value="cancel" />
+          <Button type="submit" variant="danger" icon="undo-2">{tr.cancel}</Button>
+        </form>
+      ))
+    }
+  </header>
+
+  <div class="ui-notices">
+    {flash.sent && <Notice>{fmt(tr.sent, { folio: flash.sent })}</Notice>}
+    {flash.receive && <Notice>{tr.received}</Notice>}
+    {flash.cancel && <Notice>{tr.cancelled}</Notice>}
+    {pageError && <Notice tone="error">{pageError}</Notice>}
+  </div>
+
+  <div class="ui-grid">
+    <Card title={tr.items}>
+      <dl class="ui-rows">
+        {(transfer.items ?? []).map((i) => (
+          <div><dt><a href={localePath(locale, `/products/${i.product_id}`)}>{i.product}</a></dt><dd class="num ui-strong">{Number(i.quantity)}</dd></div>
+        ))}
+      </dl>
+      {transfer.notes && <p class="ui-muted ui-small">{transfer.notes}</p>}
+    </Card>
+    <Card title={tr.timeline}>
+      <Timeline items={timeline} />
+      <dl class="ui-rows">
+        <div><dt>{tr.sentBy}</dt><dd>{transfer.sent_by}</dd></div>
+        {!inTransit && <div><dt>{tr.updatedBy}</dt><dd>{transfer.last_updated_by}</dd></div>}
+      </dl>
+    </Card>
+  </div>
+</AppLayout>

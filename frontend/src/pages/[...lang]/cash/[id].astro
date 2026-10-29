@@ -1,0 +1,894 @@
+---
+import AppLayout from '@/layouts/AppLayout.astro';
+import Badge from '@/components/ui/Badge.astro';
+import Button from '@/components/ui/Button.astro';
+import Card from '@/components/ui/Card.astro';
+import Dialog from '@/components/ui/Dialog.astro';
+import Field from '@/components/ui/Field.astro';
+import Notice from '@/components/ui/Notice.astro';
+import { fmt, getLocale, localePath, money, useTranslations } from '@/i18n';
+import { ApiError } from '@/lib/api';
+import {
+  addMovement, createCut, currentSession, getRegister, occupyRegister, registerBalances, registerCuts, registerMovements,
+  releaseRegister, renameRegister, type Register,
+} from '@/lib/cash';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const ca = t.cash;
+const { session, accessToken, branch } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'cash')?.permissions ?? [];
+if (!perms.includes('read') || !branch) return Astro.rewrite('/404');
+const canOperate = perms.includes('create');
+const isSupervisor = perms.includes('update');
+const id = Astro.params.id!;
+const selfPath = localePath(locale, `/cash/${id}`);
+
+let register: Register;
+try {
+  register = await getRegister(accessToken, branch.id, id);
+} catch (e) {
+  if (e instanceof ApiError && (e.status === 404 || e.status === 422)) return Astro.rewrite('/404');
+  throw e;
+}
+if (register.deleted_at) return Astro.rewrite('/404');
+
+// --- Occupy / release / movements / cut / rename (form POST, then back here) ---
+const MOVEMENT_TYPES = ['Cash In', 'Cash Out'] as const;
+let openDialog: 'movement' | 'cut' | 'rename' | undefined;
+let movement = { type: 'Cash In', method: '', amount: '', notes: '' };
+let movementErrors: Record<string, string> = {};
+let cutError: string | undefined;
+let cutValues: Record<string, string> = {};
+let cutNotes = '';
+let cutWithdrawal = '';
+let cutReason = '';
+let nameValue = register.name;
+let nameError: string | undefined;
+let pageError: string | undefined;
+
+if (Astro.request.method === 'POST') {
+  const data = await Astro.request.formData();
+  const intent = data.get('intent');
+  const field = (name: string) => String(data.get(name) ?? '').trim();
+  try {
+    if (intent === 'occupy') {
+      await occupyRegister(accessToken, branch.id, id);
+      return Astro.redirect(`${selfPath}?occupied=1`, 303);
+    }
+    if (intent === 'release' || intent === 'force_release') {
+      await releaseRegister(accessToken, branch.id, id, intent === 'force_release');
+      return Astro.redirect(`${localePath(locale, '/cash')}?released=1`, 303);
+    }
+    if (intent === 'rename') {
+      nameValue = field('name');
+      openDialog = 'rename';
+      if (!nameValue) nameError = ca.nameRequired;
+      else {
+        await renameRegister(accessToken, branch.id, id, nameValue);
+        return Astro.redirect(selfPath, 303);
+      }
+    }
+    if (intent === 'movement') {
+      openDialog = 'movement';
+      movement = { type: field('movement_type'), method: field('payment_method_id'), amount: field('amount'), notes: field('notes') };
+      if (!movement.amount || Number(movement.amount) === 0) movementErrors.amount = ca.amountRequired;
+      if (movement.type !== 'Cash In' && !movement.notes) movementErrors.notes = ca.notesRequired;
+      if (!Object.keys(movementErrors).length) {
+        await addMovement(accessToken, branch.id, id, {
+          movement_type: movement.type,
+          payment_method_id: movement.method,
+          amount: movement.amount,
+          notes: movement.notes || null,
+        });
+        return Astro.redirect(`${selfPath}?moved=1`, 303);
+      }
+    }
+    if (intent === 'cut') {
+      openDialog = 'cut';
+      cutNotes = field('notes');
+      cutValues = Object.fromEntries([...data.keys()].filter((k) => k.startsWith('count:')).map((k) => [k.slice(6), field(k)]));
+      const counts = Object.entries(cutValues).filter(([, v]) => v !== '').map(([pm, counted]) => ({ payment_method_id: pm, counted }));
+      if (!counts.length) cutError = ca.cutMissing;
+      else {
+        cutWithdrawal = field('withdrawal').replace(',', '.');
+        cutReason = field('withdrawal_reason');
+        const cut = await createCut(accessToken, branch.id, id, counts, cutNotes || null, cutWithdrawal || '0', cutReason || null);
+        return Astro.redirect(`${selfPath}?cut=${cut.id}#cuts`, 303);
+      }
+    }
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    const detail = e.body?.detail;
+    if (intent === 'movement') {
+      if (e.status === 403) movementErrors.form = ca.occupyFirst;
+      else if (detail?.balance !== undefined) movementErrors.amount = fmt(ca.notEnough, { balance: money(locale, Number(detail.balance)) });
+      else if (Array.isArray(detail)) movementErrors.amount = ca.amountRequired;
+      else movementErrors.form = ca.failed;
+    } else if (intent === 'cut') {
+      cutError = e.status === 403 ? ca.occupyFirst : detail?.missing ? ca.cutMissing : detail?.field === 'withdrawal' ? ca.withdrawalTooMuch
+        : e.status === 409 ? ca.overlap : ca.failed;
+    } else if (intent === 'rename') {
+      nameError = e.status === 409 ? ca.nameTaken : ca.nameRequired;
+    } else if (intent === 'occupy' && e.status === 409) {
+      pageError = detail?.session ? fmt(ca.youHaveAnother, { register: detail.session.cash_register, branch: detail.session.branch }) : ca.takenBy;
+    } else {
+      pageError = ca.failed;
+    }
+  }
+  Astro.response.status = 422;
+}
+
+const params = Astro.url.searchParams;
+const typeFilter = MOVEMENT_TYPES.includes(params.get('type') as never) || ['Sale', 'Return'].includes(params.get('type') ?? '')
+  ? params.get('type')!
+  : undefined;
+const page = Math.max(1, Number.parseInt(params.get('page') ?? '1', 10) || 1);
+const [mySession, balances, movements, cuts] = await Promise.all([
+  currentSession(accessToken),
+  registerBalances(accessToken, branch.id, id),
+  registerMovements(accessToken, branch.id, id, page, typeFilter),
+  registerCuts(accessToken, branch.id, id),
+]);
+
+const mine = mySession?.cash_register_id === id;
+const operate = (mine && canOperate) || isSupervisor;
+const tz = session.user.timezone;
+const when = new Intl.DateTimeFormat(t.intl, { dateStyle: 'medium', timeStyle: 'short', timeZone: tz });
+const time = new Intl.DateTimeFormat(t.intl, { hour: 'numeric', minute: '2-digit', timeZone: tz });
+const methodName = (d: string) => ca.methodNames[d] ?? d;
+// Cash first (it's what a register is mostly about), then the rest by their translated name
+balances.sort((a, b) =>
+  Number(a.description !== 'Cash') - Number(b.description !== 'Cash') || methodName(a.description).localeCompare(methodName(b.description), t.intl));
+const link = (p: Record<string, string | number | undefined>) => {
+  const q = new URLSearchParams(Object.entries(p).filter(([, v]) => v !== undefined).map(([k, v]) => [k, String(v)]));
+  return `${selfPath}${q.size ? `?${q}` : ''}#movements`;
+};
+const tone = (n: number) => (n === 0 ? 'zero' : n < 0 ? 'negative' : 'positive');
+const enabledMethods = balances.filter((b) => b.is_enabled);
+---
+
+<AppLayout title={register.name} current="/cash">
+  <header class="page-header">
+    <Button variant="tertiary" icon="arrow-left" href={localePath(locale, '/cash')} class="back">{ca.back}</Button>
+    <div class="title-row">
+      <h1>{register.name}</h1>
+      {mine ? <Badge tone="accent">{ca.mine}</Badge> : register.session_id ? <Badge tone="warning">{ca.occupied}</Badge> : <Badge tone="success">{ca.free}</Badge>}
+      <div class="header-actions">
+        {isSupervisor && <Button variant="tertiary" icon="pencil" data-dialog="rename-dialog">{ca.rename}</Button>}
+        {
+          mine && (
+            <form method="post" data-confirm={ca.releaseText} data-confirm-title={ca.releaseTitle} data-confirm-action={ca.release}>
+              <input type="hidden" name="intent" value="release" />
+              <Button type="submit" variant="secondary" icon="log-out">{ca.release}</Button>
+            </form>
+          )
+        }
+        {
+          !register.session_id && canOperate && !mySession && (
+            <form method="post">
+              <input type="hidden" name="intent" value="occupy" />
+              <Button type="submit" icon="log-in">{ca.occupy}</Button>
+            </form>
+          )
+        }
+        {
+          register.session_id && !mine && isSupervisor && (
+            <form
+              method="post"
+              data-confirm={fmt(ca.forceReleaseText, { name: register.occupied_by_name ?? '', register: register.name })}
+              data-confirm-title={ca.forceReleaseTitle}
+              data-confirm-action={ca.forceRelease}
+            >
+              <input type="hidden" name="intent" value="force_release" />
+              <Button type="submit" variant="secondary" icon="unlock">{ca.forceRelease}</Button>
+            </form>
+          )
+        }
+      </div>
+    </div>
+    {
+      register.session_id && (
+        <p class="sub">{fmt(ca.occupiedBy, { name: mine ? t.calendar.you : register.occupied_by_name ?? '', time: time.format(new Date(register.occupied_since!)) })}</p>
+      )
+    }
+  </header>
+
+  <div class="notices">
+    {params.get('occupied') && <Notice>{fmt(ca.occupiedOk, { name: register.name })}</Notice>}
+    {params.get('moved') && <Notice>{ca.movementSaved}</Notice>}
+    {params.get('cut') && <Notice>{`${ca.cutSaved} ${ca.cutAfter}`}</Notice>}
+    {pageError && <Notice tone="error">{pageError}</Notice>}
+    {!operate && <Notice tone="warning">{ca.notYours}</Notice>}
+    {operate && !mine && register.session_id && <Notice tone="warning">{fmt(ca.supervising, { name: register.occupied_by_name ?? '' })}</Notice>}
+  </div>
+
+  <section aria-labelledby="balances-title" class="section">
+    <div class="section-head">
+      <h2 id="balances-title">{ca.balances}</h2>
+      {
+        operate && (
+          <div class="ops">
+            <Button variant="secondary" icon="arrow-down-to-line" data-movement="Cash In">{ca.cashIn}</Button>
+            <Button variant="secondary" icon="arrow-up-from-line" data-movement="Cash Out">{ca.cashOut}</Button>
+            <Button icon="calculator" data-dialog="cut-dialog">{ca.cut}</Button>
+          </div>
+        )
+      }
+    </div>
+    <ul class="balances" role="list">
+      {
+        balances.map((b) => (
+          <li class="balance">
+            <span class="balance-name">{methodName(b.description)}</span>
+            <span class:list={['balance-amount num', { negative: b.balance < 0 }]}>{money(locale, b.balance)}</span>
+          </li>
+        ))
+      }
+    </ul>
+  </section>
+
+  <section id="movements" aria-labelledby="movements-title" class="section">
+    <div class="section-head">
+      <h2 id="movements-title">{ca.movements}</h2>
+      <nav class="filters" aria-label={ca.colType}>
+        <a href={link({})} aria-current={!typeFilter ? 'true' : undefined}>{ca.allTypes}</a>
+        {
+          ['Cash In', 'Cash Out', 'Sale', 'Return'].map((type) => (
+            <a href={link({ type })} aria-current={typeFilter === type ? 'true' : undefined}>{ca.types[type]}</a>
+          ))
+        }
+      </nav>
+    </div>
+    {
+      movements.items.length === 0 ? (
+        <p class="empty">{typeFilter ? ca.noMovementsType : ca.noMovements}</p>
+      ) : (
+        <div class="table-wrap">
+          <table class="table">
+            <thead>
+              <tr>
+                <th scope="col">{ca.colWhen}</th>
+                <th scope="col">{ca.colType}</th>
+                <th scope="col">{ca.colMethod}</th>
+                <th scope="col" class="numeric">{ca.colAmount}</th>
+                <th scope="col" class="numeric">{ca.colBalance}</th>
+                <th scope="col">{ca.colBy}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {movements.items.map((m) => (
+                <tr>
+                  <td data-label={ca.colWhen} class="num nowrap">{when.format(new Date(m.created_at))}</td>
+                  <td data-label={ca.colType}>
+                    <span class="type">{ca.types[m.movement_type] ?? m.movement_type}</span>
+                    {m.notes && <span class="note">{m.notes}</span>}
+                  </td>
+                  <td data-label={ca.colMethod}>{methodName(m.payment_method)}</td>
+                  <td data-label={ca.colAmount} class:list={['numeric num amount', tone(m.amount)]}>
+                    {m.amount > 0 ? '+' : ''}{money(locale, m.amount)}
+                  </td>
+                  <td data-label={ca.colBalance} class="numeric num">{money(locale, m.balance_after)}</td>
+                  <td data-label={ca.colBy} class="muted">{m.created_by_email}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )
+    }
+    {
+      (page > 1 || movements.has_more) && (
+        <div class="pager">
+          {page > 1 && <Button variant="secondary" icon="chevron-left" href={link({ type: typeFilter, page: page - 1 })}>{ca.newer}</Button>}
+          {movements.has_more && <Button variant="secondary" href={link({ type: typeFilter, page: page + 1 })}>{ca.older}</Button>}
+        </div>
+      )
+    }
+  </section>
+
+  <section id="cuts" aria-labelledby="cuts-title" class="section">
+    <h2 id="cuts-title">{ca.cuts}</h2>
+    {
+      cuts.items.length === 0 ? (
+        <p class="empty">{ca.noCuts}</p>
+      ) : (
+        <div class="cuts">
+          {cuts.items.map((c) => (
+            <Card class:list={['cut', { highlight: params.get('cut') === c.id }]}>
+              <div class="cut-head">
+                <strong class="num">{when.format(new Date(c.ended_at))}</strong>
+                <span class="muted">{c.performed_by}</span>
+                <span class="muted small num">
+                  {fmt(ca.period, { from: when.format(new Date(c.started_at)), to: time.format(new Date(c.ended_at)) })}
+                </span>
+              </div>
+              <table class="cut-table">
+                <thead>
+                  <tr>
+                    <th scope="col">{ca.colMethod}</th>
+                    <th scope="col" class="numeric">{ca.expected}</th>
+                    <th scope="col" class="numeric">{ca.counted}</th>
+                    <th scope="col" class="numeric">{ca.difference}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {c.details.map((d) => (
+                    <tr>
+                      <td>{methodName(d.payment_method)}</td>
+                      <td class="numeric num">{money(locale, d.expected_amount)}</td>
+                      <td class="numeric num">{money(locale, d.final_amount)}</td>
+                      <td class:list={['numeric num amount', tone(d.difference)]}>
+                        {d.difference === 0 ? ca.exact : `${d.difference > 0 ? '+' : ''}${money(locale, d.difference)}`}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {Number(c.withdrawn) > 0 && <p class="small">{fmt(ca.withdrawn, { amount: money(locale, Number(c.withdrawn)) })}{c.withdrawal_reason && ` · ${c.withdrawal_reason}`}</p>}
+              {c.notes && <p class="muted small">{c.notes}</p>}
+            </Card>
+          ))}
+        </div>
+      )
+    }
+  </section>
+
+  {
+    operate && (
+      <Dialog id="movement-dialog" title={ca.movementTitles[movement.type] ?? ca.movementTitles['Cash In']} closeLabel={ca.close} open={openDialog === 'movement'}>
+        <form method="post" class="form" novalidate data-movement-form>
+          {movementErrors.form && <p class="alert" role="alert">{movementErrors.form}</p>}
+          <input type="hidden" name="intent" value="movement" />
+          <input type="hidden" name="movement_type" value={movement.type} />
+          <p class="help" data-help>{ca.movementHelp[movement.type]}</p>
+          <Field label={ca.paymentMethod} name="payment_method_id" as="select">
+            {enabledMethods.map((b) => (
+              <option value={b.payment_method_id} selected={b.payment_method_id === movement.method}>
+                {methodName(b.description)} ({money(locale, b.balance)})
+              </option>
+            ))}
+          </Field>
+          <Field
+            label={ca.amount}
+            name="amount"
+            type="number"
+            inputmode="decimal"
+            step="0.01"
+            value={movement.amount}
+            error={movementErrors.amount}
+            required
+          />
+          <Field
+            label={ca.notes}
+            name="notes"
+            value={movement.notes}
+            placeholder={ca.notesPlaceholder}
+            hint={movementErrors.notes ? undefined : ca.notesRequired}
+            error={movementErrors.notes}
+            maxlength={500}
+          />
+          <div class="form-actions">
+            <Button variant="tertiary" data-dialog-close>{ca.cancel}</Button>
+            <Button type="submit">{ca.register}</Button>
+          </div>
+        </form>
+      </Dialog>
+      <Dialog id="cut-dialog" title={ca.cutTitle} closeLabel={ca.close} open={openDialog === 'cut'}>
+        <form method="post" class="form" novalidate data-cut-form data-intl={t.intl}>
+          {cutError && <p class="alert" role="alert">{cutError}</p>}
+          <input type="hidden" name="intent" value="cut" />
+          <p class="help">{ca.cutIntro}</p>
+          <table class="count-table">
+            <thead>
+              <tr>
+                <th scope="col">{ca.colMethod}</th>
+                <th scope="col" class="numeric">{ca.expected}</th>
+                <th scope="col" class="numeric">{ca.counted}</th>
+                <th scope="col" class="numeric">{ca.difference}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {balances.map((b) => (
+                <tr>
+                  <th scope="row">
+                    <label for={`count-${b.payment_method_id}`}>{methodName(b.description)}</label>
+                  </th>
+                  <td class="numeric num">{money(locale, b.balance)}</td>
+                  <td class="numeric">
+                    <input
+                      id={`count-${b.payment_method_id}`}
+                      class="count"
+                      name={`count:${b.payment_method_id}`}
+                      type="number"
+                      inputmode="decimal"
+                      step="0.01"
+                      min="0"
+                      value={cutValues[b.payment_method_id] ?? ''}
+                      placeholder="0.00"
+                      required={b.balance !== 0}
+                      data-expected={b.balance}
+                    />
+                  </td>
+                  <td class="numeric num diff" data-diff aria-live="polite">—</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div class="withdrawal" data-cash-id={balances.find((b) => b.description === 'Cash')?.payment_method_id ?? ''}>
+            <Field label={ca.withdrawal} name="withdrawal" id="cut-withdrawal" inputmode="decimal" autocomplete="off" value={cutWithdrawal}
+              placeholder="0.00" hint={ca.withdrawalHint} />
+            <Field label={ca.withdrawalReason} name="withdrawal_reason" id="cut-withdrawal-reason" maxlength={200} value={cutReason}
+              placeholder={ca.withdrawalReasonDefault} />
+            <p class="stays">{ca.staysInCash}: <strong class="num" data-stays>—</strong></p>
+            <p class="alert" role="alert" hidden data-withdrawal-error>{ca.withdrawalTooMuch}</p>
+          </div>
+          <Field label={ca.notes} name="notes" value={cutNotes} maxlength={500} />
+          <div class="form-actions">
+            <Button variant="tertiary" data-dialog-close>{ca.cancel}</Button>
+            <Button type="submit">{ca.cutSave}</Button>
+          </div>
+        </form>
+      </Dialog>
+    )
+  }
+
+  {
+    isSupervisor && (
+      <Dialog id="rename-dialog" title={ca.renameTitle} closeLabel={ca.close} open={openDialog === 'rename'}>
+        <form method="post" class="form" novalidate>
+          <input type="hidden" name="intent" value="rename" />
+          <Field label={ca.name} name="name" value={nameValue} error={nameError} required maxlength={100} />
+          <div class="form-actions">
+            <Button variant="tertiary" data-dialog-close>{ca.cancel}</Button>
+            <Button type="submit">{ca.save}</Button>
+          </div>
+        </form>
+      </Dialog>
+    )
+  }
+  <div hidden data-movement-copy data-titles={JSON.stringify(ca.movementTitles)} data-helps={JSON.stringify(ca.movementHelp)}></div>
+</AppLayout>
+
+<script>
+  // One dialog for cash in, cash out and adjustments: set the type, title and help, then open it.
+  const dialog = document.querySelector<HTMLDialogElement>('#movement-dialog');
+  const form = dialog?.querySelector<HTMLFormElement>('[data-movement-form]');
+  const titles: Record<string, string> = JSON.parse(document.querySelector<HTMLElement>('[data-movement-copy]')?.dataset.titles ?? '{}');
+  const helps: Record<string, string> = JSON.parse(document.querySelector<HTMLElement>('[data-movement-copy]')?.dataset.helps ?? '{}');
+  document.querySelectorAll<HTMLElement>('[data-movement]').forEach((button) =>
+    button.addEventListener('click', () => {
+      if (!dialog || !form) return;
+      const type = button.dataset.movement!;
+      (form.elements.namedItem('movement_type') as HTMLInputElement).value = type;
+      dialog.querySelector('[data-dialog-title]')!.textContent = titles[type];
+      form.querySelector('[data-help]')!.textContent = helps[type];
+      form.querySelectorAll('[role=alert], .error').forEach((el) => el.remove());
+      (form.elements.namedItem('amount') as HTMLInputElement).value = '';
+      (form.elements.namedItem('notes') as HTMLInputElement).value = '';
+      dialog.showModal();
+      (form.elements.namedItem('amount') as HTMLInputElement).focus();
+    }),
+  );
+
+  // Cut: show the difference as the cashier types each count
+  const cut = document.querySelector<HTMLFormElement>('[data-cut-form]');
+  if (cut) {
+    const currency = new Intl.NumberFormat(cut.dataset.intl, { style: 'currency', currency: 'MXN', signDisplay: 'exceptZero' });
+    const update = (input: HTMLInputElement) => {
+      const cell = input.closest('tr')!.querySelector<HTMLElement>('[data-diff]')!;
+      if (input.value === '') {
+        cell.textContent = '—';
+        cell.className = 'numeric num diff';
+        return;
+      }
+      const diff = Math.round((Number(input.value) - Number(input.dataset.expected)) * 100) / 100;
+      cell.textContent = currency.format(diff);
+      cell.className = `numeric num diff amount ${diff === 0 ? 'zero' : diff < 0 ? 'negative' : 'positive'}`;
+    };
+    cut.querySelectorAll<HTMLInputElement>('input.count').forEach((input) => {
+      input.addEventListener('input', () => update(input));
+      update(input);
+    });
+    // What stays in the drawer: the cash counted minus the cut withdrawal (it can't be more than the cash counted)
+    const box = cut.querySelector<HTMLElement>('[data-cash-id]')!;
+    const cashInput = box.dataset.cashId ? cut.querySelector<HTMLInputElement>(`#count-${box.dataset.cashId}`) : null;
+    const withdrawal = cut.querySelector<HTMLInputElement>('#cut-withdrawal')!;
+    const plain = new Intl.NumberFormat(cut.dataset.intl, { style: 'currency', currency: 'MXN' });
+    const stays = () => {
+      const counted = Number(cashInput?.value || 0);
+      const out = Number(withdrawal.value.replace(',', '.') || 0);
+      const bad = !(out >= 0) || out > counted;
+      box.querySelector<HTMLElement>('[data-stays]')!.textContent = bad ? '—' : plain.format(counted - out);
+      box.querySelector<HTMLElement>('[data-withdrawal-error]')!.hidden = !bad;
+      return !bad;
+    };
+    cashInput?.addEventListener('input', stays);
+    withdrawal.addEventListener('input', stays);
+    cut.addEventListener('submit', (e) => { if (!stays()) e.preventDefault(); });
+    stays();
+  }
+
+  const url = new URL(location.href);
+  if (['occupied', 'moved', 'cut'].some((k) => url.searchParams.has(k))) {
+    ['occupied', 'moved', 'cut'].forEach((k) => url.searchParams.delete(k));
+    history.replaceState(null, '', url);
+  }
+</script>
+
+<style>
+  .page-header {
+    display: grid;
+    gap: var(--space-2);
+    margin-bottom: var(--space-6);
+  }
+
+  .page-header > :global(.back) {
+    justify-self: start;
+    margin-inline-start: calc(-1 * var(--space-2));
+  }
+
+  .title-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-3);
+  }
+
+  .header-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    margin-inline-start: auto;
+  }
+
+  .sub,
+  .muted {
+    color: var(--text-muted);
+  }
+
+  .small {
+    font-size: var(--text-sm);
+  }
+
+  .notices {
+    display: grid;
+    gap: var(--space-2);
+    margin-bottom: var(--space-6);
+  }
+
+  .notices:empty {
+    display: none;
+  }
+
+  .section {
+    margin-bottom: var(--space-8);
+  }
+
+  .section h2 {
+    font-size: var(--text-lg);
+  }
+
+  .section-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    margin-bottom: var(--space-4);
+  }
+
+  .ops {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+  }
+
+  /* --- Balances: the number the cashier looks at all day --- */
+  .balances {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 13rem), 1fr));
+    gap: var(--space-3);
+    padding: 0;
+    list-style: none;
+  }
+
+  .balance {
+    display: grid;
+    gap: var(--space-1);
+    padding: var(--space-4) var(--space-5);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-container);
+  }
+
+  .balance-name {
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+  }
+
+  .balance-amount {
+    color: var(--text-title);
+    font-size: var(--text-2xl);
+    font-weight: var(--weight-bold);
+    line-height: var(--leading-tight);
+  }
+
+  .balance-amount.negative {
+    color: var(--status-error-text);
+  }
+
+  /* --- Movements --- */
+  .filters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-1);
+  }
+
+  .filters a {
+    padding: var(--space-1) var(--space-3);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-pill);
+    color: var(--text-body);
+    font-size: var(--text-sm);
+    text-decoration: none;
+  }
+
+  .filters a:hover {
+    border-color: var(--border-input);
+  }
+
+  .filters a[aria-current] {
+    background: var(--color-primary);
+    border-color: var(--color-primary);
+    color: var(--text-on-color);
+  }
+
+  .empty {
+    padding: var(--space-6);
+    background: var(--bg-surface);
+    border: 1px dashed var(--border-input);
+    border-radius: var(--radius-container);
+    color: var(--text-muted);
+    text-align: center;
+  }
+
+  .table-wrap {
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-container);
+    overflow-x: auto;
+  }
+
+  .table,
+  .cut-table,
+  .count-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: var(--text-sm);
+  }
+
+  .table th,
+  .cut-table th,
+  .count-table thead th {
+    padding: var(--space-2) var(--space-4);
+    color: var(--text-muted);
+    font-weight: var(--weight-medium);
+    text-align: start;
+    white-space: nowrap;
+  }
+
+  .table th {
+    background: var(--bg-surface);
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .table td {
+    padding: var(--space-3) var(--space-4);
+    border-bottom: 1px solid var(--border-subtle);
+    vertical-align: top;
+  }
+
+  .table tbody tr:last-child td {
+    border-bottom: 0;
+  }
+
+  .numeric,
+  .table th.numeric,
+  .cut-table th.numeric,
+  .count-table th.numeric {
+    text-align: end;
+  }
+
+  .nowrap {
+    white-space: nowrap;
+  }
+
+  .type {
+    display: block;
+    color: var(--text-title);
+    font-weight: var(--weight-medium);
+  }
+
+  .note {
+    color: var(--text-muted);
+  }
+
+  /* Money in, money out, and differences: text colors that pass contrast, with the sign always shown */
+  .amount {
+    font-weight: var(--weight-bold);
+  }
+
+  .amount.positive {
+    color: var(--status-success-text);
+  }
+
+  .amount.negative {
+    color: var(--status-error-text);
+  }
+
+  .amount.zero {
+    color: var(--text-muted);
+  }
+
+  .pager {
+    display: flex;
+    gap: var(--space-2);
+    margin-top: var(--space-4);
+  }
+
+  .withdrawal {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--space-3);
+    align-items: start;
+  }
+  .withdrawal .stays,
+  .withdrawal .alert {
+    grid-column: 1 / -1;
+    margin: 0;
+  }
+  @media (max-width: 30rem) {
+    .withdrawal {
+      grid-template-columns: 1fr;
+    }
+  }
+  /* --- Cuts --- */
+  .cuts {
+    display: grid;
+    gap: var(--space-3);
+  }
+
+  .cuts > :global(.highlight) {
+    border-color: var(--color-primary);
+  }
+
+  .cut-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: var(--space-1) var(--space-3);
+  }
+
+  .cut-head strong {
+    color: var(--text-title);
+  }
+
+  .cut-table td {
+    padding: var(--space-2) var(--space-4);
+    border-top: 1px solid var(--border-subtle);
+  }
+
+  .cut-table th:first-child,
+  .cut-table td:first-child {
+    padding-inline-start: 0;
+  }
+
+  /* --- Dialogs --- */
+  .form {
+    display: grid;
+    gap: var(--space-4);
+  }
+
+  .help {
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+  }
+
+  .alert {
+    padding: var(--space-3);
+    background: color-mix(in srgb, var(--status-error) 8%, var(--bg-app));
+    border: 1px solid var(--status-error);
+    border-radius: var(--radius-control);
+    color: var(--text-title);
+    font-size: var(--text-sm);
+  }
+
+  .count-table th,
+  .count-table td {
+    padding: var(--space-2) var(--space-2);
+  }
+
+  .count-table thead th:first-child,
+  .count-table tbody th {
+    padding-inline-start: 0;
+  }
+
+  .count-table tbody th {
+    color: var(--text-title);
+    font-weight: var(--weight-medium);
+    text-align: start;
+  }
+
+  .count {
+    width: 7.5rem;
+    min-height: var(--control-height);
+    padding: var(--space-2) var(--space-3);
+    background: var(--bg-input);
+    border: 1px solid var(--border-input);
+    border-radius: var(--radius-control);
+    color: var(--text-body);
+    text-align: end;
+  }
+
+  .count:focus-visible {
+    outline: none;
+    border-color: var(--color-primary);
+    box-shadow: 0 0 0 3px var(--focus-ring);
+  }
+
+  .diff {
+    min-width: 6.5rem;
+  }
+
+  .form-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--space-2);
+  }
+
+  @media (max-width: 48rem) {
+    .table thead {
+      display: none;
+    }
+
+    .table,
+    .table tbody,
+    .table tr,
+    .table td {
+      display: block;
+    }
+
+    .table-wrap {
+      border: 0;
+    }
+
+    .table tbody {
+      display: grid;
+      gap: var(--space-2);
+    }
+
+    .table tr {
+      padding: var(--space-3) var(--space-4);
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-container);
+    }
+
+    .table td {
+      display: flex;
+      justify-content: space-between;
+      gap: var(--space-3);
+      padding: var(--space-1) 0;
+      border: 0;
+    }
+
+    .table td::before {
+      content: attr(data-label);
+      color: var(--text-muted);
+    }
+
+    .count {
+      width: 6rem;
+    }
+  }
+</style>

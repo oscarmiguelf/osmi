@@ -1,0 +1,93 @@
+---
+// What was paid for an expense or a purchase (from the register / another way), what is still owed, and a dialog
+// to pay it. The page handles the POST (intent=pay) with readPayment + paymentErrorText (lib/expenses).
+import PaymentSplit from '@/components/payments/PaymentSplit.astro';
+import Button from '@/components/ui/Button.astro';
+import Card from '@/components/ui/Card.astro';
+import Dialog from '@/components/ui/Dialog.astro';
+import Field from '@/components/ui/Field.astro';
+import { money, useTranslations, type Locale } from '@/i18n';
+import type { OutgoingPayment } from '@/lib/expenses';
+
+interface Props {
+  locale: Locale;
+  tz: string;
+  total: number;
+  paid: number;
+  owed: number;
+  payments: OutgoingPayment[];
+  /** Can record a payment now (permission, not voided). */
+  canPay: boolean;
+  register: { name: string; cash: number } | null;
+  error?: string;
+  values?: { cash_amount: string; other_amount: string };
+  /** The note payments get by default (the expense's concept, the purchase's reference): not repeated on each one. */
+  defaultNote?: string | null;
+}
+
+const { locale, tz, total, paid, owed, payments, canPay, register, error, values, defaultNote } = Astro.props;
+const t = useTranslations(locale);
+const o = t.outgoing;
+const when = new Intl.DateTimeFormat(t.intl, { dateStyle: 'medium', timeStyle: 'short', timeZone: tz });
+---
+
+<Card title={o.payments}>
+  <dl class="ui-rows">
+    <div><dt>{o.total}</dt><dd class="num">{money(locale, total)}</dd></div>
+    <div><dt>{o.paid}</dt><dd class="num">{money(locale, paid)}</dd></div>
+    <div class:list={['owed', { due: owed > 0 }]}><dt>{o.owed}</dt><dd class="num">{owed > 0 ? money(locale, owed) : o.paidInFull}</dd></div>
+  </dl>
+  {payments.length === 0 ? <p class="ui-muted ui-small">{o.noPayments}</p> : (
+    <ul class="list" role="list">
+      {payments.map((p) => (
+        <li>
+          <span class="what">
+            <strong>{o.sources[p.source]}{p.cash_register && ` · ${p.cash_register}`}</strong>
+            <span class="ui-muted ui-small">{when.format(new Date(p.created_at))}{p.created_by_email && ` · ${p.created_by_email}`}{p.notes && p.notes !== defaultNote && ` · ${p.notes}`}</span>
+          </span>
+          <span class="num">{money(locale, Number(p.amount))}</span>
+        </li>
+      ))}
+    </ul>
+  )}
+  {canPay && owed > 0 && <Button variant="secondary" icon="hand-coins" data-dialog="pay-dialog">{o.pay}</Button>}
+</Card>
+
+{canPay && owed > 0 && (
+  <Dialog id="pay-dialog" title={o.payTitle} closeLabel={t.ui.close} open={!!error}>
+    <form method="post" class="ui-form" novalidate>
+      <input type="hidden" name="intent" value="pay" />
+      {error && <p class="ui-alert ui-full" role="alert">{error}</p>}
+      <div class="ui-full"><PaymentSplit locale={locale} register={register} total={owed} values={values} idPrefix="later" /></div>
+      <div class="ui-full"><Field label={o.payNotes} name="notes" maxlength={200} /></div>
+      <div class="ui-form-actions">
+        <Button variant="tertiary" data-dialog-close>{t.ui.cancel}</Button>
+        <Button type="submit" icon="check">{o.pay}</Button>
+      </div>
+    </form>
+  </Dialog>
+)}
+
+<style>
+  .owed {
+    font-weight: var(--weight-bold);
+  }
+  .due dd {
+    color: var(--status-error-text);
+  }
+  .list {
+    display: grid;
+    gap: var(--space-2);
+    margin: var(--space-3) 0;
+    padding: 0;
+    list-style: none;
+  }
+  .what {
+    display: grid;
+  }
+  .list li {
+    display: flex;
+    justify-content: space-between;
+    gap: var(--space-3);
+  }
+</style>

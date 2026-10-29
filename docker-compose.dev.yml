@@ -1,0 +1,19 @@
+# Local development on top of docker-compose.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d db api
+# The frontend runs with `npm run dev` (frontend/.env: API_URL=http://localhost:8000); `npm run dev:lan` opens it to
+# the local network on purpose (e.g. to try it on a phone).
+# Postgres is published on 5433 (5432 may be taken by a local Postgres): psql -h localhost -p 5433 -U osmi osmi
+services:
+  db:
+    ports:
+      - "127.0.0.1:5433:5432"  # only this computer, never the Wi-Fi
+
+  api:
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./backend/app:/code/app
+      - ./backend/tests:/code/tests
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    environment:
+      API_DOCS: "1"  # interactive docs at http://localhost:8000/docs (off in production)

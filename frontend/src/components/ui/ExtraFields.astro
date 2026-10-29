@@ -1,0 +1,49 @@
+---
+// The business's own fields (Settings → additional data) as form inputs: extra.<field id>, read back with readExtra.
+// Used by the customer form and the appointment forms.
+import Field from './Field.astro';
+import type { CustomField } from '@/lib/customFields';
+
+interface Props {
+  fields: CustomField[];
+  values?: Record<string, unknown>;
+  /** Messages keyed by field id */
+  errors?: Record<string, string>;
+  title?: string;
+  /** Prefix of the input ids (two forms on one page must not share them) */
+  idPrefix?: string;
+}
+
+const { fields, values = {}, errors = {}, title, idPrefix = 'extra' } = Astro.props;
+---
+
+{fields.length > 0 && title && <p class="ui-full extra-title">{title}</p>}
+{
+  fields.map((f) => {
+    const name = `extra.${f.id}`;
+    const value = values[f.id];
+    const common = { label: f.label, name, id: `${idPrefix}-${f.id}`, required: f.required, error: errors[f.id] };
+    return f.field_type === 'boolean' ? (
+      <label class="ui-check ui-full"><input type="checkbox" name={name} checked={value === true || value === 'true'} />{f.label}</label>
+    ) : f.field_type === 'select' ? (
+      <Field {...common} as="select">
+        <option value="">—</option>
+        {f.options.map((o) => <option value={o} selected={o === value}>{o}</option>)}
+      </Field>
+    ) : f.field_type === 'long_text' ? (
+      <div class="ui-full"><Field {...common} as="textarea" rows={2} value={String(value ?? '')} maxlength={2000} /></div>
+    ) : (
+      <Field {...common} type={f.field_type === 'number' ? 'number' : f.field_type === 'date' ? 'date' : 'text'}
+        step={f.field_type === 'number' ? 'any' : undefined} value={String(value ?? '')} maxlength={f.field_type === 'text' ? 200 : undefined} />
+    );
+  })
+}
+
+<style>
+  .extra-title {
+    margin: var(--space-2) 0 0;
+    padding-top: var(--space-3);
+    border-top: 1px solid var(--border-subtle);
+    font-weight: var(--weight-bold);
+  }
+</style>

@@ -1,0 +1,195 @@
+---
+import AppLayout from '@/layouts/AppLayout.astro';
+import PaymentsCard from '@/components/payments/PaymentsCard.astro';
+import Badge from '@/components/ui/Badge.astro';
+import Button from '@/components/ui/Button.astro';
+import Card from '@/components/ui/Card.astro';
+import Dialog from '@/components/ui/Dialog.astro';
+import Field from '@/components/ui/Field.astro';
+import Notice from '@/components/ui/Notice.astro';
+import Timeline from '@/components/ui/Timeline.astro';
+import { fmt, getLocale, localePath, money, useTranslations } from '@/i18n';
+import { ApiError } from '@/lib/api';
+import { costChangesText, getPurchase, listCatalog, payPurchase, purchaseHistory, updatePurchase, voidPurchase, type Purchase } from '@/lib/products';
+import { setFlash, takeFlash } from '@/lib/session';
+import { currentSession } from '@/lib/cash';
+import { paymentErrorText, readPayment } from '@/lib/expenses';
+import { localInputToInstant, toLocalInput } from '@/lib/time';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const pu = t.purchases;
+const { session, accessToken, branch } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'purchases')?.permissions ?? [];
+const seeSuppliers = session.modules.some((m) => m.code === 'suppliers' && m.permissions.includes('read'));
+if (!perms.includes('read') || !branch) return Astro.rewrite('/404');
+const id = Astro.params.id!;
+const selfPath = localePath(locale, `/purchases/${id}`);
+const tz = session.user.timezone;
+
+let pageError: { text: string; items?: string[] } | undefined;
+let editError: string | undefined;
+let edited: Record<string, string> | undefined;
+let payError: string | undefined;
+let payValues: { cash_amount: string; other_amount: string } | undefined;
+if (Astro.request.method === 'POST') {
+  const data = await Astro.request.formData();
+  const intent = data.get('intent');
+  try {
+    if (intent === 'void' && perms.includes('delete')) {
+      const r = await voidPurchase(accessToken, branch.id, id);
+      setFlash(Astro.cookies, { voided: '1', costs: costChangesText(r.cost_changes, locale, pu.costChange),
+        cashBack: Number(r.cash_returned) ? money(locale, Number(r.cash_returned)) : '' });
+    }
+    if (intent === 'pay' && perms.includes('update')) {
+      const payment = readPayment(data);
+      payValues = { cash_amount: String(data.get('cash_amount') ?? ''), other_amount: String(data.get('other_amount') ?? '') };
+      if (!Number(payment.cash_amount) && !Number(payment.other_amount)) throw new ApiError(422, { detail: { code: 'empty' } });
+      await payPurchase(accessToken, branch.id, id, { ...payment, notes: String(data.get('notes') ?? '').trim() || null });
+      setFlash(Astro.cookies, { paid: '1' });
+    }
+    if (intent === 'edit' && perms.includes('update')) {
+      edited = Object.fromEntries(['supplier_id', 'purchased_at', 'reference', 'notes'].map((k) => [k, String(data.get(k) ?? '').trim()]));
+      await updatePurchase(accessToken, branch.id, id, {
+        supplier_id: edited.supplier_id || null,
+        ...(edited.purchased_at && { purchased_at: localInputToInstant(edited.purchased_at, tz) }),
+        reference: edited.reference || null,
+        notes: edited.notes || null,
+      });
+      setFlash(Astro.cookies, { updated: '1' });
+    }
+    return Astro.redirect(selfPath, 303);
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    const detail = e.body?.detail;
+    const short: { product: string; needed: number; available: number }[] = detail?.products ?? [];
+    if (intent === 'pay') {
+      payError = detail?.code === 'empty' ? t.outgoing.enterAmount : paymentErrorText(detail, t.outgoing, (n) => money(locale, n)) ?? t.ui.failed;
+    } else if (intent === 'edit') {
+      editError = detail?.field === 'purchased_at' ? pu.futureDate : e.status === 409 ? pu.alreadyVoided
+        : e.status === 422 ? t.ui.formError : e.status === 403 ? t.ui.forbidden : t.ui.failed;
+    } else {
+      pageError = short.length
+        ? { text: pu.cantVoid, items: short.map((s) => fmt(pu.shortItem, { product: s.product, needed: Number(s.needed), available: Number(s.available) })) }
+        : { text: e.status === 409 ? pu.alreadyVoided : e.status === 403 ? t.ui.forbidden : t.ui.failed };
+    }
+    Astro.response.status = e.status;
+  }
+}
+
+let purchase: Purchase & { movements?: { product: string; quantity: number; stock_after: number }[] };
+try {
+  purchase = await getPurchase(accessToken, branch.id, id);
+} catch (e) {
+  if (e instanceof ApiError && (e.status === 404 || e.status === 422)) return Astro.rewrite('/404');
+  throw e;
+}
+const [history, suppliers, mine] = await Promise.all([purchaseHistory(accessToken, branch.id, id), listCatalog(accessToken, 'suppliers'),
+  currentSession(accessToken)]);
+const register = mine && mine.branch_id === branch.id ? { name: mine.cash_register, cash: Number(mine.cash_balance) } : null;
+const flash = takeFlash(Astro.cookies);
+const when = new Intl.DateTimeFormat(t.intl, { dateStyle: 'medium', timeStyle: 'short', timeZone: tz });
+// Stock after the purchase came in: its own Purchase movements (a void adds negative ones)
+const after = new Map((purchase.movements ?? []).filter((m) => Number(m.quantity) > 0).map((m) => [m.product, Number(m.stock_after)]));
+const active = !purchase.deleted_at;
+const values = edited ?? {
+  supplier_id: purchase.supplier_id ?? '', purchased_at: toLocalInput(purchase.purchased_at, tz),
+  reference: purchase.reference ?? '', notes: purchase.notes ?? '',
+};
+const timeline = history.items.map((h) => ({
+  title: `${pu.historyActions[h.action] ?? h.action} ${pu.historyEntities[h.entity_type] ?? h.entity_type}`
+    + (h.action === 'UPDATE' && h.changed_fields?.length
+      ? `: ${h.changed_fields.filter((f) => f in pu.historyFields).map((f) => pu.historyFields[f]).join(', ')}` : ''),
+  meta: `${h.changed_by_email ?? '—'}, ${when.format(new Date(h.changed_at))}`,
+}));
+const title = fmt(pu.detail, { date: when.format(new Date(purchase.purchased_at)) });
+---
+
+<AppLayout title={title} current="/purchases">
+  <a class="ui-back" href={localePath(locale, '/purchases')}>← {pu.back}</a>
+  <header class="ui-header">
+    <div>
+      <h1>{title}</h1>
+      <p class="ui-sub">{purchase.supplier && purchase.supplier_id && seeSuppliers ? <a href={localePath(locale, `/suppliers/${purchase.supplier_id}`)}>{purchase.supplier}</a> : purchase.supplier ?? pu.noSupplier}{purchase.reference ? `, ${purchase.reference}` : ''} {!active && <Badge tone="error">{pu.voidedBadge}</Badge>}</p>
+    </div>
+    <div class="ui-actions">
+      {active && perms.includes('update') && <Button variant="secondary" icon="pencil" data-dialog="edit-purchase">{pu.edit}</Button>}
+      {
+        active && perms.includes('delete') && (
+          <form method="post" data-confirm={pu.voidText} data-confirm-title={pu.voidTitle} data-confirm-action={pu.void}>
+            <input type="hidden" name="intent" value="void" />
+            <Button type="submit" variant="danger" icon="ban">{pu.void}</Button>
+          </form>
+        )
+      }
+    </div>
+  </header>
+
+  <div class="ui-notices">
+    {flash.saved && <Notice>{pu.saved}</Notice>}
+    {flash.updated && <Notice>{pu.updated}</Notice>}
+    {flash.voided && <Notice tone="warning">{pu.voided}{flash.cashBack && ` ${fmt(t.outgoing.cashBack, { amount: flash.cashBack })}`}</Notice>}
+    {flash.paid && <Notice>{t.outgoing.paidOk}</Notice>}
+    {flash.costs && <Notice>{fmt(pu.costChanged, { list: flash.costs })}</Notice>}
+    {pageError && (
+      <Notice tone="error">
+        {pageError.text}
+        {pageError.items && <ul>{pageError.items.map((i) => <li>{i}</li>)}</ul>}
+      </Notice>
+    )}
+  </div>
+
+  <div class="ui-grid">
+    <Card title={pu.items} class="ui-wide">
+      <div class="ui-table-wrap">
+        <table class="ui-table">
+          <thead><tr><th scope="col">{pu.product}</th><th scope="col" class="ui-end">{pu.quantity}</th><th scope="col" class="ui-end">{pu.unitCost}</th><th scope="col" class="ui-end">{pu.lineTotal}</th><th scope="col" class="ui-end">{pu.stockAfter}</th></tr></thead>
+          <tbody>
+            {(purchase.items ?? []).map((i) => (
+              <tr>
+                <td data-label={pu.product}><a class="ui-strong" href={localePath(locale, `/products/${i.product_id}`)}>{i.product}</a></td>
+                <td data-label={pu.quantity} class="ui-end num">{Number(i.quantity)}</td>
+                <td data-label={pu.unitCost} class="ui-end num">{money(locale, Number(i.unit_cost))}</td>
+                <td data-label={pu.lineTotal} class="ui-end num">{money(locale, Number(i.line_total))}</td>
+                <td data-label={pu.stockAfter} class="ui-end num ui-muted">{after.get(i.product) ?? '—'}</td>
+              </tr>
+            ))}
+          </tbody>
+          <tfoot><tr><th scope="row" colspan="3" class="ui-end">{pu.total}</th><td class="ui-end num ui-strong">{money(locale, Number(purchase.total))}</td><td /></tr></tfoot>
+        </table>
+      </div>
+      {purchase.notes && <p class="ui-muted ui-small">{purchase.notes}</p>}
+      <p class="ui-muted ui-small">{purchase.created_by_email}</p>
+    </Card>
+    <PaymentsCard locale={locale} tz={tz} total={Number(purchase.total)} paid={Number(purchase.paid ?? 0)} owed={active ? Number(purchase.owed ?? 0) : 0}
+      payments={purchase.payments ?? []} canPay={active && perms.includes('update')} register={register} error={payError} values={payValues}
+      defaultNote={purchase.reference} />
+    <Card title={pu.history}>
+      <Timeline items={timeline} />
+    </Card>
+  </div>
+
+  {
+    active && perms.includes('update') && (
+      <Dialog id="edit-purchase" title={pu.editTitle} closeLabel={t.ui.close} open={!!editError}>
+        <form method="post" class="ui-form" novalidate>
+          {editError && <p class="ui-alert" role="alert">{editError}</p>}
+          <input type="hidden" name="intent" value="edit" />
+          <p class="ui-full ui-muted ui-small">{pu.editHint}</p>
+          <Field label={pu.supplier} name="supplier_id" as="select">
+            <option value="">{pu.noSupplier}</option>
+            {suppliers.map((s) => <option value={s.id} selected={s.id === values.supplier_id}>{s.name}</option>)}
+          </Field>
+          <Field label={pu.purchasedAt} name="purchased_at" type="datetime-local" value={values.purchased_at} required
+            error={editError === pu.futureDate ? pu.futureDate : undefined} />
+          <div class="ui-full"><Field label={pu.reference} name="reference" value={values.reference} maxlength={100} /></div>
+          <div class="ui-full"><Field label={pu.notes} name="notes" as="textarea" rows={2} value={values.notes} maxlength={2000} /></div>
+          <div class="ui-form-actions">
+            <Button variant="tertiary" data-dialog-close>{t.ui.cancel}</Button>
+            <Button type="submit">{t.ui.saveChanges}</Button>
+          </div>
+        </form>
+      </Dialog>
+    )
+  }
+</AppLayout>

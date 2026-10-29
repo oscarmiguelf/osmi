@@ -1,0 +1,94 @@
+---
+// The customer form fields, shared by "New customer" and "Edit customer". Errors come keyed by API field name.
+import ExtraFields from '@/components/ui/ExtraFields.astro';
+import Field from '@/components/ui/Field.astro';
+import { useTranslations, type Locale } from '@/i18n';
+import type { CustomField } from '@/lib/customFields';
+
+interface Props {
+  locale: Locale;
+  values: Record<'full_name' | 'phone' | 'additional_phone' | 'email' | 'company' | 'address' | 'credit_limit', string>;
+  errors: Record<string, string>;
+  /** customers.credit: without it the limit is shown but can't be changed (and isn't sent). */
+  canCredit: boolean;
+  /** The business's extra fields (Settings), their values and errors keyed by field id */
+  fields?: CustomField[];
+  extra?: Record<string, unknown>;
+  extraErrors?: Record<string, string>;
+  /** Price lists to choose from, and the customer's (empty: general price) */
+  priceLists?: { id: string; name: string }[];
+  priceListId?: string;
+}
+
+const { locale, values, errors, canCredit, fields = [], extra = {}, extraErrors = {}, priceLists = [], priceListId = '' } = Astro.props;
+const pl = useTranslations(locale).priceLists;
+const cu = useTranslations(locale).customers;
+---
+
+<Field
+  label={cu.fullName}
+  name="full_name"
+  value={values.full_name}
+  placeholder={cu.fullNamePlaceholder}
+  error={errors.full_name}
+  required
+  maxlength={200}
+  autocomplete="off"
+/>
+<Field
+  label={cu.phone}
+  name="phone"
+  type="tel"
+  inputmode="tel"
+  value={values.phone}
+  placeholder={cu.phonePlaceholder}
+  hint={errors.phone ? undefined : cu.phoneHint}
+  error={errors.phone}
+  required
+/>
+<Field
+  label={cu.additionalPhone}
+  name="additional_phone"
+  type="tel"
+  inputmode="tel"
+  value={values.additional_phone}
+  placeholder={cu.phonePlaceholder}
+  error={errors.additional_phone}
+/>
+<Field
+  label={cu.email}
+  name="email"
+  type="email"
+  value={values.email}
+  placeholder={cu.emailPlaceholder}
+  error={errors.email}
+  maxlength={255}
+/>
+<Field
+  label={cu.company}
+  name="company"
+  value={values.company}
+  placeholder={cu.companyPlaceholder}
+  error={errors.company}
+  maxlength={200}
+/>
+<Field label={cu.address} name="address" as="textarea" rows={2} value={values.address} error={errors.address} maxlength={500} />
+<Field
+  label={cu.creditLimit}
+  name="credit_limit"
+  type="number"
+  inputmode="decimal"
+  min="0"
+  step="0.01"
+  value={values.credit_limit}
+  hint={errors.credit_limit ? undefined : canCredit ? cu.creditHint : cu.creditNoPermission}
+  error={errors.credit_limit}
+  disabled={!canCredit}
+/>
+{priceLists.length > 0 && (
+  <Field label={pl.customerList} name="price_list_id" as="select" error={errors.price_list_id}>
+    <option value="">{pl.noList}</option>
+    {priceLists.map((l) => <option value={l.id} selected={l.id === priceListId}>{l.name}</option>)}
+  </Field>
+)}
+<ExtraFields fields={fields} values={extra} errors={extraErrors} title={cu.extraTitle} />

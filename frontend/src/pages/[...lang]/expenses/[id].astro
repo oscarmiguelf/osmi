@@ -1,0 +1,161 @@
+---
+// One expense: what it was, how it was paid, paying what is still owed, and editing (not the amount).
+import AppLayout from '@/layouts/AppLayout.astro';
+import PaymentsCard from '@/components/payments/PaymentsCard.astro';
+import Badge from '@/components/ui/Badge.astro';
+import Button from '@/components/ui/Button.astro';
+import Card from '@/components/ui/Card.astro';
+import Dialog from '@/components/ui/Dialog.astro';
+import Field from '@/components/ui/Field.astro';
+import Notice from '@/components/ui/Notice.astro';
+import { fmt, getLocale, localePath, money, useTranslations } from '@/i18n';
+import { ApiError } from '@/lib/api';
+import { currentSession } from '@/lib/cash';
+import { getExpense, payExpense, paymentErrorText, readPayment, updateExpense, type Expense } from '@/lib/expenses';
+import { listCatalog } from '@/lib/products';
+import { takeFlash } from '@/lib/session';
+import { localInputToInstant, toLocalInput } from '@/lib/time';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const ex = t.expenses;
+const { session, accessToken, branch } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'expenses')?.permissions ?? [];
+if (!perms.includes('read') || !branch) return Astro.rewrite('/404');
+const canUpdate = perms.includes('update');
+const tz = session.user.timezone;
+const id = Astro.params.id!;
+const selfPath = localePath(locale, `/expenses/${id}`);
+
+let expense: Expense;
+try {
+  expense = await getExpense(accessToken, branch.id, id);
+} catch (e) {
+  if (e instanceof ApiError && (e.status === 404 || e.status === 422)) return Astro.rewrite('/404');
+  throw e;
+}
+const voided = expense.deleted_at !== null;
+
+let values = { description: expense.description, spent_at: toLocalInput(expense.spent_at, tz), supplier_id: expense.supplier_id ?? '',
+  reference: expense.reference ?? '', notes: expense.notes ?? '' };
+let editError: string | undefined;
+let payError: string | undefined;
+let payValues: { cash_amount: string; other_amount: string } | undefined;
+if (Astro.request.method === 'POST' && canUpdate && !voided) {
+  const data = await Astro.request.formData();
+  if (data.get('intent') === 'pay') {
+    const payment = readPayment(data);
+    payValues = { cash_amount: String(data.get('cash_amount') ?? ''), other_amount: String(data.get('other_amount') ?? '') };
+    if (!Number(payment.cash_amount) && !Number(payment.other_amount)) payError = t.outgoing.enterAmount;
+    else {
+      try {
+        await payExpense(accessToken, branch.id, id, { ...payment, notes: String(data.get('notes') ?? '').trim() || null });
+        return Astro.redirect(`${selfPath}?paid=1`, 303);
+      } catch (e) {
+        if (!(e instanceof ApiError)) throw e;
+        payError = paymentErrorText(e.body?.detail, t.outgoing, (n) => money(locale, n)) ?? t.ui.failed;
+      }
+    }
+  } else {
+    values = Object.fromEntries(Object.keys(values).map((k) => [k, String(data.get(k) ?? '').trim()])) as typeof values;
+    if (!values.description) editError = ex.errors.description;
+    else {
+      try {
+        await updateExpense(accessToken, branch.id, id, {
+          description: values.description, supplier_id: values.supplier_id || null, reference: values.reference || null,
+          notes: values.notes || null, ...(values.spent_at && { spent_at: localInputToInstant(values.spent_at, tz) }),
+        });
+        return Astro.redirect(`${selfPath}?edited=1`, 303);
+      } catch (e) {
+        if (!(e instanceof ApiError)) throw e;
+        editError = e.body?.detail?.field === 'spent_at' ? ex.errors.spent_at : t.ui.failed;
+      }
+    }
+  }
+  Astro.response.status = 422;
+}
+
+const flash = takeFlash(Astro.cookies);
+const params = Astro.url.searchParams;
+const notice = flash.saved ? ex.saved : params.has('paid') ? t.outgoing.paidOk : params.has('edited') ? ex.edited : undefined;
+const [mine, suppliers] = await Promise.all([currentSession(accessToken), canUpdate && !voided ? listCatalog(accessToken, 'suppliers') : Promise.resolve([])]);
+const register = mine && mine.branch_id === branch.id ? { name: mine.cash_register, cash: Number(mine.cash_balance) } : null;
+const when = new Intl.DateTimeFormat(t.intl, { dateStyle: 'medium', timeStyle: 'short', timeZone: tz });
+const seeSuppliers = session.modules.some((m) => m.code === 'suppliers' && m.permissions.includes('read'));
+---
+
+<AppLayout title={expense.description} current="/expenses">
+  <a class="ui-back" href={localePath(locale, '/expenses')}>← {ex.back}</a>
+  <header class="ui-header">
+    <div>
+      <h1>{expense.description} {voided && <Badge tone="error">{ex.voidedBadge}</Badge>}</h1>
+      <p class="ui-sub num">{money(locale, Number(expense.amount))} · {when.format(new Date(expense.spent_at))}</p>
+    </div>
+    {canUpdate && !voided && <Button variant="secondary" icon="pencil" data-dialog="edit-expense">{t.ui.edit}</Button>}
+  </header>
+
+  <div class="ui-notices" data-flash={notice ? '' : undefined}>
+    {notice && <Notice tone="success">{notice}</Notice>}
+    {voided && (
+      <Notice tone="error">
+        {fmt(ex.voidedBanner, { who: expense.deleted_by_email ?? '—', date: when.format(new Date(expense.deleted_at!)) })}
+        {expense.void_reason && ` ${expense.void_reason}`}
+      </Notice>
+    )}
+  </div>
+
+  <div class="ui-grid">
+    <Card title={ex.detail}>
+      <dl class="ui-rows">
+        <div><dt>{ex.supplier}</dt><dd>{expense.supplier
+          ? seeSuppliers ? <a href={localePath(locale, `/suppliers/${expense.supplier_id}`)}>{expense.supplier}</a> : expense.supplier
+          : '—'}</dd></div>
+        <div><dt>{ex.reference}</dt><dd>{expense.reference ?? '—'}</dd></div>
+        <div><dt>{ex.createdBy}</dt><dd>{expense.created_by_email}<span class="ui-line2">{when.format(new Date(expense.created_at))}</span></dd></div>
+      </dl>
+      {expense.notes && <p class="notes">{expense.notes}</p>}
+    </Card>
+    <PaymentsCard locale={locale} tz={tz} total={Number(expense.amount)} paid={Number(expense.paid)} owed={voided ? 0 : Number(expense.owed)}
+      payments={expense.payments} canPay={canUpdate && !voided} register={register} error={payError} values={payValues}
+      defaultNote={expense.description.slice(0, 200)} />
+  </div>
+
+  {canUpdate && !voided && (
+    <Dialog id="edit-expense" title={ex.editTitle} closeLabel={t.ui.close} open={!!editError}>
+      <form method="post" class="ui-form" novalidate>
+        <input type="hidden" name="intent" value="edit" />
+        {editError && <p class="ui-alert ui-full" role="alert">{editError}</p>}
+        <div class="ui-full"><Field label={ex.description} name="description" id="ed-description" value={values.description} required maxlength={200} /></div>
+        <Field label={ex.spentAt} name="spent_at" id="ed-spent" type="datetime-local" value={values.spent_at}
+          max={Temporal.Now.plainDateTimeISO(tz).toString({ smallestUnit: 'minute' })} />
+        <Field label={ex.supplier} name="supplier_id" id="ed-supplier" as="select">
+          <option value="">{ex.noSupplier}</option>
+          {suppliers.map((s) => <option value={s.id} selected={s.id === values.supplier_id}>{s.name}</option>)}
+        </Field>
+        <div class="ui-full"><Field label={ex.reference} name="reference" id="ed-reference" value={values.reference} maxlength={100} /></div>
+        <div class="ui-full"><Field label={ex.notes} name="notes" id="ed-notes" as="textarea" rows={2} value={values.notes} maxlength={2000} /></div>
+        <p class="ui-muted ui-small ui-full">{ex.amountFixed}</p>
+        <div class="ui-form-actions">
+          <Button variant="tertiary" data-dialog-close>{t.ui.cancel}</Button>
+          <Button type="submit">{t.ui.saveChanges}</Button>
+        </div>
+      </form>
+    </Dialog>
+  )}
+</AppLayout>
+
+<script>
+  if (document.querySelector('[data-flash]')) {
+    const url = new URL(location.href);
+    url.searchParams.delete('paid');
+    url.searchParams.delete('edited');
+    history.replaceState(null, '', url);
+  }
+</script>
+
+<style>
+  .notes {
+    margin-top: var(--space-3);
+    white-space: pre-line;
+  }
+</style>

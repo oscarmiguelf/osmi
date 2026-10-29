@@ -1,0 +1,483 @@
+---
+import AppLayout from '@/layouts/AppLayout.astro';
+import Badge from '@/components/ui/Badge.astro';
+import Button from '@/components/ui/Button.astro';
+import Card from '@/components/ui/Card.astro';
+import Dialog from '@/components/ui/Dialog.astro';
+import EmptyState from '@/components/ui/EmptyState.astro';
+import Field from '@/components/ui/Field.astro';
+import Icon from '@/components/ui/Icon.astro';
+import Notice from '@/components/ui/Notice.astro';
+import { fmt, getLocale, localePath, useTranslations } from '@/i18n';
+import { ApiError } from '@/lib/api';
+import {
+  createRegister, currentSession, deleteRegister, listPaymentMethods, listRegisters, occupyRegister, releaseRegister,
+  updatePaymentMethod,
+} from '@/lib/cash';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const ca = t.cash;
+const { session, accessToken, branch } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'cash')?.permissions ?? [];
+if (!perms.includes('read')) return Astro.rewrite('/404');
+const canOperate = perms.includes('create');
+const isSupervisor = perms.includes('update');
+const canDelete = perms.includes('delete');
+const basePath = localePath(locale, '/cash');
+
+let pageError: { text: string; items?: string[] } | undefined;
+let nameError: string | undefined;
+let newName = '';
+
+if (branch && Astro.request.method === 'POST') {
+  const data = await Astro.request.formData();
+  const intent = data.get('intent');
+  const id = String(data.get('register_id') ?? '');
+  const name = String(data.get('register_name') ?? '');
+  try {
+    if (intent === 'occupy') {
+      await occupyRegister(accessToken, branch.id, id);
+      return Astro.redirect(`${localePath(locale, `/cash/${id}`)}?occupied=1`, 303);
+    }
+    if (intent === 'force_release') {
+      await releaseRegister(accessToken, branch.id, id, true);
+      return Astro.redirect(`${basePath}?released=1`, 303);
+    }
+    if (intent === 'delete') {
+      await deleteRegister(accessToken, branch.id, id);
+      return Astro.redirect(`${basePath}?deleted=${encodeURIComponent(name)}`, 303);
+    }
+    if (intent === 'method') {
+      await updatePaymentMethod(accessToken, String(data.get('method_id')), { is_enabled: data.get('is_enabled') === 'on' });
+      return Astro.redirect(`${basePath}#methods`, 303);
+    }
+    if (intent === 'create') {
+      newName = String(data.get('name') ?? '').trim();
+      if (!newName) nameError = ca.nameRequired;
+      else {
+        const created = await createRegister(accessToken, branch.id, newName);
+        return Astro.redirect(`${localePath(locale, `/cash/${created.id}`)}`, 303);
+      }
+    }
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    const detail = e.body?.detail;
+    if (intent === 'create') nameError = e.status === 409 ? ca.nameTaken : e.status === 422 ? ca.nameRequired : ca.failed;
+    else if (intent === 'occupy' && e.status === 409) {
+      pageError = { text: detail?.session ? fmt(ca.youHaveAnother, { register: detail.session.cash_register, branch: detail.session.branch }) : ca.takenBy };
+    } else if (intent === 'delete' && e.status === 409) {
+      const blockers: Record<string, string | number> = detail?.blockers ?? {};
+      pageError = { text: fmt(ca.blocked, { name }), items: Object.entries(blockers).map(([k, v]) => fmt(ca.blockers[k] ?? k, { value: v })) };
+    } else pageError = { text: ca.failed };
+  }
+  Astro.response.status = 422;
+}
+
+const [registers, mySession, methods] = branch
+  ? await Promise.all([
+      listRegisters(accessToken, branch.id),
+      currentSession(accessToken),
+      isSupervisor ? listPaymentMethods(accessToken, true) : Promise.resolve([]),
+    ])
+  : [[], undefined, []];
+
+const params = Astro.url.searchParams;
+const time = new Intl.DateTimeFormat(t.intl, { hour: 'numeric', minute: '2-digit', timeZone: session.user.timezone });
+const methodName = (d: string) => ca.methodNames[d] ?? d;
+// Cash first (it's what a register is mostly about), then the rest by their translated name
+const byMethod = (a: string, b: string) => Number(a !== 'Cash') - Number(b !== 'Cash') || methodName(a).localeCompare(methodName(b), t.intl);
+methods.sort((a, b) => byMethod(a.description, b.description));
+const elsewhere = mySession && branch && mySession.branch_id !== branch.id;
+---
+
+<AppLayout title={ca.title} current="/cash">
+  <header class="page-header">
+    <div>
+      <h1>{ca.title}</h1>
+      {branch && <p class="sub">{branch.name}</p>}
+    </div>
+    {branch && isSupervisor && registers.length > 0 && <Button icon="plus" data-dialog="new-register">{ca.newRegister}</Button>}
+  </header>
+
+  {
+    !branch ? (
+      <Notice tone="warning">{ca.noBranch}</Notice>
+    ) : (
+      <>
+        <div class="notices">
+          {params.get('released') && <Notice>{ca.released}</Notice>}
+          {params.get('deleted') && <Notice>{fmt(ca.deleted, { name: params.get('deleted')! })}</Notice>}
+          {elsewhere && (
+            <Notice tone="warning">{fmt(ca.youHaveAnother, { register: mySession!.cash_register, branch: mySession!.branch })}</Notice>
+          )}
+          {pageError && (
+            <Notice tone="error">
+              {pageError.text}
+              {pageError.items && (
+                <ul class="list">
+                  {pageError.items.map((item) => (
+                    <li>{item}</li>
+                  ))}
+                </ul>
+              )}
+            </Notice>
+          )}
+        </div>
+
+        {registers.length === 0 ? (
+          <EmptyState icon="wallet" title={ca.emptyTitle} text={isSupervisor ? ca.emptyText : ca.emptyNoPermission}>
+            {isSupervisor && <Button icon="plus" data-dialog="new-register">{ca.newRegister}</Button>}
+          </EmptyState>
+        ) : (
+          <ul class="grid" role="list">
+            {registers.map((r) => {
+              const mine = mySession?.cash_register_id === r.id;
+              const href = localePath(locale, `/cash/${r.id}`);
+              return (
+                <li class:list={['item', { mine }]}>
+                  <a class="card" href={href}>
+                    <span class="top">
+                      <span class="name">{r.name}</span>
+                      {mine ? <Badge tone="accent">{ca.mine}</Badge> : r.session_id ? <Badge tone="warning">{ca.occupied}</Badge> : <Badge tone="success">{ca.free}</Badge>}
+                    </span>
+                    {r.session_id && (
+                      <span class="status">
+                        <Icon name="user-round" size={16} />
+                        {fmt(ca.occupiedBy, { name: mine ? t.calendar.you : r.occupied_by_name ?? '', time: time.format(new Date(r.occupied_since!)) })}
+                      </span>
+                    )}
+                  </a>
+                  <div class="actions">
+                    {mine && <Button href={href} icon="arrow-right">{ca.continue}</Button>}
+                    {!r.session_id && canOperate && !mySession && (
+                      <form method="post">
+                        <input type="hidden" name="intent" value="occupy" />
+                        <input type="hidden" name="register_id" value={r.id} />
+                        <Button type="submit" variant="secondary" icon="log-in">{ca.occupy}</Button>
+                      </form>
+                    )}
+                    {r.session_id && !mine && isSupervisor && (
+                      <form
+                        method="post"
+                        data-confirm={fmt(ca.forceReleaseText, { name: r.occupied_by_name ?? '', register: r.name })}
+                        data-confirm-title={ca.forceReleaseTitle}
+                        data-confirm-action={ca.forceRelease}
+                      >
+                        <input type="hidden" name="intent" value="force_release" />
+                        <input type="hidden" name="register_id" value={r.id} />
+                        <Button type="submit" variant="tertiary" icon="unlock">{ca.forceRelease}</Button>
+                      </form>
+                    )}
+                  </div>
+                  {canDelete && !r.session_id && (
+                    <form
+                      method="post"
+                      class="corner"
+                      data-confirm={fmt(ca.deleteText, { name: r.name })}
+                      data-confirm-title={ca.deleteTitle}
+                      data-confirm-action={ca.deleteAction}
+                    >
+                      <input type="hidden" name="intent" value="delete" />
+                      <input type="hidden" name="register_id" value={r.id} />
+                      <input type="hidden" name="register_name" value={r.name} />
+                      <button type="submit" class="delete" aria-label={fmt(ca.deleteRow, { name: r.name })}>
+                        <Icon name="trash-2" size={18} />
+                      </button>
+                    </form>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        )}
+
+        {isSupervisor && methods.length > 0 && (
+          <section id="methods" class="methods" aria-labelledby="methods-title">
+            <Card>
+              <h2 id="methods-title" class="card-title">{ca.paymentMethods}</h2>
+              <p class="hint">{ca.paymentMethodsHint}</p>
+              <ul class="method-list" role="list">
+                {methods.map((m) => (
+                  <li>
+                    <form method="post" class="method" data-autosubmit>
+                      <input type="hidden" name="intent" value="method" />
+                      <input type="hidden" name="method_id" value={m.id} />
+                      <label class="switch">
+                        <span class="method-name">
+                          {methodName(m.description)}
+                          {m.is_credit && <span class="credit"><Icon name="info" size={14} /></span>}
+                        </span>
+                        <input type="checkbox" name="is_enabled" role="switch" checked={m.is_enabled} />
+                        <span class="track" aria-hidden="true" />
+                      </label>
+                      <noscript><Button type="submit" variant="tertiary">{ca.save}</Button></noscript>
+                    </form>
+                  </li>
+                ))}
+              </ul>
+            </Card>
+          </section>
+        )}
+
+        {isSupervisor && (
+          <Dialog id="new-register" title={ca.newRegister} closeLabel={ca.close} open={!!nameError}>
+            <form method="post" class="form" novalidate>
+              <input type="hidden" name="intent" value="create" />
+              <Field label={ca.name} name="name" value={newName} placeholder={ca.namePlaceholder} error={nameError} required maxlength={100} />
+              <div class="form-actions">
+                <Button variant="tertiary" data-dialog-close>{ca.cancel}</Button>
+                <Button type="submit">{ca.create}</Button>
+              </div>
+            </form>
+          </Dialog>
+        )}
+      </>
+    )
+  }
+</AppLayout>
+
+<script>
+  // Switching a payment method on/off saves right away
+  document.querySelectorAll<HTMLFormElement>('form[data-autosubmit]').forEach((f) =>
+    f.querySelector('input[type=checkbox]')?.addEventListener('change', () => f.requestSubmit()),
+  );
+  const url = new URL(location.href);
+  if (url.searchParams.has('released') || url.searchParams.has('deleted')) {
+    url.searchParams.delete('released');
+    url.searchParams.delete('deleted');
+    history.replaceState(null, '', url);
+  }
+</script>
+
+<style>
+  .page-header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: var(--space-4);
+    margin-bottom: var(--space-6);
+  }
+
+  .sub {
+    margin-top: var(--space-1);
+    color: var(--text-muted);
+  }
+
+  .notices {
+    display: grid;
+    gap: var(--space-2);
+    margin-bottom: var(--space-4);
+  }
+
+  .notices:empty {
+    display: none;
+  }
+
+  .list {
+    margin-top: var(--space-1);
+    padding-inline-start: var(--space-5);
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 17rem), 1fr));
+    gap: var(--space-4);
+    padding: 0;
+    list-style: none;
+  }
+
+  .item {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-container);
+    transition: border-color var(--duration-fast) ease;
+  }
+
+  .item:hover {
+    border-color: var(--border-input);
+  }
+
+  /* Your own register stands out: it's where you work */
+  .item.mine {
+    border-color: var(--color-primary);
+    box-shadow: inset 4px 0 0 var(--color-accent);
+  }
+
+  .card {
+    display: grid;
+    gap: var(--space-2);
+    padding: var(--space-5) var(--space-5) var(--space-3);
+    color: var(--text-body);
+    text-decoration: none;
+  }
+
+  .top {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+    padding-inline-end: var(--space-8);
+  }
+
+  .name {
+    color: var(--text-title);
+    font-size: var(--text-lg);
+    font-weight: var(--weight-bold);
+  }
+
+  .status {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+  }
+
+  .actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    margin-top: auto;
+    padding: 0 var(--space-5) var(--space-5);
+  }
+
+  .actions:empty {
+    display: none;
+  }
+
+  .corner {
+    position: absolute;
+    top: var(--space-3);
+    inset-inline-end: var(--space-3);
+  }
+
+  .delete {
+    display: grid;
+    place-items: center;
+    width: 2.25rem;
+    height: 2.25rem;
+    background: none;
+    border: 0;
+    border-radius: var(--radius-control);
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+
+  .delete:hover {
+    background: color-mix(in srgb, var(--status-error) 8%, transparent);
+    color: var(--status-error-text);
+  }
+
+  @media (hover: hover) {
+    .delete {
+      opacity: 0;
+    }
+    .item:hover .delete,
+    .delete:focus-visible {
+      opacity: 1;
+    }
+  }
+
+  .methods {
+    max-width: 32rem;
+    margin-top: var(--space-8);
+  }
+
+  .card-title {
+    font-size: var(--text-md);
+  }
+
+  .hint {
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+  }
+
+  .method-list {
+    display: grid;
+    padding: 0;
+    list-style: none;
+  }
+
+  .method-list li + li {
+    border-top: 1px solid var(--border-subtle);
+  }
+
+  .switch {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-4);
+    min-height: 3rem;
+    cursor: pointer;
+  }
+
+  .method-name {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    color: var(--text-title);
+    font-weight: var(--weight-medium);
+  }
+
+  .credit {
+    color: var(--text-muted);
+  }
+
+  .switch input {
+    position: absolute;
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .track {
+    position: relative;
+    flex-shrink: 0;
+    width: 2.5rem;
+    height: 1.5rem;
+    background: var(--border-input);
+    border-radius: var(--radius-pill);
+    transition: background-color var(--duration-fast) ease;
+  }
+
+  .track::after {
+    content: '';
+    position: absolute;
+    top: 3px;
+    left: 3px;
+    width: calc(1.5rem - 6px);
+    height: calc(1.5rem - 6px);
+    background: var(--bg-app);
+    border-radius: 50%;
+    transition: transform var(--duration-fast) ease;
+  }
+
+  .switch input:checked + .track {
+    background: var(--color-primary);
+  }
+
+  .switch input:checked + .track::after {
+    transform: translateX(1rem);
+  }
+
+  .switch input:focus-visible + .track {
+    outline: 2px solid var(--color-primary);
+    outline-offset: 2px;
+  }
+
+  .form {
+    display: grid;
+    gap: var(--space-4);
+  }
+
+  .form-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--space-2);
+  }
+</style>

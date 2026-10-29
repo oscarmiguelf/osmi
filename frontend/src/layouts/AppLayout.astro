@@ -1,0 +1,267 @@
+---
+import BaseLayout from './BaseLayout.astro';
+import Sidebar from '@/components/layout/Sidebar.astro';
+import ConfirmDialog from '@/components/ui/ConfirmDialog.astro';
+import Icon from '@/components/ui/Icon.astro';
+import { getLocale, useTranslations } from '@/i18n';
+
+interface Props {
+  title: string;
+  /** App path of this page without the locale prefix, used to mark the active nav item. */
+  current: string;
+}
+
+const { title, current } = Astro.props;
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const session = Astro.locals.session!; // the middleware redirects to /login when there is none
+// Whoever sells keeps a copy on the device to sell without internet, and sends what was sold offline
+const canSell = session.modules.some((m) => m.code === 'sales' && m.permissions.includes('create')) && Astro.locals.branch;
+---
+
+<BaseLayout title={title}>
+    <a class="skip" href="#content">{t.app.skipToContent}</a>
+    <div class="shell">
+      <Sidebar locale={locale} session={session} current={current} />
+      <div class="backdrop" data-menu-close hidden></div>
+      <div class="page">
+        <header class="topbar">
+          <button
+            type="button"
+            class="menu"
+            data-menu-open
+            aria-controls="sidebar"
+            aria-expanded="false"
+            aria-label={t.app.openMenu}
+          >
+            <Icon name="menu" />
+          </button>
+          <span class="topbar-title">{t.app.name}</span>
+        </header>
+        <main id="content" tabindex="-1">
+          {canSell && (
+            <a class="offline-pending" href="/pos-offline" hidden data-offline-sync data-user={session.user.id} data-name={session.user.name}
+              data-locale={locale} data-text={t.offline.pendingBanner}></a>
+          )}
+          <slot />
+          <!-- Shown while the next page loads (see the script below) -->
+          <div class="page-skeleton" aria-hidden="true">
+            <span class="ui-skel ui-skel-title"></span>
+            <span class="ui-skel ui-skel-text"></span>
+            <div class="sk-cards">{[1, 2, 3].map(() => <span class="ui-skel ui-skel-block"></span>)}</div>
+            <span class="ui-skel ui-skel-control sk-bar"></span>
+            <div class="sk-rows">{[1, 2, 3, 4, 5, 6].map((n) => <span class="ui-skel" style={`width: ${100 - (n % 3) * 12}%`}></span>)}</div>
+          </div>
+          <p class="visually-hidden" role="status" data-loading-status></p>
+        </main>
+      </div>
+    </div>
+    <ConfirmDialog cancelLabel={t.app.cancel} defaultTitle={t.app.confirmTitle} />
+
+    <script>
+      // Mobile drawer: open/close, Escape, backdrop click, and keep the page behind it inert.
+      const sidebar = document.getElementById('sidebar')!;
+      const page = document.querySelector<HTMLElement>('.page')!;
+      const backdrop = document.querySelector<HTMLElement>('.backdrop')!;
+      const openButton = document.querySelector<HTMLButtonElement>('[data-menu-open]')!;
+
+      function setOpen(open: boolean, restoreFocus = true) {
+        sidebar.toggleAttribute('data-open', open);
+        backdrop.hidden = !open;
+        page.inert = open;
+        openButton.setAttribute('aria-expanded', String(open));
+        if (open) sidebar.querySelector<HTMLElement>('a')?.focus();
+        else if (restoreFocus) openButton.focus();
+      }
+
+      openButton.addEventListener('click', () => setOpen(true));
+      document.querySelectorAll('[data-menu-close]').forEach((el) => el.addEventListener('click', () => setOpen(false)));
+      document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && sidebar.hasAttribute('data-open')) setOpen(false);
+      });
+      matchMedia('(min-width: 60.01rem)').addEventListener('change', (e) => e.matches && setOpen(false, false));
+    </script>
+
+    <script>
+      // Page skeleton: when a navigation takes more than a moment, the content gives way to its loading shape.
+      // Fast pages never show it (150 ms grace), and a form whose submit was cancelled (validation, a confirm,
+      // the charge dialog...) doesn't trigger it: we look once every listener has had its say.
+      const main = document.querySelector<HTMLElement>('main#content')!;
+      const status = main.querySelector<HTMLElement>('[data-loading-status]')!;
+      const label = document.documentElement.lang === 'en' ? 'Loading…' : 'Cargando…';
+      let timer: ReturnType<typeof setTimeout> | undefined;
+
+      function start() {
+        clearTimeout(timer);
+        timer = setTimeout(() => {
+          main.setAttribute('aria-busy', 'true');
+          main.toggleAttribute('data-loading', true);
+          status.textContent = label;
+          scrollTo({ top: 0 });
+        }, 150);
+      }
+      function reset() {
+        clearTimeout(timer);
+        main.removeAttribute('aria-busy');
+        main.removeAttribute('data-loading');
+        status.textContent = '';
+      }
+
+      document.addEventListener('click', (e) => {
+        const a = (e.target as Element).closest?.('a[href]') as HTMLAnchorElement | null;
+        if (!a || e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+        const url = new URL(a.href, location.href);
+        if (a.target || a.hasAttribute('download') || url.origin !== location.origin) return;
+        if (url.pathname.startsWith('/api/')) return; // downloads (exports, count sheets) don't leave the page
+        if (url.pathname === location.pathname && url.search === location.search && url.hash) return; // same-page anchor
+        setTimeout(() => !e.defaultPrevented && start());
+      });
+      document.addEventListener('submit', (e) => {
+        if ((e.target as HTMLFormElement).target) return;
+        setTimeout(() => !e.defaultPrevented && start());
+      });
+      addEventListener('app:navigating', start); // form.submit() after a confirmation fires no submit event
+      // Back to a page from the browser cache: show it as it is
+      addEventListener('pageshow', reset);
+    </script>
+    <script>
+      // Offline point of sale: refresh the device's copy (catalog, prices) and send the sales made without internet
+      import { pendingCount, refreshSnapshot, syncQueue } from '@/lib/offline/sync';
+      const el = document.querySelector<HTMLAnchorElement>('[data-offline-sync]');
+      if (el && 'indexedDB' in window) {
+        const { user, name, locale, text } = el.dataset as Record<string, string>;
+        const show = (n: number) => { el.hidden = n === 0; el.textContent = text.replace('{n}', String(n)); };
+        (async () => {
+          await syncQueue(user).catch(() => 0);
+          show(await pendingCount().catch(() => 0));
+          await refreshSnapshot({ id: user, name }, locale as 'es' | 'en').catch(() => null);
+        })();
+      }
+    </script>
+</BaseLayout>
+
+<style>
+  .offline-pending {
+    display: inline-flex;
+    margin-bottom: var(--space-3);
+    padding: var(--space-1) var(--space-3);
+    color: var(--text-title);
+    font-size: var(--text-sm);
+    font-weight: var(--weight-bold);
+    background: color-mix(in srgb, var(--status-warning) 10%, var(--bg-app));
+    border: 1px solid color-mix(in srgb, var(--status-warning) 45%, var(--bg-app));
+    border-radius: var(--radius-control);
+    text-decoration: none;
+  }
+  .offline-pending[hidden] {
+    display: none;
+  }
+  .shell {
+    display: grid;
+    grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+    min-height: 100dvh;
+  }
+
+  main {
+    padding: var(--space-8);
+    outline: none;
+  }
+
+  .page-skeleton {
+    display: none;
+    gap: var(--space-4);
+  }
+  /* :global: the page's own content comes from another component, so it doesn't carry this layout's scope */
+  main[data-loading] > :global(:not(.page-skeleton, [data-loading-status])) {
+    display: none !important;
+  }
+  main[data-loading] > .page-skeleton {
+    display: grid;
+  }
+  .sk-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+    gap: var(--space-3);
+    margin-top: var(--space-2);
+  }
+  .sk-bar {
+    max-width: 32rem;
+  }
+  .sk-rows {
+    display: grid;
+    gap: var(--space-3);
+    padding: var(--space-4);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-container);
+  }
+
+  .topbar,
+  .backdrop {
+    display: none;
+  }
+
+  .skip {
+    position: absolute;
+    top: var(--space-2);
+    left: var(--space-2);
+    z-index: 30;
+    padding: var(--space-2) var(--space-4);
+    background: var(--color-primary);
+    color: var(--text-on-color);
+    border-radius: var(--radius-control);
+    transform: translateY(-200%);
+  }
+  .skip:focus {
+    transform: none;
+  }
+
+  @media (max-width: 60rem) {
+    .shell {
+      grid-template-columns: minmax(0, 1fr);
+    }
+
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      display: flex;
+      align-items: center;
+      gap: var(--space-2);
+      padding: var(--space-2) var(--space-4);
+      background: var(--bg-app);
+      border-bottom: 1px solid var(--border-subtle);
+    }
+
+    .menu {
+      display: grid;
+      place-items: center;
+      width: var(--control-height);
+      height: var(--control-height);
+      background: none;
+      border: 0;
+      border-radius: var(--radius-control);
+      color: var(--text-title);
+      cursor: pointer;
+    }
+    .menu:hover {
+      background: var(--color-primary-tint);
+    }
+
+    .topbar-title {
+      color: var(--text-title);
+      font-weight: var(--weight-bold);
+    }
+
+    .backdrop:not([hidden]) {
+      display: block;
+      position: fixed;
+      inset: 0;
+      z-index: 15;
+      background: var(--overlay-scrim);
+    }
+
+    main {
+      padding: var(--space-5) var(--space-4);
+    }
+  }
+</style>

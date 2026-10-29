@@ -1,0 +1,156 @@
+---
+// A promotion: what it gives, where and when, how much it has been used; edit, switch on/off and history.
+import AppLayout from '@/layouts/AppLayout.astro';
+import PromotionFields, { type PromotionValues } from '@/components/promotions/PromotionFields.astro';
+import Badge from '@/components/ui/Badge.astro';
+import Button from '@/components/ui/Button.astro';
+import Card from '@/components/ui/Card.astro';
+import Dialog from '@/components/ui/Dialog.astro';
+import Notice from '@/components/ui/Notice.astro';
+import Timeline from '@/components/ui/Timeline.astro';
+import { fmt, getLocale, localePath, money, useTranslations } from '@/i18n';
+import { ApiError } from '@/lib/api';
+import { describe, getPromotion, promotionErrors, promotionHistory, readPromotion, updatePromotion, type Promotion } from '@/lib/promotions';
+import { setFlash, takeFlash } from '@/lib/session';
+import { listBranches } from '@/lib/transfers';
+import { toLocalInput } from '@/lib/time';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const pr = t.promotions;
+const { session, accessToken } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'promotions')?.permissions ?? [];
+if (!perms.includes('read')) return Astro.rewrite('/404');
+const id = Astro.params.id!;
+const selfPath = localePath(locale, `/promotions/${id}`);
+const tz = session.user.timezone;
+
+let promo: Promotion;
+try {
+  promo = await getPromotion(accessToken, id);
+} catch (e) {
+  if (e instanceof ApiError && (e.status === 404 || e.status === 422)) return Astro.rewrite('/404');
+  throw e;
+}
+const canEdit = perms.includes('update') && !promo.deleted_at;
+const str = (v: number | null) => (v === null ? '' : String(Number(v)));
+let values: PromotionValues = {
+  name: promo.name, description: promo.description ?? '', kind: promo.kind, percent: str(promo.percent), amount: str(promo.amount),
+  buy_quantity: str(promo.buy_quantity) || '2', get_quantity: str(promo.get_quantity) || '1',
+  starts_at: toLocalInput(promo.starts_at, tz), ends_at: toLocalInput(promo.ends_at, tz), is_enabled: promo.is_enabled,
+  products: (promo.products ?? []).map((p) => ({ id: p.id, name: p.name })), branch_ids: (promo.branches ?? []).map((b) => b.id),
+};
+let errors: Record<string, string> = {};
+let formError: string | undefined;
+let pageError: string | undefined;
+if (Astro.request.method === 'POST' && canEdit) {
+  const data = await Astro.request.formData();
+  const intent = data.get('intent');
+  try {
+    if (intent === 'toggle') {
+      await updatePromotion(accessToken, id, { is_enabled: !promo.is_enabled });
+      setFlash(Astro.cookies, { toggled: promo.is_enabled ? 'off' : 'on' });
+    } else {
+      const body = readPromotion(data, tz);
+      values = {
+        ...values, ...Object.fromEntries(['name', 'description', 'kind', 'percent', 'amount', 'buy_quantity', 'get_quantity', 'starts_at', 'ends_at']
+          .map((k) => [k, String(data.get(k) ?? '')])), is_enabled: body.is_enabled, branch_ids: body.branch_ids,
+        products: body.product_ids.map((pid, n) => ({ id: pid, name: String(data.getAll('product_name')[n] ?? '') })),
+      } as PromotionValues;
+      await updatePromotion(accessToken, id, body);
+      setFlash(Astro.cookies, { saved: '1' });
+    }
+    return Astro.redirect(selfPath, 303);
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    if (intent === 'toggle') pageError = t.ui.failed;
+    else {
+      ({ fields: errors, form: formError } = promotionErrors(e.status, e.body, pr.errors, t.ui.formError));
+      formError ??= t.ui.formError;
+    }
+  }
+  Astro.response.status = 422;
+}
+
+const [history, branches] = await Promise.all([promotionHistory(accessToken, id), canEdit ? listBranches(accessToken) : Promise.resolve([])]);
+const flash = takeFlash(Astro.cookies);
+const when = new Intl.DateTimeFormat(t.intl, { dateStyle: 'medium', timeStyle: 'short', timeZone: tz });
+const tone = { ACTIVE: 'success', SCHEDULED: 'accent', ENDED: 'neutral', DISABLED: 'warning' } as const;
+const timeline = history.items.map((h) => ({
+  title: h.entity_type === 'promotion' && h.changed_fields?.filter((f) => f !== 'updated_by').join() === 'is_enabled'
+    ? (h.new_data?.is_enabled ? pr.enabledEvent : pr.disabledEvent)
+    : h.entity_type === 'promotion'
+    ? `${pr.actions[h.action] ?? h.action}${h.action === 'UPDATE' && h.changed_fields?.length ? `: ${h.changed_fields.filter((f) => f in pr.fields).map((f) => pr.fields[f]).join(', ')}` : ''}`
+    : fmt(h.action === 'INSERT' ? pr.linkAdded : pr.linkRemoved, { name: h.target ?? '—' }),
+  meta: `${h.changed_by ?? '—'}, ${when.format(new Date(h.changed_at))}`,
+}));
+---
+
+<AppLayout title={promo.name} current="/promotions">
+  <a class="ui-back" href={localePath(locale, '/promotions')}>← {pr.back}</a>
+  <header class="ui-header">
+    <div>
+      <h1>{promo.name}</h1>
+      <p class="ui-sub">{describe(promo, (n) => money(locale, n), pr.perUnit)} {promo.deleted_at ? <Badge tone="error">{t.ui.deletedBadge}</Badge> : <Badge tone={tone[promo.status]}>{pr.statuses[promo.status]}</Badge>}</p>
+    </div>
+    {canEdit && (
+      <div class="ui-actions">
+        <form method="post">
+          <input type="hidden" name="intent" value="toggle" />
+          <Button type="submit" variant="secondary" icon={promo.is_enabled ? 'pause' : 'play'}>{promo.is_enabled ? pr.disable : pr.enable}</Button>
+        </form>
+        <Button icon="pencil" data-dialog="edit-promotion">{t.ui.edit}</Button>
+      </div>
+    )}
+  </header>
+
+  <div class="ui-notices">
+    {flash.created && <Notice>{pr.created}</Notice>}
+    {flash.saved && <Notice>{t.ui.saved}</Notice>}
+    {flash.toggled && <Notice tone={flash.toggled === 'off' ? 'warning' : 'success'}>{flash.toggled === 'off' ? pr.disabledDone : pr.enabledDone}</Notice>}
+    {pageError && <Notice tone="error">{pageError}</Notice>}
+  </div>
+
+  <div class="ui-grid">
+    <Card title={pr.details}>
+      <dl class="ui-rows">
+        <div><dt>{pr.offer}</dt><dd>{pr.kinds[promo.kind]}: {describe(promo, (n) => money(locale, n), pr.perUnit)}</dd></div>
+        <div><dt>{pr.startsAt}</dt><dd class="num">{when.format(new Date(promo.starts_at))}</dd></div>
+        <div><dt>{pr.endsAt}</dt><dd class="num">{when.format(new Date(promo.ends_at))}</dd></div>
+        <div><dt>{pr.branches}</dt><dd>{promo.branches?.length ? promo.branches.map((b) => b.name).join(', ') : pr.allBranches}</dd></div>
+      </dl>
+      {promo.description && <p class="ui-muted ui-small">{promo.description}</p>}
+    </Card>
+    <Card title={pr.usage}>
+      <dl class="ui-rows">
+        <div><dt>{pr.given}</dt><dd class="num ui-strong">{money(locale, Number(promo.discount_given ?? 0))}</dd></div>
+        <div><dt>{pr.linesSold}</dt><dd class="num">{promo.lines_sold ?? 0}</dd></div>
+        <div><dt>{pr.unitsSold}</dt><dd class="num">{Number(promo.units_sold ?? 0)}</dd></div>
+      </dl>
+      <p class="ui-muted ui-small">{pr.usageHint}</p>
+    </Card>
+    <Card title={fmt(pr.productsCount, { n: promo.products?.length ?? 0 })}>
+      <dl class="ui-rows">
+        {(promo.products ?? []).map((p) => <div><dt><a href={localePath(locale, `/products/${p.id}`)}>{p.name}</a>{p.deleted && <span class="ui-line2">{t.ui.deletedBadge}</span>}</dt><dd class="num">{money(locale, Number(p.price))}</dd></div>)}
+      </dl>
+    </Card>
+    <Card title={t.ui.history}>
+      <Timeline items={timeline} />
+    </Card>
+  </div>
+
+  {canEdit && (
+    <Dialog id="edit-promotion" title={t.ui.edit} closeLabel={t.ui.close} open={!!formError}>
+      <form method="post" class="ui-form" novalidate>
+        {formError && <p class="ui-alert ui-full" role="alert">{formError}</p>}
+        <input type="hidden" name="intent" value="edit" />
+        <p class="ui-full ui-muted ui-small">{pr.editHint}</p>
+        <PromotionFields locale={locale} id="edit" values={values} errors={errors} branches={branches} />
+        <div class="ui-form-actions">
+          <Button variant="tertiary" data-dialog-close>{t.ui.cancel}</Button>
+          <Button type="submit">{t.ui.saveChanges}</Button>
+        </div>
+      </form>
+    </Dialog>
+  )}
+</AppLayout>

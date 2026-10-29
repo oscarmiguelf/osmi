@@ -1,0 +1,202 @@
+---
+import AppLayout from '@/layouts/AppLayout.astro';
+import Badge from '@/components/ui/Badge.astro';
+import Button from '@/components/ui/Button.astro';
+import Dialog from '@/components/ui/Dialog.astro';
+import Field from '@/components/ui/Field.astro';
+import Icon from '@/components/ui/Icon.astro';
+import Notice from '@/components/ui/Notice.astro';
+import { fmt, getLocale, localePath, useTranslations } from '@/i18n';
+import { ApiError, apiFieldErrors } from '@/lib/api';
+import { setFlash } from '@/lib/session';
+import { createUser, deleteUser, listUsers, userAction } from '@/lib/users';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const us = t.users;
+const { session, accessToken } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'users')?.permissions ?? [];
+if (!perms.includes('read')) return Astro.rewrite('/404');
+const canCreate = perms.includes('create');
+const canDelete = perms.includes('delete');
+
+const params = Astro.url.searchParams;
+const q = (params.get('q') ?? '').trim().slice(0, 100);
+const status = ['active', 'inactive', 'deleted', 'all'].includes(params.get('status') ?? '') ? params.get('status')! : undefined;
+const page = Math.max(1, Number.parseInt(params.get('page') ?? '1', 10) || 1);
+const basePath = localePath(locale, '/users');
+
+let values = { email: '', first_name: '', last_name: '', password: '' };
+let fieldErrors: Record<string, string> = {};
+let formError: string | undefined;
+let pageError: string | undefined;
+
+const data = Astro.request.method === 'POST' ? await Astro.request.formData() : undefined;
+if (data?.get('intent') === 'delete' || data?.get('intent') === 'restore') {
+  const id = String(data.get('user_id'));
+  try {
+    if (data.get('intent') === 'delete') await deleteUser(accessToken, id);
+    else await userAction(accessToken, id, 'restore');
+    return Astro.redirect(Astro.url.pathname + Astro.url.search, 303);
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    const detail = e.body?.detail;
+    pageError = e.status === 403 ? us.moreAccess : e.status === 409 ? (detail?.field === 'email' ? us.emailTaken : us.lastAdmin)
+      : e.status === 422 ? us.self : t.ui.failed;
+  }
+} else if (data) {
+  values = Object.fromEntries(Object.keys(values).map((k) => [k, String(data.get(k) ?? '').trim()])) as typeof values;
+  try {
+    const created = await createUser(accessToken, { ...values, password: values.password || null });
+    setFlash(Astro.cookies, created.temporary_password ? { password: created.temporary_password } : { created: '1' });
+    return Astro.redirect(localePath(locale, `/users/${created.id}`), 303);
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    const detail = e.body?.detail;
+    fieldErrors = e.status === 422 ? apiFieldErrors(e.body, us.errors) : {};
+    if (Array.isArray(detail?.rules)) fieldErrors.password = detail.rules.map((r: string) => t.changePassword.rules[r] ?? r).join(' ');
+    if (e.status === 409) fieldErrors.email = us.emailTaken;
+    formError = Object.keys(fieldErrors).length ? t.ui.formError : e.status === 403 ? t.ui.forbidden : t.ui.failed;
+  }
+  Astro.response.status = 422;
+}
+
+const result = await listUsers(accessToken, { q, status, page });
+const tab = (s?: string) => `${basePath}?${new URLSearchParams({ ...(q && { q }), ...(s && { status: s }) })}`;
+const when = new Intl.DateTimeFormat(t.intl, { dateStyle: 'medium', timeStyle: 'short', timeZone: session.user.timezone });
+const pageLink = (p: number) => `${basePath}?${new URLSearchParams({ ...(q && { q }), ...(status && { status }), page: String(p) })}`;
+---
+
+<AppLayout title={us.title} current="/users">
+  <header class="ui-header">
+    <div>
+      <h1>{us.title}</h1>
+      <p class="ui-sub num">{fmt(us.count, { n: result.total })}</p>
+    </div>
+    {canCreate && <Button icon="user-plus" data-dialog="new-user">{us.newUser}</Button>}
+  </header>
+
+  <div class="ui-notices">{pageError && <Notice tone="error">{pageError}</Notice>}</div>
+
+  <form method="get" class="ui-filters" role="search" data-filters>
+    {status && <input type="hidden" name="status" value={status} />}
+    <label class="ui-search">
+      <Icon name="search" size={18} />
+      <span class="visually-hidden">{t.ui.search}</span>
+      <input type="search" name="q" value={q} placeholder={us.searchPlaceholder} autocomplete="off" autofocus={!!q} />
+    </label>
+    <nav class="ui-tabs" aria-label={us.colStatus}>
+      <a href={tab()} aria-current={!status ? 'true' : undefined}>{us.status.active} + {us.status.inactive}</a>
+      {['active', 'inactive', 'deleted'].map((s) => <a href={tab(s)} aria-current={status === s ? 'true' : undefined}>{us.status[s]}</a>)}
+    </nav>
+  </form>
+
+  {
+    result.items.length === 0 ? (
+      <p class="ui-muted">{us.empty}</p>
+    ) : (
+      <div class="ui-table-wrap">
+        <table class="ui-table">
+          <thead>
+            <tr>
+              <th scope="col">{us.colUser}</th>
+              <th scope="col">{us.colStatus}</th>
+              <th scope="col">{us.colLastLogin}</th>
+              {canDelete && <th scope="col"><span class="visually-hidden">{t.ui.delete}</span></th>}
+            </tr>
+          </thead>
+          <tbody>
+            {result.items.map((u) => {
+              const name = `${u.first_name} ${u.last_name}`;
+              return (
+                <tr>
+                  <td data-label={us.colUser}>
+                    <a class="ui-strong" href={localePath(locale, `/users/${u.id}`)}>{name}</a>
+                    <span class="ui-line2">{u.email}</span>
+                  </td>
+                  <td data-label={us.colStatus}>
+                    <span class="badges">
+                      {u.deleted_at ? <Badge tone="error">{t.ui.deletedBadge}</Badge> : u.is_active ? <Badge tone="success">{us.active}</Badge> : <Badge tone="warning">{us.inactive}</Badge>}
+                      {u.is_locked && <Badge tone="error">{us.locked}</Badge>}
+                      {u.must_change_password && <Badge>{us.mustChange}</Badge>}
+                    </span>
+                  </td>
+                  <td data-label={us.colLastLogin} class="num">{u.last_login_at ? when.format(new Date(u.last_login_at)) : <span class="ui-muted">{us.never}</span>}</td>
+                  {canDelete && (
+                    <td class="ui-row-action ui-end">
+                      {u.deleted_at ? (
+                        <form method="post">
+                          <input type="hidden" name="intent" value="restore" />
+                          <input type="hidden" name="user_id" value={u.id} />
+                          <Button type="submit" variant="tertiary" icon="rotate-ccw">{t.ui.restore}</Button>
+                        </form>
+                      ) : u.id !== session.user.id && (
+                        <form method="post" data-confirm={fmt(us.deleteText, { name })} data-confirm-title={us.deleteTitle} data-confirm-action={t.ui.delete}>
+                          <input type="hidden" name="intent" value="delete" />
+                          <input type="hidden" name="user_id" value={u.id} />
+                          <Button type="submit" variant="danger" icon="trash-2" aria-label={fmt(us.deleteRow, { name })} />
+                        </form>
+                      )}
+                    </td>
+                  )}
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    )
+  }
+  {
+    (page > 1 || page * 25 < result.total) && (
+      <nav class="ui-pager">
+        <span />
+        <span class="ui-actions">
+          {page > 1 && <Button variant="secondary" href={pageLink(page - 1)}>{t.ui.previous}</Button>}
+          {page * 25 < result.total && <Button variant="secondary" href={pageLink(page + 1)}>{t.ui.next}</Button>}
+        </span>
+      </nav>
+    )
+  }
+
+  {
+    canCreate && (
+      <Dialog id="new-user" title={us.newUser} closeLabel={t.ui.close} open={!!formError}>
+        <form method="post" class="ui-form" novalidate>
+          {formError && <p class="ui-alert" role="alert">{formError}</p>}
+          <Field label={us.firstName} name="first_name" value={values.first_name} error={fieldErrors.first_name} required maxlength={100} />
+          <Field label={us.lastName} name="last_name" value={values.last_name} error={fieldErrors.last_name} required maxlength={100} />
+          <div class="ui-full">
+            <Field label={us.email} name="email" type="email" value={values.email} error={fieldErrors.email} required maxlength={255} autocomplete="off" />
+          </div>
+          <div class="ui-full">
+            <Field label={us.password} name="password" type="text" value={values.password} hint={fieldErrors.password ? undefined : us.passwordHint} error={fieldErrors.password} autocomplete="off" maxlength={128} />
+          </div>
+          <div class="ui-form-actions">
+            <Button variant="tertiary" data-dialog-close>{t.ui.cancel}</Button>
+            <Button type="submit">{us.create}</Button>
+          </div>
+        </form>
+      </Dialog>
+    )
+  }
+</AppLayout>
+
+<script>
+  const form = document.querySelector<HTMLFormElement>('[data-filters]');
+  const input = form?.querySelector<HTMLInputElement>('input[name=q]');
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  input?.addEventListener('input', () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => form!.requestSubmit(), 350);
+  });
+  if (input && document.activeElement === input) input.setSelectionRange(input.value.length, input.value.length);
+</script>
+
+<style>
+  .badges {
+    display: inline-flex;
+    flex-wrap: wrap;
+    gap: var(--space-1);
+  }
+</style>

@@ -1,0 +1,280 @@
+---
+// Any report of the catalog: filters from its spec, a table formatted by column type, totals, CSV export.
+// Hourly sales are shown as a weekday x hour heat map.
+import AppLayout from '@/layouts/AppLayout.astro';
+import Button from '@/components/ui/Button.astro';
+import Notice from '@/components/ui/Notice.astro';
+import SearchPicker from '@/components/ui/SearchPicker.astro';
+import { fmt, getLocale, localePath, money, useTranslations } from '@/i18n';
+import { ApiError } from '@/lib/api';
+import { listBranches } from '@/lib/branches';
+import { formatCell, isNumeric, REPORT_PARAMS, reportCatalog, runReport, type ReportResult } from '@/lib/reports';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const r = t.reports;
+const { session, accessToken, branch } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'reports')?.permissions ?? [];
+if (!perms.includes('read')) return Astro.rewrite('/404');
+const name = `${Astro.params.section}/${Astro.params.name}`;
+const spec = (await reportCatalog(accessToken)).find((x) => x.name === name);
+if (!spec) return Astro.rewrite('/404');
+const info = (r.names as Record<string, { title: string; text: string; note?: string }>)[name] ?? { title: name, text: '' };
+const tz = session.user.timezone;
+const params = Astro.url.searchParams;
+// The login's branch list goes stale (a branch deleted since): only the ones still active
+const active = new Set((await listBranches(accessToken)).map((b) => b.id));
+const myBranches = session.branches.filter((b) => active.has(b.id));
+
+// Defaults: the working branch, this month so far
+const today = Temporal.Now.plainDateISO(tz);
+const selectedBranches = params.getAll('branch').length ? params.getAll('branch') : branch ? [branch.id] : [];
+const query = new URLSearchParams();
+query.set('branch_ids', selectedBranches.join(','));
+if (spec.range !== false) {
+  query.set('from', params.get('from') || today.with({ day: 1 }).toString());
+  query.set('to', params.get('to') || today.toString());
+}
+for (const k of REPORT_PARAMS) if (!['branch_ids', 'from', 'to'].includes(k) && params.get(k)) query.set(k, params.get(k)!);
+
+let result: ReportResult | undefined;
+let error: string | undefined;
+const needsMissing = (spec.extras ?? []).filter((x) => x !== 'days' && !params.get(x));
+if (!selectedBranches.length) error = r.chooseBranch;
+else if (needsMissing.length) error = undefined; // the picker below asks for it
+else {
+  try {
+    result = await runReport(accessToken, branch?.id, name, query);
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    const field = e.body?.detail?.field;
+    error = e.status === 403 ? t.ui.forbidden : field === 'to' ? r.badRange : t.ui.failed;
+  }
+}
+const canExport = perms.includes('export');
+const exportHref = `/api/reports/export?${new URLSearchParams({ name, lang: locale, ...Object.fromEntries(query) })}`;
+const label = (k: string) => (r.columns as Record<string, string>)[k] ?? k;
+const cell = (type: string, v: unknown) => formatCell(type, v, locale, t, tz);
+const page = Number(params.get('page') ?? 1);
+const pageLink = (n: number) => {
+  const q = new URLSearchParams(params);
+  q.set('page', String(n));
+  return `?${q}`;
+};
+// Heat map for hourly sales: weekday rows x hour columns, darker = more sales
+const heat = name === 'sales/hourly' && result ? (() => {
+  const by = new Map(result.rows.map((x) => [`${x.weekday}-${x.hour}`, Number(x.gross_sales)]));
+  const max = Math.max(1, ...by.values());
+  const hours = result.rows.length ? [...new Set(result.rows.map((x) => Number(x.hour)))] : [];
+  const span = hours.length ? Array.from({ length: Math.max(...hours) - Math.min(...hours) + 1 }, (_, i) => Math.min(...hours) + i) : [];
+  return { by, max, span };
+})() : undefined;
+const generated = result && new Intl.DateTimeFormat(t.intl, { dateStyle: 'medium', timeStyle: 'short', timeZone: tz }).format(new Date(result.generated_at));
+---
+
+<AppLayout title={info.title} current="/reports">
+  <a class="ui-back" href={localePath(locale, '/reports')}>← {r.title}</a>
+  <header class="ui-header">
+    <div>
+      <h1>{info.title}</h1>
+      <p class="ui-sub">{info.text}</p>
+    </div>
+    {result && canExport && (
+      <div class="ui-actions">
+        <Button variant="secondary" icon="file-spreadsheet" href={`${exportHref}&format=xlsx`}>{r.exportXlsx}</Button>
+        <Button variant="tertiary" icon="download" href={`${exportHref}&format=csv`}>{r.export}</Button>
+      </div>
+    )}
+  </header>
+
+  <form method="get" class="filters">
+    {myBranches.length > 1 && (
+      <fieldset class="branches">
+        <legend class="label">{r.branches}</legend>
+        {myBranches.map((b) => <label class="ui-check"><input type="checkbox" name="branch" value={b.id} checked={selectedBranches.includes(b.id)} />{b.name}</label>)}
+      </fieldset>
+    )}
+    {spec.range !== false && (
+      <>
+        <label class="field"><span class="label">{r.from}</span><input class="ui-input" type="date" name="from" value={query.get('from')} max={today.toString()} /></label>
+        <label class="field"><span class="label">{r.to}</span><input class="ui-input" type="date" name="to" value={query.get('to')} max={today.toString()} /></label>
+      </>
+    )}
+    {name === 'sales/summary' && (
+      <label class="field"><span class="label">{r.group}</span>
+        <select class="ui-select" name="group">{(['day', 'week', 'month'] as const).map((g) => <option value={g} selected={(params.get('group') ?? 'day') === g}>{r.groups[g]}</option>)}</select>
+      </label>
+    )}
+    {name === 'sales/top-products' && (
+      <>
+        <label class="field"><span class="label">{r.orderBy}</span>
+          <select class="ui-select" name="order">{(['revenue', 'units', 'margin'] as const).map((o) => <option value={o} selected={(params.get('order') ?? 'revenue') === o}>{label(o)}</option>)}</select>
+        </label>
+        <label class="field"><span class="label">{r.direction}</span>
+          <select class="ui-select" name="direction"><option value="desc" selected={params.get('direction') !== 'asc'}>{r.best}</option><option value="asc" selected={params.get('direction') === 'asc'}>{r.worst}</option></select>
+        </label>
+      </>
+    )}
+    {spec.extras?.includes('days') && (
+      <label class="field"><span class="label">{r.days}</span><input class="ui-input num" type="number" name="days" min="1" max="3650" value={params.get('days') ?? '60'} /></label>
+    )}
+    {spec.extras?.includes('product_id') && (
+      <div class="field wide"><span class="label">{r.product}</span>
+        <SearchPicker id="report-product" name="product_id" endpoint={`/api/products?mode=sale&lang=${locale}`} placeholder={r.productPlaceholder}
+          hint="" noResults={t.sales.cart.noResults} clearLabel={t.sales.cart.clear}
+          value={params.get('product_id') ? { id: params.get('product_id')!, title: params.get('product_id_label') ?? '' } : null} />
+      </div>
+    )}
+    {spec.extras?.includes('customer_id') && (
+      <div class="field wide"><span class="label">{r.customer}</span>
+        <SearchPicker id="report-customer" name="customer_id" endpoint="/api/customers" placeholder={r.customerPlaceholder}
+          hint="" noResults={t.sales.cart.noCustomers} clearLabel={t.sales.cart.clear}
+          value={params.get('customer_id') ? { id: params.get('customer_id')!, title: params.get('customer_id_label') ?? '' } : null} />
+      </div>
+    )}
+    <Button type="submit" variant="secondary" icon="refresh-cw">{r.run}</Button>
+  </form>
+
+  {info.note && <p class="note ui-small">{info.note}</p>}
+  {error && <Notice tone="error">{error}</Notice>}
+  {needsMissing.length > 0 && <p class="ui-muted">{r.needsChoice}</p>}
+
+  {result && (
+    result.rows.length === 0 ? <p class="ui-muted">{r.empty}</p> : heat ? (
+      <div class="ui-table-wrap">
+        <table class="heat">
+          <thead><tr><th scope="col"></th>{heat.span.map((h) => <th scope="col" class="num">{String(h).padStart(2, '0')}</th>)}</tr></thead>
+          <tbody>
+            {[1, 2, 3, 4, 5, 6, 7].map((d) => (
+              <tr>
+                <th scope="row">{r.weekdays[d - 1]}</th>
+                {heat.span.map((h) => {
+                  const v = heat.by.get(`${d}-${h}`) ?? 0;
+                  return <td style={`--a: ${v / heat.max}`} title={`${r.weekdays[d - 1]} ${String(h).padStart(2, '0')}:00 · ${money(locale, v)}`}>{v ? money(locale, v).replace(/\.\d+$/, '') : ''}</td>;
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    ) : (
+      <div class="ui-table-wrap">
+        <table class="ui-table report">
+          <thead><tr>{result.columns.map((c) => <th scope="col" class:list={[isNumeric(c.type) && 'ui-end']}>{label(c.key)}</th>)}</tr></thead>
+          <tbody>
+            {result.rows.map((row) => (
+              <tr>{result!.columns.map((c) => (
+                <td data-label={label(c.key)} class:list={[isNumeric(c.type) && 'ui-end num', c.type === 'flag' && row[c.key] && 'flag',
+                  (c.type === 'money' || c.type === 'signed') && Number(row[c.key]) < 0 && 'neg']}>{cell(c.type, row[c.key])}</td>
+              ))}</tr>
+            ))}
+          </tbody>
+          {Object.keys(result.totals).length > 0 && (
+            <tfoot>
+              <tr>{result.columns.map((c, i) => (
+                <td class:list={[isNumeric(c.type) && 'ui-end num']}>{i === 0 ? r.total : c.key in result!.totals ? cell(c.type, result!.totals[c.key]) : ''}</td>
+              ))}</tr>
+            </tfoot>
+          )}
+        </table>
+      </div>
+    )
+  )}
+  {result?.totals?.official_tax !== undefined && <p class="ui-small ui-muted">{fmt(r.officialTax, { amount: money(locale, Number(result.totals.official_tax)) })}</p>}
+  {result && (page > 1 || result.has_more) && (
+    <nav class="ui-pager">
+      <span />
+      <span class="ui-actions">
+        {page > 1 && <Button variant="secondary" href={pageLink(page - 1)}>{t.ui.previous}</Button>}
+        {result.has_more && <Button variant="secondary" href={pageLink(page + 1)}>{t.ui.next}</Button>}
+      </span>
+    </nav>
+  )}
+  {result && <p class="ui-small ui-muted generated">{fmt(r.generatedAt, { when: generated!, tz: result.timezone })}</p>}
+</AppLayout>
+
+<script>
+  // The pickers send product_id / customer_id and their *_label (so the name shows again); skip them when empty
+  document.querySelector<HTMLFormElement>('form.filters')?.addEventListener('submit', (e) => {
+    (e.currentTarget as HTMLFormElement).querySelectorAll<HTMLInputElement>('[data-picker] input[type=hidden]').forEach((i) => {
+      if (!i.value) i.disabled = true;
+    });
+  });
+</script>
+
+<style>
+  .filters {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: var(--space-3);
+    margin-bottom: var(--space-4);
+    padding: var(--space-4);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-container);
+  }
+  .field {
+    display: grid;
+    gap: var(--space-1);
+  }
+  .field.wide {
+    flex: 1 1 18rem;
+  }
+  .label {
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
+  }
+  .branches {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-3);
+    flex-basis: 100%;
+    margin: 0;
+    padding: 0;
+    border: 0;
+  }
+  .branches legend {
+    margin-bottom: var(--space-1);
+  }
+  .note {
+    margin-bottom: var(--space-3);
+    padding: var(--space-2) var(--space-3);
+    background: var(--color-primary-tint);
+    border-radius: var(--radius-control);
+  }
+  .report tfoot td {
+    border-top: 2px solid var(--border-input);
+    font-weight: var(--weight-bold);
+  }
+  .neg {
+    color: var(--status-error-text);
+  }
+  .flag {
+    color: var(--status-warning-text, #92400e);
+    font-weight: var(--weight-medium);
+  }
+  .heat {
+    border-collapse: separate;
+    border-spacing: 2px;
+    font-size: var(--text-xs, 0.75rem);
+  }
+  .heat th {
+    padding: var(--space-1);
+    color: var(--text-muted);
+    font-weight: var(--weight-medium);
+    text-align: start;
+  }
+  .heat td {
+    min-width: 3.25rem;
+    height: 2rem;
+    padding: 0 var(--space-1);
+    background: color-mix(in srgb, var(--color-primary) calc(var(--a) * 55%), var(--bg-surface)); /* light enough to read the text */
+    border-radius: 3px;
+    color: var(--text-title);
+    text-align: center;
+  }
+  .generated {
+    margin-top: var(--space-3);
+  }
+</style>

@@ -1,0 +1,135 @@
+---
+// Label + control + hint/error, wired for screen readers (for/id, aria-describedby, aria-invalid).
+import type { HTMLAttributes } from 'astro/types';
+import Icon from './Icon.astro';
+
+type Props = Omit<HTMLAttributes<'input'>, 'name'> & {
+  label: string;
+  name: string;
+  as?: 'input' | 'textarea' | 'select';
+  hint?: string;
+  /** Error microcopy. Its presence switches the field to the error state. */
+  error?: string;
+  rows?: number;
+};
+
+const { label, name, as = 'input', hint, error, id = `field-${name}`, value, ...rest } = Astro.props;
+const hintId = hint ? `${id}-hint` : undefined;
+const errorId = error ? `${id}-error` : undefined;
+const control = {
+  id,
+  name,
+  class: 'control',
+  'aria-invalid': error ? 'true' : undefined,
+  'aria-describedby': [errorId, hintId].filter(Boolean).join(' ') || undefined,
+  ...rest,
+} as Record<string, unknown>;
+---
+
+<div class="field">
+  <label for={id}>
+    {label}
+    {rest.required && <span class="required" aria-hidden="true">*</span>}
+  </label>
+  {
+    as === 'textarea' ? (
+      <textarea {...control}>{value}</textarea>
+    ) : as === 'select' ? (
+      <select {...control}>
+        <slot />
+      </select>
+    ) : (
+      <input {...control} value={value} />
+    )
+  }
+  {
+    error && (
+      <p id={errorId} class="message error">
+        <Icon name="circle-alert" size={16} />
+        {error}
+      </p>
+    )
+  }
+  {hint && <p id={hintId} class="message">{hint}</p>}
+</div>
+
+<style>
+  .field {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr); /* date/time inputs have a wide intrinsic size; keep them inside */
+    align-content: start; /* don't stretch the control when a sibling field in the row is taller */
+    gap: var(--space-1);
+  }
+
+  label {
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
+    color: var(--text-body);
+  }
+
+  .required {
+    margin-inline-start: var(--space-1);
+    color: var(--status-error-text);
+  }
+
+  .control {
+    width: 100%;
+    min-height: var(--control-height);
+    padding: var(--space-2) var(--space-3);
+    background-color: var(--bg-input);
+    border: 1px solid var(--border-input);
+    border-radius: var(--radius-control);
+    color: var(--text-body);
+    transition:
+      border-color var(--duration-fast) ease,
+      box-shadow var(--duration-fast) ease;
+  }
+
+  select.control {
+    padding-inline-end: 2.5rem; /* room for the chevron */
+  }
+
+  textarea.control {
+    min-height: 6rem;
+    resize: vertical;
+  }
+
+  .control:focus-visible {
+    outline: none;
+    border-color: var(--color-primary);
+    box-shadow: 0 0 0 3px var(--focus-ring);
+  }
+
+  .control[aria-invalid='true'],
+  .control:user-invalid {
+    border-color: var(--status-error);
+  }
+  .control[aria-invalid='true']:focus-visible,
+  .control:user-invalid:focus-visible {
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--status-error) 25%, transparent);
+  }
+
+  .control:disabled {
+    background-color: var(--bg-surface);
+    border-style: dashed;
+    color: var(--text-muted);
+    cursor: not-allowed;
+  }
+
+  .message {
+    font-size: var(--text-sm);
+    color: var(--text-muted);
+  }
+
+  .error {
+    display: flex;
+    gap: var(--space-1);
+    align-items: flex-start;
+    color: var(--status-error-text);
+  }
+
+  .error :global(svg) {
+    flex-shrink: 0;
+    margin-top: 0.2em;
+  }
+</style>

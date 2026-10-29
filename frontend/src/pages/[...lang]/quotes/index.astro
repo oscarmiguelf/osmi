@@ -1,0 +1,112 @@
+---
+// Quotes of the working branch, by status. "Open" are the ones that can still be converted; expired ones
+// (open but past their validity) have their own tab.
+import AppLayout from '@/layouts/AppLayout.astro';
+import Badge from '@/components/ui/Badge.astro';
+import Button from '@/components/ui/Button.astro';
+import EmptyState from '@/components/ui/EmptyState.astro';
+import Field from '@/components/ui/Field.astro';
+import Notice from '@/components/ui/Notice.astro';
+import { getLocale, localePath, money, useTranslations } from '@/i18n';
+import { listQuotes, type QuoteSummary } from '@/lib/sales';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const qt = t.quotes;
+const { session, accessToken, branch } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'quotes')?.permissions ?? [];
+if (!perms.includes('read')) return Astro.rewrite('/404');
+const basePath = localePath(locale, '/quotes');
+const TABS = ['OPEN', 'EXPIRED', 'CONVERTED', 'CANCELLED', 'ALL'] as const;
+const params = Astro.url.searchParams;
+const tab = (TABS as readonly string[]).includes(params.get('status') ?? '') ? (params.get('status') as (typeof TABS)[number]) : 'OPEN';
+const q = (params.get('q') ?? '').trim().slice(0, 100);
+const page = Math.max(1, Number.parseInt(params.get('page') ?? '1', 10) || 1);
+const result = branch
+  ? await listQuotes(accessToken, branch.id, { status: tab === 'ALL' ? undefined : tab, q, page })
+  : { items: [], has_more: false };
+const when = new Intl.DateTimeFormat(t.intl, { dateStyle: 'medium', timeZone: session.user.timezone });
+const statusOf = (x: QuoteSummary) => (x.is_expired ? 'EXPIRED' : x.status);
+const tone = { OPEN: 'success', EXPIRED: 'warning', CONVERTED: 'accent', CANCELLED: 'neutral' } as const;
+const link = (extra: Record<string, string | number>) => {
+  const qp = new URLSearchParams(params);
+  for (const [k, v] of Object.entries(extra)) qp.set(k, String(v));
+  return `${basePath}?${qp}`;
+};
+---
+
+<AppLayout title={qt.title} current="/quotes">
+  <header class="ui-header">
+    <div>
+      <h1>{qt.title}</h1>
+      {branch && <p class="ui-sub">{branch.name}</p>}
+    </div>
+    {perms.includes('create') && branch && <Button icon="file-plus" href={localePath(locale, '/quotes/new')}>{qt.newQuote}</Button>}
+  </header>
+
+  <nav class="ui-tabs tabs" aria-label={qt.title}>
+    {TABS.map((k) => <a href={k === 'OPEN' ? basePath : `${basePath}?status=${k}`} aria-current={k === tab ? 'page' : undefined}>{qt.tabs[k]}</a>)}
+  </nav>
+
+  {
+    !branch ? <Notice tone="warning">{t.ui.noBranch}</Notice> : (
+      <>
+        <form method="get" class="filters">
+          {tab !== 'OPEN' && <input type="hidden" name="status" value={tab} />}
+          <Field label={qt.search} name="q" type="search" value={q} maxlength={100} />
+          <Button type="submit" variant="secondary" icon="search">{t.ui.search}</Button>
+        </form>
+        {result.items.length === 0 && page === 1 ? (
+          tab === 'OPEN' && !q ? (
+            <EmptyState icon="file-text" title={qt.empty} text={qt.emptyText}>
+              {perms.includes('create') && <Button icon="file-plus" href={localePath(locale, '/quotes/new')}>{qt.newQuote}</Button>}
+            </EmptyState>
+          ) : <p class="ui-muted">{qt.noResults}</p>
+        ) : (
+          <div class="ui-table-wrap">
+            <table class="ui-table">
+              <thead><tr><th scope="col">{qt.folio}</th><th scope="col">{qt.customer}</th><th scope="col">{qt.validUntil}</th><th scope="col">{qt.status}</th><th scope="col" class="ui-end">{t.sales.cart.total}</th></tr></thead>
+              <tbody>
+                {result.items.map((x) => (
+                  <tr>
+                    <td data-label={qt.folio}><a class="ui-strong num" href={localePath(locale, `/quotes/${x.id}`)}>{x.folio}</a><span class="ui-line2">{when.format(new Date(x.created_at))} · {x.created_by}</span></td>
+                    <td data-label={qt.customer}>{x.customer ?? <span class="ui-muted">{qt.noCustomer}</span>}</td>
+                    <td data-label={qt.validUntil} class="num">{when.format(new Date(x.valid_until))}</td>
+                    <td data-label={qt.status}><Badge tone={tone[statusOf(x)]}>{qt.statuses[statusOf(x)]}</Badge></td>
+                    <td data-label={t.sales.cart.total} class="ui-end num ui-strong">{money(locale, Number(x.total))}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        {(page > 1 || result.has_more) && (
+          <nav class="ui-pager">
+            <span />
+            <span class="ui-actions">
+              {page > 1 && <Button variant="secondary" href={link({ page: page - 1 })}>{t.ui.previous}</Button>}
+              {result.has_more && <Button variant="secondary" href={link({ page: page + 1 })}>{t.ui.next}</Button>}
+            </span>
+          </nav>
+        )}
+      </>
+    )
+  }
+</AppLayout>
+
+<style>
+  .tabs {
+    margin-bottom: var(--space-4);
+  }
+  .filters {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: var(--space-3);
+    margin-bottom: var(--space-5);
+  }
+  .filters > :global(.field) {
+    flex: 1 1 16rem;
+    max-width: 28rem;
+  }
+</style>

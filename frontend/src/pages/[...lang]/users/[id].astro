@@ -1,0 +1,298 @@
+---
+import AppLayout from '@/layouts/AppLayout.astro';
+import Badge from '@/components/ui/Badge.astro';
+import Button from '@/components/ui/Button.astro';
+import Card from '@/components/ui/Card.astro';
+import Dialog from '@/components/ui/Dialog.astro';
+import Field from '@/components/ui/Field.astro';
+import Notice from '@/components/ui/Notice.astro';
+import Timeline from '@/components/ui/Timeline.astro';
+import { fmt, getLocale, localePath, useTranslations } from '@/i18n';
+import { ApiError, apiFieldErrors } from '@/lib/api';
+import { setFlash, takeFlash } from '@/lib/session';
+import { listBranches } from '@/lib/transfers';
+import {
+  getUser, loginHistory, resetPassword, setUserAccess, setUserBranches, updateUser, userAccess, userAction, userBranches,
+  userHistory, userSessions, type User,
+} from '@/lib/users';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const us = t.users;
+const { session, accessToken } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'users')?.permissions ?? [];
+if (!perms.includes('read')) return Astro.rewrite('/404');
+const canUpdate = perms.includes('update');
+const canDelete = perms.includes('delete');
+const id = Astro.params.id!;
+const selfPath = localePath(locale, `/users/${id}`);
+
+let user: User;
+try {
+  user = await getUser(accessToken, id);
+} catch (e) {
+  if (e instanceof ApiError && (e.status === 404 || e.status === 422)) return Astro.rewrite('/404');
+  throw e;
+}
+const name = `${user.first_name} ${user.last_name}`;
+
+// Map an API refusal to the sentence people need
+const refusal = (e: ApiError, forAccess = false) => {
+  const detail = e.body?.detail;
+  if (e.status === 403) return forAccess ? us.escalation : us.moreAccess;
+  if (e.status === 409) return detail?.field === 'email' ? us.emailTaken : us.lastAdmin;
+  if (e.status === 422 && typeof detail === 'string' && detail.includes('your own')) return us.self;
+  return t.ui.failed;
+};
+
+let values = { first_name: user.first_name, last_name: user.last_name, email: user.email, timezone: user.timezone };
+let fieldErrors: Record<string, string> = {};
+let formError: string | undefined;
+let pageError: string | undefined;
+
+if (Astro.request.method === 'POST') {
+  const data = await Astro.request.formData();
+  const intent = String(data.get('intent'));
+  try {
+    if (intent === 'edit') {
+      values = Object.fromEntries(Object.keys(values).map((k) => [k, String(data.get(k) ?? '').trim()])) as typeof values;
+      await updateUser(accessToken, id, values);
+      setFlash(Astro.cookies, { saved: '1' });
+    } else if (intent === 'reset') {
+      const r = await resetPassword(accessToken, id);
+      setFlash(Astro.cookies, { reset: r.temporary_password ?? '' });
+    } else if (intent === 'branches') {
+      await setUserBranches(accessToken, id, data.getAll('branch').map(String));
+      setFlash(Astro.cookies, { saved: '1' });
+    } else if (intent === 'access') {
+      const modules = data.getAll('module').map(String).map((mid) => ({ module_id: mid, permission_ids: data.getAll(`perm:${mid}`).map(String) }));
+      await setUserAccess(accessToken, id, modules);
+      setFlash(Astro.cookies, { saved: '1' });
+    } else if (['activate', 'deactivate', 'unlock', 'logout-all', 'restore'].includes(intent)) {
+      const r = (await userAction(accessToken, id, intent as 'activate')) as { revoked?: number };
+      setFlash(Astro.cookies, intent === 'logout-all' ? { logout: String(r.revoked ?? 0) } : { saved: '1' });
+    }
+    return Astro.redirect(selfPath, 303);
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    if (intent === 'edit') {
+      fieldErrors = e.status === 422 ? apiFieldErrors(e.body, us.errors) : {};
+      if (e.body?.detail?.field === 'timezone') fieldErrors.timezone = us.errors.timezone;
+      if (e.status === 409) fieldErrors.email = us.emailTaken;
+      formError = Object.keys(fieldErrors).length ? t.ui.formError : refusal(e);
+    } else pageError = refusal(e, intent === 'access' || intent === 'branches');
+  }
+  Astro.response.status = 422;
+}
+
+const flash = takeFlash(Astro.cookies);
+const deleted = user.deleted_at !== null;
+const [branches, allBranches, access, sessions, logins, history] = await Promise.all([
+  userBranches(accessToken, id),
+  listBranches(accessToken),
+  userAccess(accessToken, id),
+  userSessions(accessToken, id),
+  loginHistory(accessToken, id),
+  userHistory(accessToken, id),
+]);
+const mine = new Set(branches.map((b) => b.id));
+const when = new Intl.DateTimeFormat(t.intl, { dateStyle: 'medium', timeStyle: 'short', timeZone: session.user.timezone });
+const show = (f: string, v: unknown) => (f === 'password_hash' ? us.changed : v === null || v === undefined || v === '' ? '—' : typeof v === 'boolean' ? (v ? t.ui.yes : 'No') : String(v));
+const timeline = history.items.map((h) => ({
+  title: us.actions[h.action] ?? h.action,
+  meta: `${h.changed_by_email ?? '—'}, ${when.format(new Date(h.changed_at))}`,
+  changes: h.action === 'UPDATE'
+    ? (h.changed_fields ?? []).filter((f) => f in us.fields).map((f) => ({ label: us.fields[f], from: show(f, h.old_data?.[f]), to: show(f, h.new_data?.[f]) }))
+    : [],
+}));
+const manage = canUpdate && !deleted;
+---
+
+<AppLayout title={name} current="/users">
+  <a class="ui-back" href={localePath(locale, '/users')}>← {us.back}</a>
+  <header class="ui-header">
+    <div>
+      <h1>{name}</h1>
+      <p class="ui-sub">{user.email}</p>
+      <p class="badges">
+        {deleted ? <Badge tone="error">{t.ui.deletedBadge}</Badge> : user.is_active ? <Badge tone="success">{us.active}</Badge> : <Badge tone="warning">{us.inactive}</Badge>}
+        {user.is_locked && <Badge tone="error">{us.locked}</Badge>}
+        {user.must_change_password && <Badge>{us.mustChange}</Badge>}
+      </p>
+    </div>
+    <div class="ui-actions">
+      {manage && <Button variant="secondary" icon="pencil" data-dialog="edit-user">{t.ui.edit}</Button>}
+      {manage && user.is_locked && (
+        <form method="post"><input type="hidden" name="intent" value="unlock" /><Button type="submit" variant="secondary" icon="lock-open">{us.unlock}</Button></form>
+      )}
+      {manage && (
+        <form method="post" data-confirm={us.resetText} data-confirm-title={us.resetTitle} data-confirm-action={us.resetPassword}>
+          <input type="hidden" name="intent" value="reset" /><Button type="submit" variant="tertiary" icon="key-round">{us.resetPassword}</Button>
+        </form>
+      )}
+      {manage && (
+        <form method="post" data-confirm={fmt(us.logoutText, { name })} data-confirm-title={us.logoutTitle} data-confirm-action={us.logoutAll}>
+          <input type="hidden" name="intent" value="logout-all" /><Button type="submit" variant="tertiary" icon="log-out">{us.logoutAll}</Button>
+        </form>
+      )}
+      {manage && user.id !== session.user.id && (user.is_active ? (
+        <form method="post" data-confirm={fmt(us.deactivateText, { name })} data-confirm-title={us.deactivateTitle} data-confirm-action={us.deactivate}>
+          <input type="hidden" name="intent" value="deactivate" /><Button type="submit" variant="danger" icon="user-x">{us.deactivate}</Button>
+        </form>
+      ) : (
+        <form method="post"><input type="hidden" name="intent" value="activate" /><Button type="submit" icon="user-check">{us.activate}</Button></form>
+      ))}
+      {deleted && canDelete && (
+        <form method="post"><input type="hidden" name="intent" value="restore" /><Button type="submit" icon="rotate-ccw">{t.ui.restore}</Button></form>
+      )}
+    </div>
+  </header>
+
+  <div class="ui-notices">
+    {flash.password && <Notice tone="warning">{fmt(us.created, { password: flash.password })} {us.nextStep}</Notice>}
+    {flash.created && <Notice>{us.createdOwn} {us.nextStep}</Notice>}
+    {flash.reset && <Notice tone="warning">{fmt(us.resetDone, { password: flash.reset })}</Notice>}
+    {flash.logout && <Notice>{fmt(us.logoutDone, { n: flash.logout })}</Notice>}
+    {flash.saved && <Notice>{t.ui.saved}</Notice>}
+    {pageError && <Notice tone="error">{pageError}</Notice>}
+  </div>
+
+  <div class="ui-grid">
+    <Card title={us.profile}>
+      <dl class="ui-rows">
+        <div><dt>{us.email}</dt><dd>{user.email}</dd></div>
+        <div><dt>{us.timezone}</dt><dd>{user.timezone}</dd></div>
+        <div><dt>{us.colLastLogin}</dt><dd class="num">{user.last_login_at ? when.format(new Date(user.last_login_at)) : us.never}</dd></div>
+        <div><dt>{us.createdBy}</dt><dd>{user.created_by_email ?? '—'}</dd></div>
+      </dl>
+    </Card>
+
+    <Card title={us.branches}>
+      <p class="ui-muted ui-small">{us.branchesHint}</p>
+      <form method="post" class="stack">
+        <input type="hidden" name="intent" value="branches" />
+        <fieldset class="ui-checks" disabled={!manage}>
+          <legend class="visually-hidden">{us.branches}</legend>
+          {allBranches.map((b) => (
+            <label class="ui-check"><input type="checkbox" name="branch" value={b.id} checked={mine.has(b.id)} />{b.name}</label>
+          ))}
+        </fieldset>
+        {manage && <Button type="submit" variant="secondary">{t.ui.saveChanges}</Button>}
+      </form>
+    </Card>
+
+    <Card title={us.access} class="ui-wide">
+      <p class="ui-muted ui-small">{us.accessHint}</p>
+      <form method="post" class="stack" data-access>
+        <input type="hidden" name="intent" value="access" />
+        <div class="modules">
+          {access.map((m) => (
+            <fieldset class="module" disabled={!manage}>
+              <legend><label class="ui-check strong"><input type="checkbox" name="module" value={m.module_id} checked={m.has_module} data-module />{t.modules[m.module_code] ?? m.module_name}</label></legend>
+              <div class="perms">
+                {m.permissions.map((p) => (
+                  <label class="ui-check"><input type="checkbox" name={`perm:${m.module_id}`} value={p.id} checked={p.granted} data-perm />{us.permissionNames[p.code] ?? p.name}</label>
+                ))}
+              </div>
+            </fieldset>
+          ))}
+        </div>
+        {manage && <Button type="submit" variant="secondary">{t.ui.saveChanges}</Button>}
+      </form>
+    </Card>
+
+    <Card title={us.sessions}>
+      {sessions.length === 0 ? <p class="ui-muted">{us.noSessions}</p> : (
+        <ul class="list" role="list">
+          {sessions.map((s) => (
+            <li><span class="ui-strong">{s.user_agent?.slice(0, 60) ?? '—'}</span><span class="ui-muted ui-small num">{s.ip_address}, {fmt(us.since, { when: when.format(new Date(s.session_started_at)) })}</span></li>
+          ))}
+        </ul>
+      )}
+    </Card>
+
+    <Card title={us.logins}>
+      {logins.items.length === 0 && <p class="ui-muted">{us.noLogins}</p>}
+      <ul class="list" role="list">
+        {logins.items.map((l) => (
+          <li><span>{us.events[l.event_type] ?? l.event_type}</span><span class="ui-muted ui-small num">{when.format(new Date(l.created_at))}{l.ip_address ? `, ${l.ip_address}` : ''}</span></li>
+        ))}
+      </ul>
+    </Card>
+
+    <Card title={t.ui.history} class="ui-wide">
+      <Timeline items={timeline} />
+    </Card>
+  </div>
+
+  {
+    manage && (
+      <Dialog id="edit-user" title={us.editTitle} closeLabel={t.ui.close} open={!!formError}>
+        <form method="post" class="ui-form" novalidate>
+          {formError && <p class="ui-alert" role="alert">{formError}</p>}
+          <input type="hidden" name="intent" value="edit" />
+          <Field label={us.firstName} name="first_name" value={values.first_name} error={fieldErrors.first_name} required maxlength={100} />
+          <Field label={us.lastName} name="last_name" value={values.last_name} error={fieldErrors.last_name} required maxlength={100} />
+          <div class="ui-full"><Field label={us.email} name="email" type="email" value={values.email} error={fieldErrors.email} required maxlength={255} /></div>
+          <div class="ui-full"><Field label={us.timezone} name="timezone" value={values.timezone} error={fieldErrors.timezone} required maxlength={64} /></div>
+          <div class="ui-form-actions">
+            <Button variant="tertiary" data-dialog-close>{t.ui.cancel}</Button>
+            <Button type="submit">{t.ui.saveChanges}</Button>
+          </div>
+        </form>
+      </Dialog>
+    )
+  }
+</AppLayout>
+
+<script>
+  // A permission only makes sense with its module: checking a permission checks the module, unchecking the module clears them
+  document.querySelectorAll<HTMLFieldSetElement>('[data-access] .module').forEach((set) => {
+    const module = set.querySelector<HTMLInputElement>('[data-module]')!;
+    const perms = [...set.querySelectorAll<HTMLInputElement>('[data-perm]')];
+    perms.forEach((p) => p.addEventListener('change', () => p.checked && (module.checked = true)));
+    module.addEventListener('change', () => !module.checked && perms.forEach((p) => (p.checked = false)));
+  });
+</script>
+
+<style>
+  .badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-1);
+    margin-top: var(--space-2);
+  }
+  .stack {
+    display: grid;
+    gap: var(--space-3);
+    justify-items: start;
+  }
+  .modules {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 14rem), 1fr));
+    gap: var(--space-3);
+    width: 100%;
+  }
+  .module {
+    padding: var(--space-3);
+    background: var(--bg-app);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-control);
+  }
+  .strong {
+    color: var(--text-title);
+    font-weight: var(--weight-bold);
+  }
+  .perms {
+    padding-inline-start: var(--space-6);
+  }
+  .list {
+    display: grid;
+    gap: var(--space-2);
+    padding: 0;
+    list-style: none;
+  }
+  .list li {
+    display: grid;
+  }
+</style>

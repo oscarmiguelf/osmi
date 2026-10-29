@@ -1,0 +1,216 @@
+---
+// Promotion form fields (new and edit). The discount fields follow the kind; products are added with the picker
+// and travel as product_id inputs; no branch checked = every branch.
+import Field from '@/components/ui/Field.astro';
+import SearchPicker from '@/components/ui/SearchPicker.astro';
+import { useTranslations, type Locale } from '@/i18n';
+
+export interface PromotionValues {
+  name: string;
+  description: string;
+  kind: string;
+  percent: string;
+  amount: string;
+  buy_quantity: string;
+  get_quantity: string;
+  starts_at: string;
+  ends_at: string;
+  is_enabled: boolean;
+  products: { id: string; name: string }[];
+  branch_ids: string[];
+}
+
+interface Props {
+  locale: Locale;
+  id: string;
+  values: PromotionValues;
+  errors: Record<string, string>;
+  branches: { id: string; name: string }[];
+}
+
+const { locale, id, values, errors, branches } = Astro.props;
+const t = useTranslations(locale);
+const pr = t.promotions;
+const fid = (name: string) => `${id}-${name}`;
+---
+
+<div class="ui-full"><Field label={pr.name} name="name" id={fid('name')} value={values.name} error={errors.name} required maxlength={150} /></div>
+<div class="ui-full"><Field label={pr.description} name="description" id={fid('description')} value={values.description} maxlength={500} hint={pr.descriptionHint} /></div>
+
+<fieldset class="ui-full kinds" data-kinds>
+  <legend class="label">{pr.kind}</legend>
+  {(['PERCENT', 'AMOUNT', 'BUY_X_GET_Y'] as const).map((k) => (
+    <label class="kind">
+      <input type="radio" name="kind" value={k} checked={values.kind === k} />
+      <span><strong>{pr.kinds[k]}</strong><span class="ui-muted ui-small">{pr.kindHints[k]}</span></span>
+    </label>
+  ))}
+</fieldset>
+
+<div class="ui-full kind-fields">
+  <div data-kind-field="PERCENT"><Field label={pr.percent} name="percent" id={fid('percent')} type="number" min="0.01" max="100" step="0.01" inputmode="decimal" value={values.percent} error={errors.percent} /></div>
+  <div data-kind-field="AMOUNT"><Field label={pr.amount} name="amount" id={fid('amount')} type="number" min="0.01" step="0.01" inputmode="decimal" value={values.amount} error={errors.amount} hint={pr.amountHint} /></div>
+  <div data-kind-field="BUY_X_GET_Y" class="pair">
+    <Field label={pr.buy} name="buy_quantity" id={fid('buy')} type="number" min="1" max="1000" step="1" inputmode="numeric" value={values.buy_quantity} error={errors.buy_quantity} />
+    <Field label={pr.get} name="get_quantity" id={fid('get')} type="number" min="1" max="1000" step="1" inputmode="numeric" value={values.get_quantity} error={errors.get_quantity} />
+    <p class="ui-muted ui-small" data-example data-template={pr.example}></p>
+  </div>
+</div>
+
+<Field label={pr.startsAt} name="starts_at" id={fid('starts')} type="datetime-local" value={values.starts_at} error={errors.starts_at} required />
+<Field label={pr.endsAt} name="ends_at" id={fid('ends')} type="datetime-local" value={values.ends_at} error={errors.ends_at} required hint={errors.ends_at ? undefined : pr.endsHint} />
+
+<div class="ui-full products" data-promo-products>
+  <span class="label" id={fid('products-label')}>{pr.products}</span>
+  <SearchPicker id={fid('product-search')} name="product_pick" endpoint={`/api/products?mode=sale&lang=${locale}`} placeholder={pr.productPlaceholder}
+    hint={pr.productHint} noResults={t.sales.cart.noResults} clearLabel={t.sales.cart.clear} />
+  <ul class="chips" role="list" data-chips aria-labelledby={fid('products-label')}>
+    {values.products.map((p) => (
+      <li class="chip"><input type="hidden" name="product_id" value={p.id} /><input type="hidden" name="product_name" value={p.name} />{p.name}<button type="button" data-remove aria-label={`${t.sales.cart.remove}: ${p.name}`}>×</button></li>
+    ))}
+  </ul>
+  {errors.product_ids && <p class="error" role="alert">{errors.product_ids}</p>}
+</div>
+
+<fieldset class="ui-full">
+  <legend class="label">{pr.branches}</legend>
+  <div class="ui-checks">
+    {branches.map((b) => <label class="ui-check"><input type="checkbox" name="branch_id" value={b.id} checked={values.branch_ids.includes(b.id)} />{b.name}</label>)}
+  </div>
+  <p class="ui-muted ui-small">{pr.branchesHint}</p>
+</fieldset>
+
+<label class="ui-check ui-full"><input type="checkbox" name="is_enabled" checked={values.is_enabled} />{pr.enabled}</label>
+
+<script>
+  document.querySelectorAll<HTMLElement>('[data-kinds]').forEach((kinds) => {
+    const form = kinds.closest('form')!;
+    const fields = [...form.querySelectorAll<HTMLElement>('[data-kind-field]')];
+    const example = form.querySelector<HTMLElement>('[data-example]');
+    const buy = form.querySelector<HTMLInputElement>('input[name=buy_quantity]');
+    const get = form.querySelector<HTMLInputElement>('input[name=get_quantity]');
+    const show = () => {
+      const kind = form.querySelector<HTMLInputElement>('input[name=kind]:checked')?.value;
+      // Hidden fields are disabled so they are neither sent nor validated
+      fields.forEach((f) => {
+        const off = f.dataset.kindField !== kind;
+        f.hidden = off;
+        f.querySelectorAll('input').forEach((i) => (i.disabled = off));
+      });
+      const b = Number(buy?.value), g = Number(get?.value);
+      if (example) example.textContent = b > 0 && g > 0 ? example.dataset.template!.replaceAll('{take}', String(b + g)).replaceAll('{pay}', String(b)) : '';
+    };
+    kinds.addEventListener('change', show);
+    buy?.addEventListener('input', show);
+    get?.addEventListener('input', show);
+    show();
+  });
+
+  document.querySelectorAll<HTMLElement>('[data-promo-products]').forEach((box) => {
+    const chips = box.querySelector<HTMLUListElement>('[data-chips]')!;
+    const picker = box.querySelector<HTMLElement>('[data-picker]')!;
+    chips.addEventListener('click', (e) => {
+      const button = (e.target as HTMLElement).closest('[data-remove]');
+      if (button) button.closest('li')!.remove();
+    });
+    picker.addEventListener('picker:choose', (e) => {
+      const item = (e as CustomEvent).detail as { id: string; title: string };
+      picker.dispatchEvent(new CustomEvent('picker:set', { detail: null }));
+      if (chips.querySelector(`input[value="${item.id}"]`)) return;
+      const li = document.createElement('li');
+      li.className = 'chip';
+      const input = Object.assign(document.createElement('input'), { type: 'hidden', name: 'product_id', value: item.id });
+      const label = Object.assign(document.createElement('input'), { type: 'hidden', name: 'product_name', value: item.title }); // to re-render after an error
+      const remove = Object.assign(document.createElement('button'), { type: 'button', textContent: '×' });
+      remove.dataset.remove = '';
+      remove.setAttribute('aria-label', `× ${item.title}`);
+      li.append(input, label, item.title, remove);
+      chips.append(li);
+      box.querySelector('.error')?.remove(); // the 'add a product' message no longer applies
+      picker.querySelector<HTMLInputElement>('input[type=search]')?.focus();
+    });
+  });
+</script>
+
+<style>
+  .label {
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
+  }
+  fieldset {
+    display: grid;
+    gap: var(--space-2);
+    margin: 0;
+    padding: 0;
+    border: 0;
+  }
+  .kinds {
+    grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+  }
+  .kinds legend {
+    margin-bottom: var(--space-2);
+  }
+  .kind {
+    display: flex;
+    gap: var(--space-2);
+    align-items: flex-start;
+    padding: var(--space-3);
+    border: 1px solid var(--border-input);
+    border-radius: var(--radius-control);
+    cursor: pointer;
+  }
+  .kind:has(input:checked) {
+    border-color: var(--color-primary);
+    background: var(--color-primary-tint);
+  }
+  .kind > span {
+    display: grid;
+  }
+  .kind-fields [hidden] {
+    display: none;
+  }
+  .pair {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--space-3);
+  }
+  .pair p {
+    grid-column: 1 / -1;
+  }
+  .products {
+    display: grid;
+    gap: var(--space-2);
+  }
+  .chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    padding: 0;
+    list-style: none;
+  }
+  .chips :global(.chip) {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    padding: var(--space-1) var(--space-1) var(--space-1) var(--space-3);
+    background: var(--color-primary-tint);
+    border-radius: var(--radius-pill);
+    font-size: var(--text-sm);
+  }
+  .chips :global(.chip button) {
+    width: 1.5rem;
+    height: 1.5rem;
+    background: none;
+    border: 0;
+    border-radius: 50%;
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+  .chips :global(.chip button:hover) {
+    color: var(--status-error-text);
+  }
+  .error {
+    color: var(--status-error-text);
+    font-size: var(--text-sm);
+  }
+</style>

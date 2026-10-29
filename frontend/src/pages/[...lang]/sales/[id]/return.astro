@@ -1,0 +1,235 @@
+---
+// Return part or all of a sale. The DB computes each refund (after the sale discount); unpaid credit is cancelled
+// first and only the rest goes back as money, from the register the person occupies.
+import AppLayout from '@/layouts/AppLayout.astro';
+import Button from '@/components/ui/Button.astro';
+import Card from '@/components/ui/Card.astro';
+import Field from '@/components/ui/Field.astro';
+import Notice from '@/components/ui/Notice.astro';
+import { fmt, getLocale, localePath, money, useTranslations } from '@/i18n';
+import { ApiError } from '@/lib/api';
+import { currentSession, listPaymentMethods } from '@/lib/cash';
+import { createReturn, getSale, saleErrorText, type Sale } from '@/lib/sales';
+import { setFlash } from '@/lib/session';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const s = t.sales;
+const r = s.returns;
+const { session, accessToken, branch } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'sales')?.permissions ?? [];
+if (!perms.includes('delete') || !branch) return Astro.rewrite('/404');
+const id = Astro.params.id!;
+const salePath = localePath(locale, `/sales/${id}`);
+
+let sale: Sale;
+try {
+  sale = await getSale(accessToken, branch.id, id);
+} catch (e) {
+  if (e instanceof ApiError && (e.status === 404 || e.status === 422)) return Astro.rewrite('/404');
+  throw e;
+}
+if (sale.status === 'RETURNED') return Astro.redirect(salePath, 303);
+
+const methods = (await listPaymentMethods(accessToken)).filter((m) => !m.is_credit);
+let values: Record<string, string> = { reason: '', payment_method_id: methods[0]?.id ?? '', reference: '' };
+let quantities: Record<string, string> = {};
+let formError: { text: string; items?: string[] } | undefined;
+if (Astro.request.method === 'POST') {
+  const data = await Astro.request.formData();
+  values = Object.fromEntries(Object.keys(values).map((k) => [k, String(data.get(k) ?? '').trim()]));
+  quantities = Object.fromEntries(sale.items.map((i) => [i.id, String(data.get(`qty_${i.id}`) ?? '').trim()]));
+  const items = Object.entries(quantities).filter(([, q]) => Number(q) > 0).map(([sale_item_id, quantity]) => ({ sale_item_id, quantity }));
+  const money_refund = String(data.get('money_refund') ?? '0');
+  if (!items.length) formError = { text: r.chooseItems };
+  else {
+    try {
+      const done = await createReturn(accessToken, branch.id, id, {
+        items, reason: values.reason || null,
+        // The credit part is added by the API; we only send the money part (computed by the live preview)
+        refunds: Number(money_refund) > 0 ? [{ payment_method_id: values.payment_method_id, amount: money_refund, reference: values.reference || null }] : [],
+      });
+      setFlash(Astro.cookies, { returned: done.folio, refund: String(done.refund_total) });
+      return Astro.redirect(salePath, 303);
+    } catch (e) {
+      if (!(e instanceof ApiError)) throw e;
+      const detail = e.body?.detail;
+      formError = detail?.returnable !== undefined ? { text: r.tooMany }
+        : detail?.money_refund !== undefined ? { text: r.amountChanged } : saleErrorText(e.status, detail, t);
+    }
+  }
+  Astro.response.status = 422;
+}
+
+const mySession = await currentSession(accessToken);
+const hasRegister = mySession?.branch_id === branch.id;
+const unit = (u: string) => t.products.unitNames[u] ?? u;
+const returnable = sale.items.filter((i) => Number(i.returnable_quantity) > 0);
+---
+
+<AppLayout title={fmt(r.title, { folio: sale.folio })} current="/sales">
+  <a class="ui-back" href={salePath}>← {fmt(s.detail.title, { folio: sale.folio })}</a>
+  <header class="ui-header">
+    <div>
+      <h1>{fmt(r.title, { folio: sale.folio })}</h1>
+      <p class="ui-sub">{sale.customer ?? s.noCustomer} · {money(locale, Number(sale.total))}</p>
+    </div>
+  </header>
+
+  {!hasRegister && <Notice tone="warning">{r.needRegister} <a href={localePath(locale, '/cash')}>{s.goToCash}</a></Notice>}
+
+  <form method="post" class="layout" novalidate data-return data-sale={id} data-lang={locale} data-intl={t.intl}>
+    {formError && <Notice tone="error">{formError.text}{formError.items && <ul>{formError.items.map((i) => <li>{i}</li>)}</ul>}</Notice>}
+    <Card title={r.what}>
+      <div class="ui-table-wrap">
+        <table class="ui-table">
+          <thead><tr><th scope="col">{s.cart.product}</th><th scope="col" class="ui-end">{r.sold}</th><th scope="col" class="ui-end">{r.left}</th><th scope="col" class="ui-end">{r.toReturn}</th></tr></thead>
+          <tbody>
+            {returnable.map((i) => (
+              <tr>
+                <td data-label={s.cart.product}><span class="ui-strong">{i.product}</span><span class="ui-line2">{money(locale, Number(i.line_total))}</span></td>
+                <td data-label={r.sold} class="ui-end num">{Number(i.quantity)} {unit(i.unit)}</td>
+                <td data-label={r.left} class="ui-end num">{Number(i.returnable_quantity)}</td>
+                <td data-label={r.toReturn} class="ui-end">
+                  <span class="qty-cell">
+                    <input class="ui-input num qty" type="number" name={`qty_${i.id}`} min="0" max={String(i.returnable_quantity)} step="0.001"
+                      inputmode="decimal" value={quantities[i.id] ?? ''} placeholder="0" aria-label={`${r.toReturn}: ${i.product}`} data-qty={i.id} />
+                    <button type="button" class="all" data-all={i.id} data-max={String(Number(i.returnable_quantity))}>{r.all}</button>
+                  </span>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <Button variant="tertiary" data-everything>{r.everything}</Button>
+    </Card>
+
+    <Card title={r.refund}>
+      <dl class="sums" aria-live="polite">
+        <div><dt>{r.refundTotal}</dt><dd class="num" data-total>—</dd></div>
+        <div><dt>{r.creditPart}</dt><dd class="num" data-credit>—</dd></div>
+        <div class="grand"><dt>{r.moneyPart}</dt><dd class="num" data-money>—</dd></div>
+      </dl>
+      <p class="ui-muted ui-small">{r.creditHint}</p>
+      <p class="ui-alert" data-error role="alert" hidden></p>
+      <input type="hidden" name="money_refund" value="0" data-money-input />
+      <div class="ui-form">
+        <Field label={r.method} name="payment_method_id" as="select">
+          {methods.map((m) => <option value={m.id} selected={m.id === values.payment_method_id}>{t.cash.methodNames[m.description] ?? m.description}</option>)}
+        </Field>
+        <Field label={s.cart.reference} name="reference" maxlength={100} value={values.reference} />
+        <div class="ui-full"><Field label={r.reason} name="reason" maxlength={500} value={values.reason} /></div>
+      </div>
+      <div class="ui-form-actions">
+        <Button variant="tertiary" href={salePath}>{t.ui.cancel}</Button>
+        <Button type="submit" variant="danger" icon="undo-2" disabled={!hasRegister}>{r.submit}</Button>
+      </div>
+    </Card>
+  </form>
+</AppLayout>
+
+<script>
+  const form = document.querySelector<HTMLFormElement>('[data-return]');
+  if (form) {
+    const money = new Intl.NumberFormat(form.dataset.intl, { style: 'currency', currency: 'MXN' });
+    const inputs = [...form.querySelectorAll<HTMLInputElement>('[data-qty]')];
+    const error = form.querySelector<HTMLElement>('[data-error]')!;
+    const moneyInput = form.querySelector<HTMLInputElement>('[data-money-input]')!;
+    const show = (sel: string, v: string) => (form.querySelector(sel)!.textContent = v);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let seq = 0;
+
+    async function preview() {
+      const mine = ++seq;
+      const items = inputs.filter((i) => Number(i.value) > 0).map((i) => ({ sale_item_id: i.dataset.qty, quantity: i.value }));
+      if (!items.length) {
+        ['[data-total]', '[data-credit]', '[data-money]'].forEach((s) => show(s, '—'));
+        moneyInput.value = '0';
+        error.hidden = true;
+        return;
+      }
+      const slow = setTimeout(() => mine === seq && form!.classList.add('pricing'), 200);
+      const res = await fetch('/api/sales/return-preview', { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sale_id: form!.dataset.sale, items, lang: form!.dataset.lang }) });
+      const out = await res.json().catch(() => ({ error: '…' }));
+      clearTimeout(slow);
+      if (mine !== seq) return;
+      form!.classList.remove('pricing');
+      error.hidden = !out.error;
+      error.textContent = out.error ?? '';
+      if (out.error) return;
+      show('[data-total]', money.format(out.data.refund_total));
+      show('[data-credit]', money.format(out.data.credit_refund));
+      show('[data-money]', money.format(out.data.money_refund));
+      moneyInput.value = String(out.data.money_refund);
+    }
+    const schedule = () => { clearTimeout(timer); timer = setTimeout(preview, 250); };
+    inputs.forEach((i) => i.addEventListener('input', schedule));
+    form.querySelectorAll<HTMLButtonElement>('[data-all]').forEach((b) => b.addEventListener('click', () => {
+      form.querySelector<HTMLInputElement>(`[data-qty="${b.dataset.all}"]`)!.value = b.dataset.max!;
+      schedule();
+    }));
+    form.querySelector('[data-everything]')?.addEventListener('click', () => {
+      form.querySelectorAll<HTMLButtonElement>('[data-all]').forEach((b) => (form.querySelector<HTMLInputElement>(`[data-qty="${b.dataset.all}"]`)!.value = b.dataset.max!));
+      schedule();
+    });
+    preview();
+  }
+</script>
+
+<style>
+  .layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 24rem);
+    align-items: start;
+    gap: var(--space-4);
+  }
+  .layout > :global(.notice) {
+    grid-column: 1 / -1;
+  }
+  .qty-cell {
+    display: inline-flex;
+    gap: var(--space-1);
+    align-items: center;
+  }
+  .qty {
+    width: 6.5rem;
+    text-align: end;
+  }
+  .all {
+    padding: var(--space-1) var(--space-2);
+    background: none;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-control);
+    color: var(--color-primary);
+    font-size: var(--text-sm);
+    cursor: pointer;
+  }
+  .pricing .sums dd {
+    color: transparent;
+    border-radius: var(--radius-control);
+    background: color-mix(in srgb, var(--text-muted) 18%, transparent);
+  }
+  .sums {
+    display: grid;
+    gap: var(--space-1);
+    margin: 0;
+  }
+  .sums div {
+    display: flex;
+    justify-content: space-between;
+  }
+  .sums dd {
+    margin: 0;
+  }
+  .grand {
+    font-size: var(--text-lg);
+    font-weight: var(--weight-bold);
+  }
+  @media (max-width: 60rem) {
+    .layout {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+</style>

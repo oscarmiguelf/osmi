@@ -1,0 +1,164 @@
+---
+// "How was it paid?" for an expense, a purchase or a later payment: part from the register the person occupies
+// (never more than its cash), part another way, the rest stays owed. The total comes from `total`, from the form's
+// `amount` field, or from an ItemsEditor in the same form (its items:total event).
+import Field from '@/components/ui/Field.astro';
+import { fmt, localePath, money, useTranslations, type Locale } from '@/i18n';
+
+interface Props {
+  locale: Locale;
+  /** The register the person occupies in this branch, with its cash; null = none (cash can't be taken). */
+  register: { name: string; cash: number } | null;
+  values?: { cash_amount: string; other_amount: string };
+  /** Fixed total (a later payment: what is still owed). */
+  total?: number;
+  idPrefix?: string;
+}
+
+const { locale, register, values = { cash_amount: '', other_amount: '' }, total, idPrefix = 'pay' } = Astro.props;
+const t = useTranslations(locale);
+const o = t.outgoing;
+---
+
+<fieldset class="split" data-split data-total={total} data-cash={register?.cash ?? 0} data-intl={t.intl}
+  data-labels={JSON.stringify({ tooMuch: o.tooMuch, notEnough: o.notEnough, paidInFull: o.paidInFull })}>
+  <legend>{o.legend}</legend>
+  <div class="row">
+    {register ? (
+      <Field label={fmt(o.fromCash, { register: register.name })} name="cash_amount" id={`${idPrefix}-cash`} type="number" min="0" step="0.01"
+        inputmode="decimal" placeholder="0.00" value={values.cash_amount} hint={fmt(o.available, { amount: money(locale, register.cash) })} data-split-cash />
+    ) : (
+      <div class="no-register">
+        <span class="label">{o.fromCashNone}</span>
+        <span class="ui-muted ui-small">{o.needRegister} <a href={localePath(locale, '/cash')}>{o.goToCash}</a></span>
+      </div>
+    )}
+    {register && <button type="button" class="quick" data-split-all="cash">{o.allCash}</button>}
+  </div>
+  <div class="row">
+    <Field label={o.other} name="other_amount" id={`${idPrefix}-other`} type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00"
+      value={values.other_amount} hint={o.otherHint} data-split-other />
+    <button type="button" class="quick" data-split-all="other">{o.allOther}</button>
+  </div>
+  <dl class="sums" aria-live="polite">
+    <div><dt>{o.total}</dt><dd class="num" data-split-total>—</dd></div>
+    <div class="owed"><dt>{o.owed}</dt><dd class="num" data-split-owed>—</dd></div>
+  </dl>
+  <p class="warn" data-split-error role="alert" hidden></p>
+</fieldset>
+
+<script>
+  document.querySelectorAll<HTMLElement>('[data-split]').forEach((root) => {
+    const form = root.closest('form');
+    const L = JSON.parse(root.dataset.labels!);
+    const fmtMoney = new Intl.NumberFormat(root.dataset.intl, { style: 'currency', currency: 'MXN' });
+    const cashInput = root.querySelector<HTMLInputElement>('[data-split-cash]');
+    const otherInput = root.querySelector<HTMLInputElement>('[data-split-other]')!;
+    const available = Number(root.dataset.cash);
+    const amountInput = form?.querySelector<HTMLInputElement>('input[name=amount]');
+    // Items already in the form (a purchase re-shown after an error): the editor may have announced its total before we listened
+    const itemsTotal = () => [...(form?.querySelectorAll<HTMLInputElement>('[name=item_qty]') ?? [])].reduce((sum, q) => {
+      const cost = q.closest('tr')?.querySelector<HTMLInputElement>('[name=item_cost]');
+      return sum + Math.round(Number(q.value) * Number(cost?.value ?? 0) * 100) / 100;
+    }, 0);
+    let total = root.dataset.total ? Number(root.dataset.total) : amountInput ? Number(amountInput.value || 0) : itemsTotal();
+    const round = (n: number) => Math.round(n * 100) / 100;
+
+    function update() {
+      const cash = Number(cashInput?.value || 0);
+      const other = Number(otherInput.value || 0);
+      const owed = round(total - cash - other);
+      root.querySelector('[data-split-total]')!.textContent = fmtMoney.format(total);
+      root.querySelector('[data-split-owed]')!.textContent = owed <= 0 && total > 0 ? L.paidInFull : fmtMoney.format(Math.max(owed, 0));
+      const error = cash > available ? L.notEnough.replace('{available}', fmtMoney.format(available))
+        : owed < 0 ? L.tooMuch.replace('{owed}', fmtMoney.format(total)) : '';
+      const box = root.querySelector<HTMLElement>('[data-split-error]')!;
+      box.hidden = !error;
+      box.textContent = error;
+      root.classList.toggle('invalid', !!error);
+    }
+    root.addEventListener('input', update);
+    amountInput?.addEventListener('input', () => { total = Number(amountInput.value || 0); update(); });
+    form?.addEventListener('items:total', (e) => { total = (e as CustomEvent<number>).detail; update(); });
+    // "All from the register" takes what the drawer allows; "all another way" the rest
+    root.querySelectorAll<HTMLButtonElement>('[data-split-all]').forEach((b) => b.addEventListener('click', () => {
+      const target = b.dataset.splitAll === 'cash' ? cashInput! : otherInput;
+      const otherOne = target === otherInput ? cashInput : otherInput;
+      if (otherOne) otherOne.value = '';
+      target.value = String(target === cashInput ? Math.min(total, available) : total);
+      update();
+    }));
+    // Never send a payment the API would refuse
+    form?.addEventListener('submit', (e) => {
+      update();
+      if (root.classList.contains('invalid')) {
+        e.preventDefault();
+        (cashInput ?? otherInput).focus();
+      }
+    });
+    update();
+  });
+</script>
+
+<style>
+  .split {
+    display: grid;
+    gap: var(--space-3);
+    margin: 0;
+    padding: var(--space-4);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-container);
+  }
+  legend {
+    padding: 0 var(--space-1);
+    font-weight: var(--weight-bold);
+  }
+  .row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: end;
+    gap: var(--space-2);
+  }
+  .no-register {
+    display: grid;
+    gap: var(--space-1);
+  }
+  .label {
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
+  }
+  .quick {
+    min-height: var(--control-height);
+    margin-bottom: 1.6rem; /* aligned with the input, above the field's hint */
+    padding: 0 var(--space-3);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-control);
+    color: var(--color-primary);
+    font-size: var(--text-sm);
+    cursor: pointer;
+  }
+  .sums {
+    display: grid;
+    gap: var(--space-1);
+    margin: 0;
+  }
+  .sums div {
+    display: flex;
+    justify-content: space-between;
+  }
+  .sums dd {
+    margin: 0;
+  }
+  .owed {
+    font-weight: var(--weight-bold);
+  }
+  .warn {
+    margin: 0;
+    color: var(--status-error-text);
+    font-size: var(--text-sm);
+  }
+  .warn[hidden] {
+    display: none;
+  }
+</style>

@@ -1,0 +1,114 @@
+---
+// Your own name, time zone and password. No users permission needed (the API's /me endpoints).
+import AppLayout from '@/layouts/AppLayout.astro';
+import Button from '@/components/ui/Button.astro';
+import Card from '@/components/ui/Card.astro';
+import Field from '@/components/ui/Field.astro';
+import Notice from '@/components/ui/Notice.astro';
+import { getLocale, localePath, useTranslations } from '@/i18n';
+import { ApiError, apiFieldErrors, login } from '@/lib/api';
+import { setFlash, startSession, takeFlash } from '@/lib/session';
+import { changeMyPassword, updateMe } from '@/lib/users';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const pf = t.profile;
+const cp = t.changePassword;
+const us = t.users;
+const { session, accessToken } = Astro.locals as Required<App.Locals>;
+const selfPath = localePath(locale, '/profile');
+
+let details = { first_name: session.user.first_name, last_name: session.user.last_name, timezone: session.user.timezone };
+const detailErrors: Record<string, string> = {};
+const passwordErrors: Record<string, string> = {};
+
+if (Astro.request.method === 'POST') {
+  const data = await Astro.request.formData();
+  const field = (k: string) => String(data.get(k) ?? '').trim();
+  if (data.get('intent') === 'details') {
+    details = { first_name: field('first_name'), last_name: field('last_name'), timezone: field('timezone') };
+    try {
+      await updateMe(accessToken, details);
+      setFlash(Astro.cookies, { saved: '1' });
+      return Astro.redirect(selfPath, 303);
+    } catch (e) {
+      if (!(e instanceof ApiError)) throw e;
+      Object.assign(detailErrors, e.status === 422 ? apiFieldErrors(e.body, us.errors) : {});
+      if (e.body?.detail?.field === 'timezone') detailErrors.timezone = us.errors.timezone;
+      if (!Object.keys(detailErrors).length) detailErrors.form = t.ui.failed;
+    }
+  } else {
+    const [current, next, confirm] = ['current', 'next', 'confirm'].map((k) => String(data.get(k) ?? ''));
+    if (next !== confirm) passwordErrors.confirm = cp.mismatch;
+    else {
+      try {
+        await changeMyPassword(accessToken, current, next);
+        // Changing it ends every session, this one included: sign in again with the new password
+        const result = await login(session.user.email, next, { ip: Astro.locals.clientIp, userAgent: Astro.request.headers.get('user-agent') });
+        if (!result.tokens) return Astro.redirect(localePath(locale, '/login'), 303);
+        startSession(Astro.cookies, result.tokens);
+        setFlash(Astro.cookies, { password: '1' });
+        return Astro.redirect(selfPath, 303);
+      } catch (e) {
+        if (!(e instanceof ApiError)) throw e;
+        const detail = e.body?.detail;
+        if (detail?.field === 'current_password') passwordErrors.current = cp.wrongCurrent;
+        else if (Array.isArray(detail?.rules)) passwordErrors.next = detail.rules.map((r: string) => cp.rules[r] ?? r).join(' ');
+        else passwordErrors.next = t.ui.failed;
+      }
+    }
+  }
+  Astro.response.status = 422;
+}
+
+const flash = takeFlash(Astro.cookies);
+// Every IANA zone the runtime knows; the API validates against PostgreSQL's list too
+const zones = Intl.supportedValuesOf('timeZone');
+if (!zones.includes(details.timezone)) zones.unshift(details.timezone);
+---
+
+<AppLayout title={pf.title} current="/profile">
+  <header class="ui-header">
+    <div>
+      <h1>{pf.title}</h1>
+      <p class="ui-sub">{session.user.email}</p>
+    </div>
+  </header>
+
+  <div class="ui-notices">
+    {flash.saved && <Notice>{t.ui.saved}</Notice>}
+    {flash.password && <Notice>{pf.passwordChanged}</Notice>}
+  </div>
+
+  <div class="ui-grid">
+    <Card title={pf.details}>
+      <p class="ui-muted ui-small">{pf.detailsHint}</p>
+      <form method="post" class="ui-form" novalidate>
+        {detailErrors.form && <p class="ui-alert" role="alert">{detailErrors.form}</p>}
+        <input type="hidden" name="intent" value="details" />
+        <Field label={us.firstName} name="first_name" value={details.first_name} error={detailErrors.first_name} required maxlength={100} autocomplete="given-name" />
+        <Field label={us.lastName} name="last_name" value={details.last_name} error={detailErrors.last_name} required maxlength={100} autocomplete="family-name" />
+        <div class="ui-full">
+          <Field label={us.timezone} name="timezone" as="select" error={detailErrors.timezone}>
+            {zones.map((z) => <option value={z} selected={z === details.timezone}>{z.replaceAll('_', ' ')}</option>)}
+          </Field>
+        </div>
+        <div class="ui-full">
+          <Field label={us.email} name="email_display" value={session.user.email} disabled hint={pf.emailHint} />
+        </div>
+        <div class="ui-form-actions"><Button type="submit">{t.ui.saveChanges}</Button></div>
+      </form>
+    </Card>
+
+    <Card title={pf.password}>
+      <p class="ui-muted ui-small">{pf.passwordHint}</p>
+      <form method="post" class="ui-form" novalidate>
+        <input type="hidden" name="intent" value="password" />
+        <div class="ui-full"><Field label={cp.current.replace(/ \(.*\)$/, '')} name="current" type="password" autocomplete="current-password" error={passwordErrors.current} required /></div>
+        <div class="ui-full"><Field label={cp.next} name="next" type="password" autocomplete="new-password" hint={passwordErrors.next ? undefined : cp.hint} error={passwordErrors.next} required /></div>
+        <div class="ui-full"><Field label={cp.confirm} name="confirm" type="password" autocomplete="new-password" error={passwordErrors.confirm} required /></div>
+        <div class="ui-form-actions"><Button type="submit" variant="secondary" icon="key-round">{pf.changePassword}</Button></div>
+      </form>
+    </Card>
+  </div>
+</AppLayout>

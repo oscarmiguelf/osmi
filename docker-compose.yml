@@ -1,0 +1,58 @@
+# Osmi: database + API + web. For Coolify / Dokploy (Docker Compose): set the variables of .env.example in the
+# panel and give a domain to the "web" service (port 4321). The API and the database are not published: only the
+# web server (the BFF) talks to the API, and only the API talks to the database.
+services:
+  db:
+    build: ./bd-scripts
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-osmi}
+      POSTGRES_USER: ${POSTGRES_USER:-osmi}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+      # First start only (empty volume): the admin's first password and the first branch / register
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD (first password of the admin user)}
+      BRANCH_NAME: ${BRANCH_NAME:-Matriz}
+      BRANCH_CODE: ${BRANCH_CODE:-SUC1}
+      REGISTER_NAME: ${REGISTER_NAME:-Caja 1}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?Set APP_DB_PASSWORD (the API's database role)}
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build: ./backend
+    restart: unless-stopped
+    environment:
+      # osmi_app: data only, never the owner (see bd-scripts/app-role.sql)
+      DATABASE_URL: postgresql+psycopg://osmi_app:${APP_DB_PASSWORD}@db:5432/${POSTGRES_DB:-osmi}
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET}
+      # Only the web container can reach the API (it isn't published), so it may pass the client's IP along
+      FORWARDED_ALLOW_IPS: "*"
+      UPLOADS_DIR: /data/uploads
+      # Encrypts clinical records in the DB: keep it safe AND backed up (lost = records unreadable)
+      CLINICAL_KEY: ${CLINICAL_KEY:?Set CLINICAL_KEY (openssl rand -hex 32)}
+    volumes:
+      - uploads:/data/uploads  # product images: keep it (and back it up) like the database
+    depends_on:
+      db:
+        condition: service_healthy
+
+  web:
+    build: ./frontend
+    restart: unless-stopped
+    environment:
+      API_URL: http://api:8000
+      # Proxies in front that append to X-Forwarded-For: Coolify / Dokploy's Traefik = 1 (add 1 per extra proxy, e.g. Cloudflare)
+      TRUSTED_PROXY_HOPS: ${TRUSTED_PROXY_HOPS:-1}
+    expose:
+      - "4321"
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
+  uploads:

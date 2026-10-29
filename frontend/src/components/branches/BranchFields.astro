@@ -1,0 +1,53 @@
+---
+// Name, code, phone and address: shared by "New branch" and "Edit branch".
+import Field from '@/components/ui/Field.astro';
+import { fmt, useTranslations, type Locale } from '@/i18n';
+
+interface Props {
+  locale: Locale;
+  values: Record<'name' | 'code' | 'phone' | 'address', string>;
+  errors: Record<string, string>;
+  /** false once the branch has issued folios: the code is printed on them */
+  codeEditable?: boolean;
+}
+
+const { locale, values, errors, codeEditable = true } = Astro.props;
+const br = useTranslations(locale).branches;
+---
+
+<Field label={br.name} name="name" value={values.name} placeholder={br.namePlaceholder} error={errors.name} required maxlength={150} />
+<Field
+  label={br.code}
+  name="code"
+  value={values.code}
+  placeholder="SUC2"
+  error={errors.code}
+  hint={errors.code ? undefined : codeEditable ? fmt(br.codeHint, { code: values.code || 'SUC2' }) : br.codeLocked}
+  required
+  maxlength={10}
+  autocapitalize="characters"
+  spellcheck="false"
+  disabled={!codeEditable}
+/>
+<Field
+  label={br.phone}
+  name="phone"
+  type="tel"
+  inputmode="tel"
+  value={values.phone}
+  placeholder="55 1234 5678"
+  hint={errors.phone ? undefined : br.phoneHint}
+  error={errors.phone}
+/>
+<Field label={br.address} name="address" as="textarea" rows={2} value={values.address} error={errors.address} maxlength={500} />
+
+<script>
+  // Codes are uppercase: show them that way while typing (the API uppercases too)
+  document.querySelectorAll<HTMLInputElement>('input[name=code]').forEach((input) =>
+    input.addEventListener('input', () => {
+      const at = input.selectionStart;
+      input.value = input.value.toUpperCase();
+      input.setSelectionRange(at, at);
+    }),
+  );
+</script>

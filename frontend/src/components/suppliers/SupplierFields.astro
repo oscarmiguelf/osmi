@@ -1,0 +1,22 @@
+---
+// Name, phone and email of a supplier (create and edit dialogs). `duplicate` adds "save anyway" after a same-name warning.
+import Field from '@/components/ui/Field.astro';
+import { useTranslations, type Locale } from '@/i18n';
+
+interface Props {
+  locale: Locale;
+  values: { name: string; phone: string; email: string };
+  errors: Record<string, string>;
+  duplicate?: boolean;
+  /** Prefix for field ids when two forms share a page. */
+  idPrefix?: string;
+}
+
+const { locale, values, errors, duplicate = false, idPrefix = 'field' } = Astro.props;
+const s = useTranslations(locale).suppliers;
+---
+
+<div class="ui-full"><Field label={s.name} name="name" id={`${idPrefix}-name`} value={values.name} required maxlength={200} error={errors.name} /></div>
+<Field label={s.phone} name="phone" id={`${idPrefix}-phone`} type="tel" value={values.phone} maxlength={20} hint={errors.phone ? undefined : s.phoneHint} error={errors.phone} />
+<Field label={s.email} name="email" id={`${idPrefix}-email`} type="email" value={values.email} maxlength={255} error={errors.email} />
+{duplicate && <label class="ui-check ui-full"><input type="checkbox" name="force" />{s.saveAnyway}</label>}

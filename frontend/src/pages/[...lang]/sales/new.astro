@@ -1,0 +1,248 @@
+---
+// Point of sale: a cart priced live by the API. ?quote=<id> converts a quote (prefilled with its prices);
+// ?appointment=<id> charges an appointment (its customer and services).
+import AppLayout from '@/layouts/AppLayout.astro';
+import Cart, { type CartState } from '@/components/sales/Cart.astro';
+import Button from '@/components/ui/Button.astro';
+import Dialog from '@/components/ui/Dialog.astro';
+import Notice from '@/components/ui/Notice.astro';
+import { fmt, getLocale, localePath, money, useTranslations } from '@/i18n';
+import { ApiError } from '@/lib/api';
+import { currentSession, listPaymentMethods, listRegisters, occupyRegister } from '@/lib/cash';
+import { activePromotions, convertDraft, convertQuote, createSale, saleErrorText, type QuoteDraft } from '@/lib/sales';
+import { getAppointment, type Appointment } from '@/lib/appointments';
+import { setFlash, takeFlash } from '@/lib/session';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const s = t.sales;
+const { session, accessToken, branch } = Astro.locals as Required<App.Locals>;
+const can = (module: string, p: string) => (session.modules.find((m) => m.code === module)?.permissions ?? []).includes(p);
+if (!can('sales', 'create') || !branch) return Astro.rewrite('/404');
+const quoteId = Astro.url.searchParams.get('quote');
+// Home renders this page too (rewrite): keep the person on the URL they opened
+const fromHome = !/\/sales\/new\/?$/.test(Astro.originPathname);
+if (quoteId && !can('quotes', 'read')) return Astro.rewrite('/404');
+const appointmentId = Astro.url.searchParams.get('appointment');
+if (appointmentId && !can('appointments', 'read')) return Astro.rewrite('/404');
+const selfPath = Astro.originPathname + Astro.url.search;
+
+let draft: QuoteDraft | undefined;
+let draftError: string | undefined;
+if (quoteId) {
+  try {
+    draft = await convertDraft(accessToken, branch.id, quoteId);
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    if (e.status === 404 || e.status === 422) return Astro.rewrite('/404');
+    draftError = saleErrorText(e.status, e.body?.detail, t).text;
+  }
+}
+
+let appointment: Appointment | undefined;
+if (appointmentId && !quoteId) {
+  try {
+    appointment = await getAppointment(accessToken, branch.id, appointmentId);
+  } catch (e) {
+    if (e instanceof ApiError && (e.status === 404 || e.status === 422)) return Astro.rewrite('/404');
+    throw e;
+  }
+  if (appointment.sale_id) return Astro.redirect(localePath(locale, `/appointments/${appointment.id}`), 303); // already charged
+}
+
+let initial: CartState = appointment
+  ? {
+      id: crypto.randomUUID(),
+      appointment_id: appointment.id,
+      customer: { id: appointment.customer_id, title: appointment.customer },
+      items: (appointment.services ?? []).map((sv) => ({
+        product_id: sv.product_id, product: sv.product, unit: t.products.unitNames[sv.unit] ?? sv.unit, quantity: Number(sv.quantity),
+        unit_price: Number(sv.price), discount: 0,
+      })),
+    }
+  : draft
+  ? {
+      id: crypto.randomUUID(),
+      quote_id: draft.quote_id,
+      customer: draft.customer_id ? { id: draft.customer_id, title: draft.customer ?? '' } : null,
+      discount: Number(draft.discount) || '',
+      items: draft.items.filter((i) => i.available).map((i) => ({
+        product_id: i.product_id, product: i.product, unit: t.products.unitNames[i.unit] ?? i.unit, quantity: Number(i.quantity),
+        unit_price: Number(i.unit_price), discount: Number(i.discount), current_price: Number(i.current_price),
+      })),
+    }
+  : { id: crypto.randomUUID(), items: [] };
+let formError: { text: string; items?: string[] } | undefined;
+let occupyError: string | undefined;
+
+if (Astro.request.method === 'POST') {
+  const data = await Astro.request.formData();
+  if (data.get('intent') === 'occupy') {
+    try {
+      await occupyRegister(accessToken, branch.id, String(data.get('register_id')));
+      return Astro.redirect(selfPath, 303);
+    } catch (e) {
+      if (!(e instanceof ApiError)) throw e;
+      occupyError = e.status === 409 ? t.cash.takenBy : t.ui.failed;
+    }
+  } else {
+    let body: any;
+    try {
+      body = JSON.parse(String(data.get('payload') ?? ''));
+    } catch {
+      body = undefined;
+    }
+    if (!body || !Array.isArray(body.items)) formError = { text: t.ui.failed };
+    else {
+      initial = { ...body, customer: body.customer_id ? { id: body.customer_id, title: body.customer_label ?? '' } : null };
+      try {
+        const sale = draft ? (await convertQuote(accessToken, branch.id, draft.quote_id, body)).sale : await createSale(accessToken, branch.id, body);
+        // Back to an empty point of sale: the confirmation is a dialog there, so the next sale starts right away
+        const change = sale.payments.reduce((sum, p) => sum + Number(p.change_given ?? 0), 0);
+        setFlash(Astro.cookies, { sold: sale.id, folio: sale.folio, total: String(sale.total), change: String(change) });
+        return Astro.redirect(draft || appointment ? (fromHome ? localePath(locale, '/') : localePath(locale, '/sales/new')) : selfPath, 303);
+      } catch (e) {
+        if (!(e instanceof ApiError)) throw e;
+        formError = saleErrorText(e.status, e.body?.detail, t);
+      }
+    }
+  }
+  Astro.response.status = 422;
+}
+
+const [mySession, registers, methods, promotions] = await Promise.all([
+  currentSession(accessToken),
+  listRegisters(accessToken, branch.id),
+  listPaymentMethods(accessToken),
+  activePromotions(accessToken, branch.id),
+]);
+const myRegister = mySession?.branch_id === branch.id ? mySession : undefined;
+const sold = Astro.request.method === 'GET' ? takeFlash(Astro.cookies) : {};
+const freeRegisters = registers.filter((r) => !r.occupied_by);
+const changed = draft?.items.filter((i) => i.price_changed && i.available) ?? [];
+const heading = appointment ? fmt(s.chargeAppointment, { customer: appointment.customer })
+  : draft ? fmt(s.convertTitle, { folio: draft.folio }) : fromHome ? t.app.pos : s.newSale;
+---
+
+<AppLayout title={heading} current={fromHome ? '/' : '/sales'}>
+  {appointment ? <a class="ui-back" href={localePath(locale, `/appointments/${appointment.id}`)}>← {appointment.title}</a>
+    : !fromHome && <a class="ui-back" href={localePath(locale, draft ? `/quotes/${draft.quote_id}` : '/sales')}>← {draft ? t.quotes.back : s.back}</a>}
+  <header class="ui-header">
+    <div>
+      <h1>{heading}</h1>
+      <p class="ui-sub">{branch.name}{myRegister && <> · {fmt(s.atRegister, { register: myRegister.cash_register })}</>}</p>
+    </div>
+  </header>
+
+  {draftError && <Notice tone="error">{draftError}</Notice>}
+
+  {
+    !draftError && !myRegister ? (
+      <section class="occupy">
+        <Notice tone="warning">{mySession ? fmt(s.registerElsewhere, { register: mySession.cash_register, branch: mySession.branch }) : s.needRegister}</Notice>
+        {occupyError && <Notice tone="error">{occupyError}</Notice>}
+        {!mySession && (freeRegisters.length ? (
+          <ul class="registers" role="list">
+            {freeRegisters.map((r) => (
+              <li>
+                <form method="post">
+                  <input type="hidden" name="intent" value="occupy" />
+                  <input type="hidden" name="register_id" value={r.id} />
+                  <Button type="submit" variant="secondary" icon="log-in">{fmt(s.occupy, { register: r.name })}</Button>
+                </form>
+              </li>
+            ))}
+          </ul>
+        ) : <p class="ui-muted">{s.noFreeRegister}</p>)}
+        <Button variant="tertiary" href={localePath(locale, '/cash')}>{s.goToCash}</Button>
+      </section>
+    ) : !draftError && (
+      <form method="post" class="pos" novalidate>
+        <input type="hidden" name="intent" value="sale" />
+        <div class="ui-notices">
+          {formError && (
+            <Notice tone="error">
+              {formError.text}
+              {formError.items && <ul>{formError.items.map((i) => <li>{i}</li>)}</ul>}
+            </Notice>
+          )}
+          {(appointment ? Date.parse(appointment.starts_at) : draft?.appointment_at ? Date.parse(draft.appointment_at) : 0) > Date.now()
+            && <Notice>{t.appointments.depositHint}</Notice>}
+          {draft && changed.length > 0 && <Notice tone="warning">{s.quotedPrices}</Notice>}
+          {draft && draft.removed_products.length > 0 && <Notice tone="warning">{fmt(s.removedProducts, { list: draft.removed_products.join(', ') })}</Notice>}
+          {draft && draft.stock_warnings.length > 0 && (
+            <Notice tone="warning">{s.quoteStock}<ul>{draft.stock_warnings.map((w) => <li>{fmt(s.errors.stockItem, { product: w.product, needed: Number(w.needed), available: Number(w.available) })}</li>)}</ul></Notice>
+          )}
+        </div>
+        <Cart mode="sale" locale={locale} initial={initial} promotions={promotions} methods={methods}
+          customerLocked={!!draft?.customer_id || !!appointment}>
+        </Cart>
+      </form>
+    )
+  }
+
+  {sold.sold && (
+    <Dialog id="sold-dialog" title={fmt(s.done.title, { folio: sold.folio })} closeLabel={t.ui.close} open>
+      <div class="done">
+        <p class="done-total"><span>{s.cart.total}</span><strong class="num">{money(locale, Number(sold.total))}</strong></p>
+        {Number(sold.change) > 0 && <p class="done-change"><span>{s.done.change}</span><strong class="num">{money(locale, Number(sold.change))}</strong></p>}
+        <div class="done-actions">
+          <Button variant="secondary" icon="printer" href={`${localePath(locale, `/sales/${sold.sold}`)}?print=1`} {...{ target: '_blank' }}>{s.done.print}</Button>
+          <Button variant="tertiary" href={localePath(locale, `/sales/${sold.sold}`)}>{s.done.view}</Button>
+          <Button icon="plus" data-dialog-close autofocus>{s.done.next}</Button>
+        </div>
+      </div>
+    </Dialog>
+  )}
+</AppLayout>
+
+<script>
+  // Closing the confirmation goes straight back to scanning
+  document.querySelector('#sold-dialog')?.addEventListener('close', () => document.querySelector<HTMLInputElement>('#cart-search')?.focus());
+</script>
+
+<style>
+  .done {
+    display: grid;
+    gap: var(--space-3);
+  }
+  .done p {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin: 0;
+    font-size: var(--text-lg);
+  }
+  .done-change {
+    padding: var(--space-3) var(--space-4);
+    background: color-mix(in srgb, var(--status-success, #15803d) 12%, var(--bg-app));
+    border-radius: var(--radius-control);
+  }
+  .done-change strong {
+    font-size: var(--text-3xl, 2.25rem);
+    color: var(--text-title);
+  }
+  .done-actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: var(--space-2);
+    margin-top: var(--space-2);
+  }
+  .occupy {
+    display: grid;
+    gap: var(--space-3);
+    max-width: 40rem;
+  }
+  .registers {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    padding: 0;
+    list-style: none;
+  }
+  .pos {
+    display: grid;
+    gap: var(--space-3);
+  }
+</style>

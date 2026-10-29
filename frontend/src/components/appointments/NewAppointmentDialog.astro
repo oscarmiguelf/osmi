@@ -1,0 +1,114 @@
+---
+// "New appointment" dialog, used by the calendar and by the customer's page (there the customer is fixed).
+// The page handles the POST with saveNewAppointment (lib/appointments).
+import Button from '@/components/ui/Button.astro';
+import Dialog from '@/components/ui/Dialog.astro';
+import Field from '@/components/ui/Field.astro';
+import SearchPicker from '@/components/ui/SearchPicker.astro';
+import ServicePicker from './ServicePicker.astro';
+import { fmt, useTranslations, type Locale } from '@/i18n';
+import type { BookableService, NewAppointmentValues } from '@/lib/appointments';
+import type { CustomField } from '@/lib/customFields';
+import ExtraFields from '@/components/ui/ExtraFields.astro';
+
+interface Props {
+  locale: Locale;
+  values: NewAppointmentValues;
+  error?: string;
+  staff: { id: string; name: string | null; email: string }[];
+  open?: boolean;
+  /** The customer can't be changed (the customer's own page). */
+  customerFixed?: boolean;
+  /** Services that can be booked: chosen ones set the length and are charged at the end */
+  services?: BookableService[];
+  /** The business's data of each appointment (Settings) and the messages of what was wrong in it */
+  fields?: CustomField[];
+  extraErrors?: Record<string, string>;
+}
+
+const { locale, values, error, staff, open = false, customerFixed = false, services = [], fields = [], extraErrors = {} } = Astro.props;
+const t = useTranslations(locale);
+const ap = t.appointments;
+const DURATIONS = [15, 30, 45, 60, 90, 120];
+// Opened with services already chosen (from a quote): the length is theirs, added up, as when picking them here
+const proposed = values.services.reduce((m, id) => m + (services.find((sv) => sv.id === id)?.duration ?? 0), 0);
+const duration = !error && proposed ? String(proposed) : values.duration;
+const lengths = [...new Set([...DURATIONS, Number(duration) || 30])].sort((a, b) => a - b);
+const lengthLabel = (m: number) => (m < 60 || m % 60 ? fmt(ap.minutes, { n: m }) : fmt(ap.hours, { n: m / 60 }));
+---
+
+<Dialog id="new-appointment" title={ap.new} closeLabel={t.ui.close} open={open || !!error}>
+  <form method="post" class="ui-form" novalidate data-appointment-form>
+    <input type="hidden" name="intent" value="appointment" />
+    {values.quote_id && <input type="hidden" name="quote_id" value={values.quote_id} />}
+    {error && <p class="ui-alert ui-full" role="alert">{error}</p>}
+    <div class="ui-full field-block">
+      {customerFixed ? (
+        <>
+          <span class="label">{ap.customer}</span>
+          <strong>{values.customer_label}</strong>
+          <input type="hidden" name="customer" value={values.customer_id} />
+          <input type="hidden" name="customer_label" value={values.customer_label} />
+        </>
+      ) : (
+        <>
+          <label class="label" for="ap-customer">{ap.customer} <span class="req" aria-hidden="true">*</span></label>
+          <SearchPicker id="ap-customer" name="customer" endpoint="/api/customers" placeholder={ap.customerPlaceholder} hint={ap.customerHint}
+            noResults={t.sales.cart.noCustomers} clearLabel={t.sales.cart.clear} focusAfter="#field-title" requiredMessage={ap.errors.customer}
+            value={values.customer_id ? { id: values.customer_id, title: values.customer_label } : null} />
+        </>
+      )}
+    </div>
+    <div class="ui-full"><Field label={ap.reason} name="title" value={values.title} required maxlength={200} hint={ap.reasonHint} /></div>
+    {services.length > 0 && (
+      <div class="ui-full" data-services>
+        <ServicePicker locale={locale} id="ap-services" services={services} selected={values.services} hint={ap.servicesHint} />
+      </div>
+    )}
+    <Field label={ap.start} name="start" type="datetime-local" value={values.start} required />
+    <Field label={ap.duration} name="duration" as="select">
+      {lengths.map((m) => <option value={m} selected={String(m) === duration}>{lengthLabel(m)}</option>)}
+    </Field>
+    <div class="ui-full">
+      <Field label={ap.assignedTo} name="assigned_to" as="select" hint={ap.assignedHint}>
+        <option value="">{ap.nobody}</option>
+        {staff.map((s) => <option value={s.id} selected={s.id === values.assigned_to}>{s.name ?? s.email}</option>)}
+      </Field>
+    </div>
+    <ExtraFields fields={fields} values={values.extra} errors={extraErrors} title={ap.extraTitle} idPrefix="ap-extra" />
+    <div class="ui-full"><Field label={ap.notes} name="notes" as="textarea" rows={2} value={values.notes} maxlength={5000} /></div>
+    <label class="ui-check ui-full"><input type="checkbox" name="confirmed" checked={values.confirmed} />{ap.alreadyConfirmed}</label>
+    <div class="ui-form-actions">
+      <Button variant="tertiary" data-dialog-close>{t.ui.cancel}</Button>
+      <Button type="submit" icon="calendar-check">{ap.schedule}</Button>
+    </div>
+  </form>
+</Dialog>
+
+<script>
+  // Choosing services proposes the length: their minutes added up (a longer length than the list offers is added to it)
+  document.querySelectorAll<HTMLElement>('[data-services]').forEach((box) => {
+    const form = box.closest('form')!;
+    const duration = form.querySelector<HTMLSelectElement>('select[name=duration]')!;
+    box.addEventListener('change', () => {
+      const total = [...box.querySelectorAll<HTMLInputElement>('input[name=service]')].reduce((m, i) => m + Number(i.dataset.minutes), 0);
+      if (!total) return;
+      if (![...duration.options].some((o) => Number(o.value) === total)) duration.add(new Option(`${total} min`, String(total)));
+      duration.value = String(total);
+    });
+  });
+</script>
+
+<style>
+  .field-block {
+    display: grid;
+    gap: var(--space-1);
+  }
+  .label {
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
+  }
+  .req {
+    color: var(--status-error-text);
+  }
+</style>

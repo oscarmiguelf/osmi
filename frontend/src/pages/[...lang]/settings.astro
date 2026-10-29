@@ -1,0 +1,401 @@
+---
+// Business settings: the business type (giro), the extra customer fields, and the catalog's WhatsApp number.
+import AppLayout from '@/layouts/AppLayout.astro';
+import Button from '@/components/ui/Button.astro';
+import Badge from '@/components/ui/Badge.astro';
+import Card from '@/components/ui/Card.astro';
+import Dialog from '@/components/ui/Dialog.astro';
+import Field from '@/components/ui/Field.astro';
+import Notice from '@/components/ui/Notice.astro';
+import { fmt, getLocale, localePath, useTranslations } from '@/i18n';
+import { HIDDEN_MODULES } from '@/i18n/giro';
+import en from '@/i18n/en';
+import es from '@/i18n/es';
+import { ApiError } from '@/lib/api';
+import { createField, deleteField, listFields, updateField, type FieldType } from '@/lib/customFields';
+import { deleteLogo, getSettings, updateSettings, uploadLogo } from '@/lib/settings';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const s = t.settingsPage;
+const { session, accessToken } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'settings')?.permissions ?? [];
+if (!perms.includes('read')) return Astro.rewrite('/404');
+const canUpdate = perms.includes('update');
+const selfPath = localePath(locale, '/settings');
+
+let settings = await getSettings(accessToken);
+let number = settings.whatsapp_number;
+let error: string | undefined;
+let fieldError: string | undefined;
+let fieldErrorEntity: string | undefined;
+let logoError: string | undefined;
+const TYPES: FieldType[] = ['text', 'long_text', 'number', 'date', 'select', 'boolean'];
+const optionsOf = (raw: FormDataEntryValue | null) => String(raw ?? '').split(/\r?\n|,/).map((o) => o.trim()).filter(Boolean);
+if (Astro.request.method === 'POST' && canUpdate) {
+  const data = await Astro.request.formData();
+  const intent = String(data.get('intent') ?? 'whatsapp');
+  try {
+    if (intent === 'logo') {
+      const file = data.get('logo');
+      if (!(file instanceof File) || file.size === 0) throw new ApiError(422, null);
+      await uploadLogo(accessToken, file);
+      return Astro.redirect(`${selfPath}?logo=1#logo`, 303);
+    }
+    if (intent === 'logo-delete') {
+      await deleteLogo(accessToken);
+      return Astro.redirect(`${selfPath}?logo=1#logo`, 303);
+    }
+    if (intent === 'giro') await updateSettings(accessToken, { business_type: String(data.get('business_type')) as never });
+    else if (intent === 'field-create') {
+      await createField(accessToken, { entity: data.get('entity') === 'appointment' ? 'appointment' : 'customer',
+        label: String(data.get('label') ?? '').trim(), field_type: String(data.get('field_type')) as FieldType,
+        options: optionsOf(data.get('options')), required: data.has('required') });
+    } else if (intent === 'field-update') {
+      await updateField(accessToken, String(data.get('id')), { label: String(data.get('label') ?? '').trim(),
+        ...(data.has('options') && { options: optionsOf(data.get('options')) }), required: data.has('required') });
+    } else if (intent === 'field-move') await updateField(accessToken, String(data.get('id')), { sort_order: Number(data.get('sort_order')) });
+    else if (intent === 'field-delete') await deleteField(accessToken, String(data.get('id')));
+    else if (intent === 'clinical') {
+      await updateSettings(accessToken, { doctor_header: String(data.get('doctor_header') ?? '').trim(), privacy_notice: String(data.get('privacy_notice') ?? '').trim() });
+    } else if (intent === 'reminder') await updateSettings(accessToken, { reminder_template: String(data.get('reminder_template') ?? '').trim() });
+    else {
+      number = String(data.get('whatsapp_number') ?? '').trim();
+      settings = await updateSettings(accessToken, { whatsapp_number: number });
+    }
+    return Astro.redirect(`${selfPath}?saved=1${intent.startsWith('field') ? `#fields-${data.get('entity') ?? 'customer'}` : ''}`, 303);
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    if (intent.startsWith('logo')) logoError = e.status === 422 ? t.share.logoError : t.ui.failed;
+    else if (intent.startsWith('field')) {
+      fieldErrorEntity = String(data.get('entity') ?? 'customer');
+      const d = e.body?.detail;
+      fieldError = d?.field === 'label' && e.status === 409 ? s.fieldTaken : d?.field === 'options' ? s.fieldOptions : e.status === 422 ? t.ui.formError : t.ui.failed;
+    } else error = e.status === 422 ? s.whatsappError : e.status === 403 ? t.ui.forbidden : t.ui.failed;
+    Astro.response.status = 422;
+  }
+}
+// The business's own data: about customers, and about each appointment (when it uses appointments)
+const usesAppointments = !HIDDEN_MODULES[settings.business_type]?.includes('appointments');
+const fieldSets = [
+  { entity: 'customer', title: s.fields, text: s.fieldsText, fields: await listFields(accessToken) },
+  ...(usesAppointments ? [{ entity: 'appointment', title: s.appointmentFields, text: s.appointmentFieldsText, fields: await listFields(accessToken, 'appointment') }] : []),
+];
+const GIROS = ['retail', 'beauty', 'health', 'music'] as const;
+// Each giro described in its own words (the current giro's renames would say "eventos" in the beauty card)
+const giroCards = (locale === 'en' ? en : es).settingsPage.giros;
+const catalogUrl = new URL(localePath(locale, '/catalog'), Astro.url).toString();
+---
+
+<AppLayout title={s.title} current="/settings">
+  <header class="ui-header"><h1>{s.title}</h1></header>
+  <div class="ui-notices" data-flash={Astro.url.searchParams.has('saved') ? '' : undefined}>
+    {Astro.url.searchParams.has('saved') && <Notice>{s.saved}</Notice>}
+  </div>
+
+  <Card title={t.share.logoTitle}>
+    <div class="logo-row" id="logo">
+      {settings.logo_file
+        ? <img class="logo" src={`/api/catalog/logo?v=${settings.logo_file}`} alt={t.share.logoTitle} />
+        : <span class="logo empty ui-muted ui-small">{t.share.logoNone}</span>}
+      <div class="logo-side">
+        <p class="ui-muted ui-small">{t.share.logoText}</p>
+        {logoError && <p class="ui-alert" role="alert">{logoError}</p>}
+        {Astro.url.searchParams.has('logo') && !logoError && <Notice>{t.share.logoSaved}</Notice>}
+        {canUpdate && (
+          <div class="ui-actions">
+            <form method="post" enctype="multipart/form-data" class="logo-form">
+              <input type="hidden" name="intent" value="logo" />
+              <input type="file" name="logo" accept="image/png,image/jpeg,image/webp" class="visually-hidden" tabindex="-1" aria-hidden="true" data-logo-input />
+              <Button variant="secondary" icon="image-up" data-logo-pick>{settings.logo_file ? t.share.logoReplace : t.share.logoUpload}</Button>
+            </form>
+            {settings.logo_file && (
+              <form method="post" data-confirm={t.share.logoRemoveText} data-confirm-title={t.share.logoRemoveTitle} data-confirm-action={t.share.logoRemove}>
+                <input type="hidden" name="intent" value="logo-delete" />
+                <Button type="submit" variant="tertiary" icon="trash-2">{t.share.logoRemove}</Button>
+              </form>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  </Card>
+
+  <Card title={s.giro}>
+    <p class="ui-muted">{s.giroText}</p>
+    <form method="post" class="giros">
+      <input type="hidden" name="intent" value="giro" />
+      {GIROS.map((g) => (
+        <label class:list={['giro', { current: settings.business_type === g }]}>
+          <input type="radio" name="business_type" value={g} checked={settings.business_type === g} disabled={!canUpdate} />
+          <strong>{giroCards[g].name}</strong>
+          <span class="ui-muted ui-small">{giroCards[g].text}</span>
+        </label>
+      ))}
+      {canUpdate && <div class="ui-form-actions"><Button type="submit">{s.saveGiro}</Button></div>}
+    </form>
+  </Card>
+
+  {fieldSets.map(({ entity, title, text, fields }) => (
+  <>
+  <span id={`fields-${entity}`}></span>
+  <Card title={title}>
+    <p class="ui-muted">{text}</p>
+    {fieldError && fieldErrorEntity === entity && <p class="ui-alert" role="alert">{fieldError}</p>}
+    {fields.length === 0 ? <p class="ui-muted ui-small">{s.noFields}</p> : (
+      <ul class="fields" role="list">
+        {fields.map((f, n) => (
+          <li>
+            <span class="field-info">
+              <strong>{f.label}</strong>
+              <span class="ui-muted ui-small">{s.types[f.field_type]}{f.options.length > 0 && `: ${f.options.join(', ')}`}</span>
+            </span>
+            {f.required && <Badge>{s.required}</Badge>}
+            {canUpdate && (
+              <span class="ui-actions field-actions">
+                {n > 0 && <form method="post"><input type="hidden" name="intent" value="field-move" /><input type="hidden" name="id" value={f.id} /><input type="hidden" name="entity" value={entity} />
+                  <input type="hidden" name="sort_order" value={Math.max(fields[n - 1].sort_order - 1, 0)} />
+                  <Button type="submit" variant="tertiary" icon="arrow-up" aria-label={fmt(s.moveUp, { name: f.label })} /></form>}
+                <Button variant="tertiary" icon="pencil" aria-label={`${t.ui.edit}: ${f.label}`}
+                  data-edit-field={JSON.stringify({ id: f.id, entity, label: f.label, options: f.options.join('\n'), required: f.required, select: f.field_type === 'select' })} />
+                <form method="post" data-confirm={s.deleteFieldText} data-confirm-title={fmt(s.deleteFieldTitle, { name: f.label })} data-confirm-action={t.ui.delete}>
+                  <input type="hidden" name="intent" value="field-delete" /><input type="hidden" name="id" value={f.id} /><input type="hidden" name="entity" value={entity} />
+                  <Button type="submit" variant="danger" icon="trash-2" aria-label={`${t.ui.delete}: ${f.label}`} />
+                </form>
+              </span>
+            )}
+          </li>
+        ))}
+      </ul>
+    )}
+    {canUpdate && (
+      <form method="post" class="ui-form add-field" novalidate data-field-form>
+        <input type="hidden" name="intent" value="field-create" />
+        <input type="hidden" name="entity" value={entity} />
+        <Field label={s.fieldLabel} name="label" maxlength={80} required id={`field-label-${entity}`} />
+        <Field label={s.fieldType} name="field_type" as="select" data-field-type id={`field-type-${entity}`}>
+          {TYPES.map((ty) => <option value={ty}>{s.types[ty]}</option>)}
+        </Field>
+        <div class="ui-full" data-options hidden><Field label={s.fieldOptionsLabel} name="options" as="textarea" rows={3} hint={s.fieldOptionsHint} id={`field-options-${entity}`} /></div>
+        <label class="ui-check ui-full"><input type="checkbox" name="required" />{s.requiredLabel}</label>
+        <div class="ui-form-actions"><Button type="submit" icon="plus">{s.addField}</Button></div>
+      </form>
+    )}
+  </Card>
+  </>
+  ))}
+
+  {canUpdate && (
+    <Dialog id="edit-field" title={s.editField} closeLabel={t.ui.close}>
+      <form method="post" class="ui-form" novalidate data-edit-field-form>
+        <input type="hidden" name="intent" value="field-update" />
+        <input type="hidden" name="id" />
+        <input type="hidden" name="entity" />
+        <div class="ui-full"><Field label={s.fieldLabel} name="label" id="edit-field-label" maxlength={80} required /></div>
+        <div class="ui-full" data-edit-options><Field label={s.fieldOptionsLabel} name="options" id="edit-field-options" as="textarea" rows={3} hint={s.fieldOptionsHint} /></div>
+        <label class="ui-check ui-full"><input type="checkbox" name="required" />{s.requiredLabel}</label>
+        <p class="ui-muted ui-small ui-full">{s.typeFixed}</p>
+        <div class="ui-form-actions">
+          <Button variant="tertiary" data-dialog-close>{t.ui.cancel}</Button>
+          <Button type="submit">{t.ui.saveChanges}</Button>
+        </div>
+      </form>
+    </Dialog>
+  )}
+
+  <Card title={t.reminders.title}>
+    <form method="post" class="ui-form">
+      <input type="hidden" name="intent" value="reminder" />
+      <div class="ui-full">
+        <Field label={t.reminders.templateLabel} name="reminder_template" as="textarea" rows={3} maxlength={1000} value={settings.reminder_template ?? ''}
+          placeholder={t.reminders.defaultText} hint={t.reminders.templateHint} disabled={!canUpdate} />
+      </div>
+      {canUpdate && <div class="ui-form-actions"><Button type="submit">{t.ui.save}</Button></div>}
+    </form>
+  </Card>
+
+  {settings.business_type === 'health' && (
+    <Card title={t.clinical.settingsTitle}>
+      <form method="post" class="ui-form">
+        <input type="hidden" name="intent" value="clinical" />
+        <div class="ui-full">
+          <Field label={t.clinical.doctorHeader} name="doctor_header" as="textarea" rows={4} maxlength={1000} value={settings.doctor_header ?? ''}
+            hint={t.clinical.doctorHeaderHint} disabled={!canUpdate} />
+        </div>
+        <div class="ui-full">
+          <Field label={t.clinical.privacyNotice} name="privacy_notice" as="textarea" rows={8} maxlength={20000} value={settings.privacy_notice ?? ''}
+            hint={t.clinical.privacyNoticeHint} disabled={!canUpdate} />
+        </div>
+        {canUpdate && <div class="ui-form-actions"><Button type="submit">{t.ui.save}</Button></div>}
+      </form>
+    </Card>
+  )}
+
+  <Card title={s.catalog}>
+    <p class="ui-muted">{s.catalogText}</p>
+    <div class="link-row">
+      <span class="label">{s.catalogLink}</span>
+      <code class="url" data-url>{catalogUrl}</code>
+      <span class="ui-actions">
+        <Button variant="secondary" icon="copy" data-copy data-copied={s.copied}>{s.copy}</Button>
+        <Button variant="tertiary" icon="external-link" href={catalogUrl} target="_blank" rel="noopener">{s.open}</Button>
+      </span>
+    </div>
+    <form method="post" class="ui-form" novalidate>
+      <div class="ui-full">
+        <Field label={s.whatsapp} name="whatsapp_number" type="tel" inputmode="tel" value={number} maxlength={20} disabled={!canUpdate}
+          hint={error ? undefined : s.whatsappHint} error={error} />
+      </div>
+      {!settings.whatsapp_number && <p class="ui-muted ui-small ui-full">{s.off}</p>}
+      <div class="ui-form-actions">
+        {settings.whatsapp_number && <Button variant="tertiary" icon="message-circle" href={`https://wa.me/${settings.whatsapp_number}`} target="_blank" rel="noopener">{s.test}</Button>}
+        {canUpdate && <Button type="submit">{t.ui.save}</Button>}
+      </div>
+    </form>
+  </Card>
+</AppLayout>
+
+<script>
+  // Logo: the button opens the file picker; choosing a file uploads it
+  const logoInput = document.querySelector<HTMLInputElement>('[data-logo-input]');
+  document.querySelector('[data-logo-pick]')?.addEventListener('click', () => logoInput?.click());
+  logoInput?.addEventListener('change', () => logoInput.files?.length && logoInput.form!.requestSubmit());
+  // New field: the options box only for lists
+  document.querySelectorAll<HTMLFormElement>('[data-field-form]').forEach((form) => {
+    const type = form.querySelector<HTMLSelectElement>('[data-field-type]')!;
+    const opts = form.querySelector<HTMLElement>('[data-options]')!;
+    type.addEventListener('change', () => { opts.hidden = type.value !== 'select'; });
+  });
+  // Edit a field in the dialog (its type can't change)
+  const editDialog = document.querySelector<HTMLDialogElement>('#edit-field');
+  const editForm = editDialog?.querySelector<HTMLFormElement>('[data-edit-field-form]');
+  document.querySelectorAll<HTMLElement>('[data-edit-field]').forEach((b) => b.addEventListener('click', () => {
+    const v = JSON.parse(b.dataset.editField!);
+    (editForm!.elements.namedItem('id') as HTMLInputElement).value = v.id;
+    (editForm!.elements.namedItem('entity') as HTMLInputElement).value = v.entity;
+    (editForm!.elements.namedItem('label') as HTMLInputElement).value = v.label;
+    const options = editForm!.elements.namedItem('options') as HTMLTextAreaElement;
+    options.value = v.options;
+    options.disabled = !v.select; // only lists have options (a disabled field isn't sent)
+    editForm!.querySelector<HTMLElement>('[data-edit-options]')!.hidden = !v.select;
+    (editForm!.elements.namedItem('required') as HTMLInputElement).checked = v.required;
+    editDialog!.showModal();
+  }));
+  document.querySelector<HTMLButtonElement>('[data-copy]')?.addEventListener('click', async (e) => {
+    const b = e.currentTarget as HTMLButtonElement;
+    try {
+      await navigator.clipboard.writeText(document.querySelector('[data-url]')!.textContent!);
+      const label = b.lastChild!;
+      const before = label.textContent;
+      label.textContent = b.dataset.copied!;
+      setTimeout(() => (label.textContent = before), 1500);
+    } catch { /* clipboard blocked: the link is visible to copy by hand */ }
+  });
+  if (document.querySelector('[data-flash]')) {
+    const url = new URL(location.href);
+    url.searchParams.delete('saved');
+    history.replaceState(null, '', url);
+  }
+</script>
+
+<style>
+  .logo-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-4);
+  }
+  .logo {
+    width: 9rem;
+    height: 5rem;
+    object-fit: contain;
+    background: #fff;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-control);
+  }
+  .logo.empty {
+    display: grid;
+    place-items: center;
+    border-style: dashed;
+    background: transparent;
+  }
+  .logo-side {
+    display: grid;
+    flex: 1 1 16rem;
+    gap: var(--space-2);
+  }
+  .logo-side p {
+    margin: 0;
+  }
+  .link-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2) var(--space-3);
+    margin: var(--space-3) 0 var(--space-5);
+  }
+  .label {
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
+  }
+  .url {
+    padding: var(--space-1) var(--space-2);
+    background: var(--bg-app);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-control);
+    font-size: var(--text-sm);
+    word-break: break-all;
+  }
+  .giros {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+    gap: var(--space-3);
+    margin-top: var(--space-3);
+  }
+  .giro {
+    display: grid;
+    gap: var(--space-1);
+    padding: var(--space-3) var(--space-4);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-container);
+    cursor: pointer;
+  }
+  .giro:has(input:checked) {
+    border-color: var(--color-primary);
+    box-shadow: 0 0 0 1px var(--color-primary);
+  }
+  .giros .ui-form-actions {
+    grid-column: 1 / -1;
+  }
+  .fields {
+    display: grid;
+    gap: var(--space-2);
+    margin: var(--space-3) 0;
+    padding: 0;
+    list-style: none;
+  }
+  .fields li {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-control);
+  }
+  .field-info {
+    display: grid;
+    flex: 1;
+  }
+  .field-actions {
+    flex-wrap: nowrap;
+  }
+  .add-field {
+    margin-top: var(--space-3);
+    padding-top: var(--space-3);
+    border-top: 1px solid var(--border-subtle);
+  }
+  [data-options][hidden],
+  [data-edit-options][hidden] {
+    display: none;
+  }
+</style>

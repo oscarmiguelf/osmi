@@ -1,0 +1,11 @@
+# Exact versions: every build installs what was tested. To upgrade: change a version, run the tests, then
+#   pip-audit -r requirements.txt   (known vulnerabilities)
+fastapi==0.162.0
+uvicorn[standard]==0.54.0
+sqlalchemy==2.1.6
+psycopg[binary]==3.3.6
+pyjwt==2.15.1
+argon2-cffi==25.1.0
+bcrypt==5.0.0
+python-multipart==0.0.32
+Pillow==13.0.0

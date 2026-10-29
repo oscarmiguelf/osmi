@@ -1,0 +1,65 @@
+---
+// For screens with nothing to show yet: say what goes here and offer the action that fills it.
+import Icon from './Icon.astro';
+
+interface Props {
+  icon: string;
+  title: string;
+  text: string;
+  level?: 1 | 2 | 3;
+}
+
+const { icon, title, text, level = 2 } = Astro.props;
+const Heading = `h${level}` as const;
+---
+
+<div class="empty">
+  <span class="icon"><Icon name={icon} size={28} /></span>
+  <Heading class="title">{title}</Heading>
+  <p>{text}</p>
+  {
+    Astro.slots.has('default') && (
+      <div class="action">
+        <slot />
+      </div>
+    )
+  }
+</div>
+
+<style>
+  .empty {
+    display: grid;
+    justify-items: center;
+    gap: var(--space-2);
+    padding: var(--space-12) var(--space-6);
+    background: var(--bg-surface);
+    border: 1px dashed var(--border-input);
+    border-radius: var(--radius-container);
+    text-align: center;
+  }
+
+  .icon {
+    display: grid;
+    place-items: center;
+    width: 3.5rem;
+    height: 3.5rem;
+    margin-bottom: var(--space-2);
+    background: var(--bg-app);
+    border: 1px solid var(--border-subtle);
+    border-radius: 50%;
+    color: var(--color-primary);
+  }
+
+  .title {
+    font-size: var(--text-lg);
+  }
+
+  p {
+    max-width: 40ch;
+    color: var(--text-muted);
+  }
+
+  .action {
+    margin-top: var(--space-4);
+  }
+</style>

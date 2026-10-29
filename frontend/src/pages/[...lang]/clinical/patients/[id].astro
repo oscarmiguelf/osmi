@@ -1,0 +1,560 @@
+---
+// A patient's clinical record: background, consultations, prescriptions, studies, dental chart, consents and who opened it.
+// Opening this page is logged by the API (clinical_access_log).
+import AppLayout from '@/layouts/AppLayout.astro';
+import Badge from '@/components/ui/Badge.astro';
+import Button from '@/components/ui/Button.astro';
+import Card from '@/components/ui/Card.astro';
+import Dialog from '@/components/ui/Dialog.astro';
+import Field from '@/components/ui/Field.astro';
+import Notice from '@/components/ui/Notice.astro';
+import { fmt, getLocale, localePath, useTranslations } from '@/i18n';
+import { ApiError } from '@/lib/api';
+import {
+  accessLog, addConsent, addDental, ADULT_TEETH, BACKGROUND, CHILD_TEETH, clinicalRecord, CONDITIONS, createNote, saveBackground, uploadClinicalFile,
+  type ClinicalRecord,
+} from '@/lib/clinical';
+import { formatPhone } from '@/lib/customers';
+import { setFlash, takeFlash } from '@/lib/session';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const c = t.clinical;
+const { session, accessToken, branch } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'clinical')?.permissions ?? [];
+if (!perms.includes('read') || session.business_type !== 'health') return Astro.rewrite('/404');
+const canCreate = perms.includes('create');
+const canUpdate = perms.includes('update');
+const id = Astro.params.id!;
+const selfPath = localePath(locale, `/clinical/patients/${id}`);
+const tz = session.user.timezone;
+
+let errors: Record<string, string> = {};
+let openDialog: string | undefined;
+const errText = (e: ApiError) => {
+  const d = e.body?.detail;
+  if (e.status === 403) return c.errors.forbidden;
+  if (d?.code && (c.fileErrors[d.code] || (c.errors as Record<string, string>)[d.code])) return c.fileErrors[d.code] ?? (c.errors as Record<string, string>)[d.code];
+  if (d?.field === 'signature') return c.errors.signature;
+  return e.status === 422 ? c.errors.required : t.ui.failed;
+};
+
+if (Astro.request.method === 'POST') {
+  const data = await Astro.request.formData();
+  const intent = String(data.get('intent'));
+  const v = (k: string) => String(data.get(k) ?? '').trim();
+  try {
+    if (intent === 'note' && canCreate && branch) {
+      // From the record or from an appointment ("Nota de consulta"): the appointment's note opens if it already has one
+      try {
+        const note = await createNote(accessToken, branch.id, { customer_id: id, appointment_id: v('appointment_id') || null, kind: v('kind') || 'medical' });
+        return Astro.redirect(localePath(locale, `/clinical/notes/${note.id}`), 303);
+      } catch (e) {
+        if (e instanceof ApiError && e.body?.detail?.code === 'note_exists') return Astro.redirect(localePath(locale, `/clinical/notes/${e.body.detail.note_id}`), 303);
+        throw e;
+      }
+    } else if (intent === 'background' && canUpdate) {
+      openDialog = 'background';
+      await saveBackground(accessToken, id, Object.fromEntries(BACKGROUND.map((k) => [k, v(k)]).filter(([, x]) => x)));
+    } else if (intent === 'file' && canCreate) {
+      const file = data.get('file');
+      if (!(file instanceof File) || file.size === 0) throw new ApiError(422, { detail: { field: 'file' } });
+      await uploadClinicalFile(accessToken, id, file, v('label'));
+    } else if (intent === 'dental' && canUpdate) {
+      openDialog = 'tooth';
+      await addDental(accessToken, id, [{ tooth: Number(v('tooth')), surface: v('surface') || null, condition: v('condition'), note: v('note') || null }]);
+    } else if (intent === 'consent' && canCreate) {
+      openDialog = 'consent';
+      if (!v('signer_name') || !v('text')) throw new ApiError(422, null);
+      await addConsent(accessToken, id, { kind: v('kind'), signer_name: v('signer_name'), text: v('text'), signature: v('signature') || null });
+    } else {
+      return Astro.redirect(selfPath, 303);
+    }
+    setFlash(Astro.cookies, { done: intent });
+    return Astro.redirect(selfPath + (intent === 'dental' ? '#dental' : ''), 303);
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    errors[intent] = errText(e);
+  }
+  Astro.response.status = 422;
+}
+
+let record: ClinicalRecord;
+try {
+  record = await clinicalRecord(accessToken, id);
+} catch (e) {
+  if (e instanceof ApiError && (e.status === 404 || e.status === 422)) return Astro.rewrite('/404');
+  throw e;
+}
+const log = await accessLog(accessToken, id);
+const flash = takeFlash(Astro.cookies);
+const when = new Intl.DateTimeFormat(t.intl, { dateStyle: 'medium', timeStyle: 'short', timeZone: tz });
+const day = new Intl.DateTimeFormat(t.intl, { dateStyle: 'medium', timeZone: tz });
+const bg = record.background.data;
+const filled = BACKGROUND.filter((k) => bg[k]);
+// The chart only matters to dentists: shown once the patient has a dental note or finding (or on demand)
+const showDental = record.dental_chart.length > 0 || record.notes.some((n) => n.kind === 'dental') || Astro.url.searchParams.has('dental');
+const chart = new Map<number, { whole?: string; surfaces: Record<string, string> }>();
+for (const e of record.dental_chart) {
+  const tooth = chart.get(e.tooth) ?? { surfaces: {} };
+  if (e.surface) tooth.surfaces[e.surface] = e.condition;
+  else tooth.whole = e.condition;
+  chart.set(e.tooth, tooth);
+}
+const toothTitle = (n: number) => {
+  const x = chart.get(n);
+  const parts = [x?.whole && c.conditions[x.whole], ...Object.entries(x?.surfaces ?? {}).map(([s, k]) => `${s}: ${c.conditions[k]}`)].filter(Boolean);
+  return `${fmt(c.tooth, { n })}${parts.length ? ' — ' + parts.join(', ') : ''}`;
+};
+const kb = (n: number) => (n < 1024 * 1024 ? `${Math.ceil(n / 1024)} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`);
+---
+
+<AppLayout title={`${c.title} · ${record.patient.full_name}`} current="/clinical">
+  <a class="ui-back" href={localePath(locale, '/clinical')}>← {c.title}</a>
+  <header class="ui-header">
+    <div>
+      <h1>{record.patient.full_name}</h1>
+      <p class="ui-sub">
+        {c.title}
+        {record.patient.phone && <> · <span class="num">{formatPhone(record.patient.phone)}</span></>}
+        {' · '}<a href={localePath(locale, `/customers/${id}`)}>{t.customers.title}</a>
+      </p>
+    </div>
+    {canCreate && branch && (
+      <div class="ui-actions">
+        <form method="post"><input type="hidden" name="intent" value="note" /><input type="hidden" name="kind" value="medical" />
+          <Button type="submit" icon="stethoscope">{c.newNote}</Button></form>
+        <form method="post"><input type="hidden" name="intent" value="note" /><input type="hidden" name="kind" value="dental" />
+          <Button type="submit" variant="secondary" icon="smile">{c.newDental}</Button></form>
+      </div>
+    )}
+  </header>
+
+  <div class="ui-notices">
+    {flash.done && c.done[flash.done] && <Notice tone="success">{c.done[flash.done]}</Notice>}
+    {(errors.note || errors.file) && <Notice tone="error">{errors.note ?? errors.file}</Notice>}
+    {bg.allergies && <Notice tone="warning">{c.bg.allergies}: {bg.allergies}</Notice>}
+  </div>
+
+  <div class="layout">
+    <div class="main">
+      <Card title={c.notesTitle}>
+        {record.notes.length === 0 ? <p class="ui-muted">{c.notesEmpty}</p> : (
+          <ul class="rows" role="list">
+            {record.notes.map((n) => (
+              <li>
+                <a class="ui-strong" href={localePath(locale, `/clinical/notes/${n.id}`)}>{when.format(new Date(n.visit_at))}</a>
+                <span class="ui-small">{n.reason || '—'}{n.diagnosis && <span class="ui-muted"> · {n.diagnosis}</span>}</span>
+                <span class="badges">
+                  {n.kind === 'dental' && <Badge>{c.kinds.dental}</Badge>}
+                  {n.signed_at ? <Badge tone="success">{c.signed}</Badge> : <Badge tone="warning">{c.draft}</Badge>}
+                </span>
+                <span class="ui-muted ui-small">{n.author}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </Card>
+
+      {showDental ? (
+        <Card title={c.dentalTitle}>
+          <p class="ui-muted ui-small" id="dental">{c.dentalHint}</p>
+          {errors.dental && <p class="ui-alert" role="alert">{errors.dental}</p>}
+          {[ADULT_TEETH, CHILD_TEETH].map((rows, i) => {
+            const grid = (
+              <div class:list={['teeth', { child: i === 1 }]}>
+                {rows.map((row) => (
+                  <div class="teeth-row">
+                    {row.map((n) => {
+                      const x = chart.get(n);
+                      return (
+                        <button type="button" class:list={['tooth', x?.whole && `c-${x.whole}`]} data-tooth={n} title={toothTitle(n)} aria-label={toothTitle(n)}
+                          disabled={!canUpdate}>
+                          <span class="num">{n}</span>
+                          <span class="surfaces" aria-hidden="true">
+                            {['V', 'M', 'O', 'D', 'L'].map((s) => <i class:list={[`s-${s}`, x?.surfaces[s] && `c-${x.surfaces[s]}`]} />)}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                ))}
+              </div>
+            );
+            return i === 0 ? grid : <details><summary class="ui-small">{c.dentalChildren}</summary>{grid}</details>;
+          })}
+          <ul class="legend ui-small" role="list">
+            {CONDITIONS.map((k) => <li><i class={`c-${k}`} aria-hidden="true" />{c.conditions[k]}</li>)}
+          </ul>
+        </Card>
+      ) : (
+        <p><a class="ui-small" href={`${selfPath}?dental=1#dental`}>{c.dentalOpen}</a></p>
+      )}
+
+      <Card title={c.rxTitle}>
+        {record.prescriptions.length === 0 ? <p class="ui-muted">{c.rxEmpty}</p> : (
+          <ul class="rows" role="list">
+            {record.prescriptions.map((p) => (
+              <li>
+                <a class="ui-strong" href={localePath(locale, `/clinical/prescriptions/${p.id}`)} target="_blank">{day.format(new Date(p.created_at))}</a>
+                <span class="ui-small">{p.items.map((m) => m.name).join(', ')}</span>
+                <span />
+                <span class="ui-muted ui-small">{p.author}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </Card>
+
+      <Card title={c.filesTitle}>
+        {canCreate && (
+          <form method="post" enctype="multipart/form-data" class="upload">
+            <input type="hidden" name="intent" value="file" />
+            <Field label={c.file} name="file" type="file" accept="application/pdf,image/jpeg,image/png,image/webp" required id="clinical-file" />
+            <Field label={c.fileLabel} name="label" maxlength={200} id="clinical-file-label" />
+            <Button type="submit" variant="secondary" icon="upload">{c.upload}</Button>
+          </form>
+        )}
+        {record.files.length === 0 ? <p class="ui-muted">{c.filesEmpty}</p> : (
+          <ul class="rows" role="list">
+            {record.files.map((f) => (
+              <li>
+                <a class="ui-strong" href={`/api/clinical/file?id=${f.id}`} target="_blank" rel="noopener">{f.label}</a>
+                <span class="ui-muted ui-small">{f.content_type === 'application/pdf' ? 'PDF' : f.content_type.replace('image/', '').toUpperCase()} · {kb(f.size_bytes)}</span>
+                <span />
+                <span class="ui-muted ui-small">{f.uploaded_by}, {day.format(new Date(f.created_at))}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </Card>
+    </div>
+
+    <div class="main">
+      <Card title={c.backgroundTitle}>
+        {canUpdate && <Button slot="action" variant="tertiary" icon="pencil" data-dialog="background">{c.editBackground}</Button>}
+        {filled.length === 0 ? <p class="ui-muted">{c.backgroundEmpty}</p> : (
+          <dl class="bg">
+            {filled.map((k) => <div><dt>{c.bg[k]}</dt><dd>{bg[k]}</dd></div>)}
+          </dl>
+        )}
+        {record.background.updated_at && (
+          <p class="ui-muted ui-small">{fmt(c.updatedBy, { who: record.background.updated_by ?? '—', when: when.format(new Date(record.background.updated_at)) })}</p>
+        )}
+      </Card>
+
+      <Card title={c.consentsTitle}>
+        {canCreate && <Button slot="action" variant="tertiary" icon="signature" data-dialog="consent">{c.consentNew}</Button>}
+        {record.consents.length === 0 ? <p class="ui-muted">{c.consentsEmpty}</p> : (
+          <ul class="consents" role="list">
+            {record.consents.map((x) => (
+              <li>
+                <span class="ui-strong">{c.consentKinds[x.kind]}</span>
+                <span class="ui-muted ui-small">{fmt(c.signedOn, { who: x.signer_name, when: when.format(new Date(x.accepted_at)) })}</span>
+                {x.signature_file && <img class="sig" src={`/api/clinical/file?patient=${id}&signature=${x.signature_file}`} alt={x.signer_name} />}
+                <details><summary class="ui-small">{c.viewText}</summary><p class="ui-small pre">{x.text_snapshot}</p></details>
+              </li>
+            ))}
+          </ul>
+        )}
+      </Card>
+
+      <Card title={c.logTitle}>
+        <ul class="log ui-small" role="list">
+          {log.slice(0, 15).map((l) => <li><span>{c.logActions[l.action]} · {l.name ?? l.email}</span><span class="ui-muted num">{when.format(new Date(l.at))}</span></li>)}
+        </ul>
+      </Card>
+    </div>
+  </div>
+
+  <p class="ui-muted ui-small legal">{c.legal}</p>
+
+  {canUpdate && (
+    <Dialog id="background" title={c.backgroundTitle} closeLabel={t.ui.close} open={openDialog === 'background'}>
+      <form method="post" class="ui-form" novalidate>
+        {errors.background && <p class="ui-alert ui-full" role="alert">{errors.background}</p>}
+        <input type="hidden" name="intent" value="background" />
+        {BACKGROUND.map((k) => <div class="ui-full"><Field label={c.bg[k]} name={k} as="textarea" rows={2} value={bg[k] ?? ''} maxlength={5000} id={`bg-${k}`} /></div>)}
+        <div class="ui-form-actions">
+          <Button variant="tertiary" data-dialog-close>{t.ui.cancel}</Button>
+          <Button type="submit">{t.ui.saveChanges}</Button>
+        </div>
+      </form>
+    </Dialog>
+  )}
+
+  {canUpdate && showDental && (
+    <Dialog id="tooth" title={c.dentalTitle} closeLabel={t.ui.close} open={openDialog === 'tooth'}>
+      <form method="post" class="ui-form" novalidate data-tooth-form data-label={c.tooth}>
+        <input type="hidden" name="intent" value="dental" />
+        <input type="hidden" name="tooth" value="" />
+        <p class="ui-full ui-strong" data-tooth-label></p>
+        <Field label={c.surface} name="surface" as="select" id="tooth-surface">
+          <option value="">{c.wholeTooth}</option>
+          {Object.entries(c.surfaces).map(([k, label]) => <option value={k}>{label}</option>)}
+        </Field>
+        <Field label={c.condition} name="condition" as="select" id="tooth-condition">
+          {CONDITIONS.map((k) => <option value={k}>{c.conditions[k]}</option>)}
+        </Field>
+        <div class="ui-full"><Field label={c.dentalNote} name="note" maxlength={300} id="tooth-note" /></div>
+        <div class="ui-form-actions">
+          <Button variant="tertiary" data-dialog-close>{t.ui.cancel}</Button>
+          <Button type="submit">{c.dentalSave}</Button>
+        </div>
+      </form>
+    </Dialog>
+  )}
+
+  {canCreate && (
+    <Dialog id="consent" title={c.consentNew} closeLabel={t.ui.close} open={openDialog === 'consent'}>
+      <form method="post" class="ui-form" novalidate data-consent>
+        {errors.consent && <p class="ui-alert ui-full" role="alert">{errors.consent}</p>}
+        <input type="hidden" name="intent" value="consent" />
+        <input type="hidden" name="signature" value="" />
+        <Field label={c.consentKind} name="kind" as="select" id="consent-kind">
+          {Object.entries(c.consentKinds).map(([k, label]) => <option value={k}>{label}</option>)}
+        </Field>
+        <Field label={c.signer} name="signer_name" value={record.patient.full_name} required maxlength={200} id="consent-signer" />
+        <div class="ui-full">
+          <Field label={c.consentText} name="text" as="textarea" rows={6} value={record.privacy_notice} required maxlength={20000} id="consent-text"
+            hint={record.privacy_notice ? undefined : c.privacyMissing} />
+        </div>
+        <div class="ui-full pad">
+          <span class="ui-small">{c.signHere}</span>
+          <canvas width="560" height="180" data-pad aria-label={c.signHere}></canvas>
+          <Button variant="tertiary" icon="eraser" data-pad-clear>{c.clearSignature}</Button>
+        </div>
+        <div class="ui-form-actions">
+          <Button variant="tertiary" data-dialog-close>{t.ui.cancel}</Button>
+          <Button type="submit" icon="signature">{c.consentSave}</Button>
+        </div>
+      </form>
+    </Dialog>
+  )}
+</AppLayout>
+
+<script>
+  // Dental chart: a tooth opens the finding dialog for it
+  const toothForm = document.querySelector<HTMLFormElement>('[data-tooth-form]');
+  document.querySelectorAll<HTMLButtonElement>('[data-tooth]').forEach((b) => b.addEventListener('click', () => {
+    if (!toothForm) return;
+    toothForm.tooth.value = b.dataset.tooth!;
+    toothForm.querySelector('[data-tooth-label]')!.textContent = toothForm.dataset.label!.replace('{n}', b.dataset.tooth!);
+    toothForm.closest('dialog')!.showModal();
+  }));
+
+  // Signature pad: drawn with a finger, stylus or mouse; sent as a PNG with the consent
+  const consent = document.querySelector<HTMLFormElement>('[data-consent]');
+  const pad = consent?.querySelector<HTMLCanvasElement>('[data-pad]');
+  if (consent && pad) {
+    const ctx = pad.getContext('2d')!;
+    let drawing = false;
+    let drawn = false;
+    const at = (e: PointerEvent) => {
+      const r = pad.getBoundingClientRect();
+      return [(e.clientX - r.left) * (pad.width / r.width), (e.clientY - r.top) * (pad.height / r.height)] as const;
+    };
+    ctx.lineWidth = 2.5;
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = '#111';
+    pad.addEventListener('pointerdown', (e) => { drawing = true; pad.setPointerCapture(e.pointerId); ctx.beginPath(); ctx.moveTo(...at(e)); });
+    pad.addEventListener('pointermove', (e) => { if (!drawing) return; ctx.lineTo(...at(e)); ctx.stroke(); drawn = true; });
+    pad.addEventListener('pointerup', () => { drawing = false; });
+    consent.querySelector('[data-pad-clear]')!.addEventListener('click', () => { ctx.clearRect(0, 0, pad.width, pad.height); drawn = false; });
+    consent.addEventListener('submit', () => { consent.signature.value = drawn ? pad.toDataURL('image/png') : ''; });
+  }
+</script>
+
+<style>
+  .layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 24rem);
+    align-items: start;
+    gap: var(--space-4);
+  }
+  .main {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--space-4);
+  }
+  .rows {
+    display: grid;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .rows li {
+    display: grid;
+    grid-template-columns: 11rem minmax(0, 1fr) auto auto;
+    align-items: center;
+    gap: var(--space-3);
+    padding: var(--space-2) 0;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .rows li:last-child {
+    border-bottom: 0;
+  }
+  .badges {
+    display: flex;
+    gap: var(--space-1);
+  }
+  .upload {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+    align-items: end;
+    gap: var(--space-3);
+  }
+  .bg {
+    display: grid;
+    gap: var(--space-3);
+    margin: 0;
+  }
+  .bg dt {
+    font-size: var(--text-sm);
+    color: var(--text-muted);
+  }
+  .bg dd {
+    margin: 0;
+    white-space: pre-line;
+  }
+  .consents,
+  .log {
+    display: grid;
+    gap: var(--space-3);
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .consents li {
+    display: grid;
+    gap: var(--space-1);
+  }
+  .log li {
+    display: flex;
+    justify-content: space-between;
+    gap: var(--space-2);
+  }
+  .sig {
+    max-width: 12rem;
+    background: #fff;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-control);
+  }
+  .pre {
+    white-space: pre-line;
+  }
+  .pad {
+    display: grid;
+    gap: var(--space-1);
+    justify-items: start;
+  }
+  .pad canvas {
+    width: 100%;
+    aspect-ratio: 560 / 180;
+    background: #fff;
+    border: 1px dashed var(--border-strong, var(--border-subtle));
+    border-radius: var(--radius-control);
+    touch-action: none;
+  }
+  .legal {
+    margin-top: var(--space-6);
+  }
+
+  /* Dental chart */
+  .teeth {
+    display: grid;
+    gap: var(--space-2);
+    overflow-x: auto;
+    padding-bottom: var(--space-1);
+  }
+  .teeth-row {
+    display: flex;
+    gap: 2px;
+    justify-content: center;
+  }
+  .teeth-row + .teeth-row {
+    padding-top: var(--space-2);
+    border-top: 1px dashed var(--border-subtle);
+  }
+  .tooth {
+    display: grid;
+    justify-items: center;
+    gap: 2px;
+    min-width: 2.25rem;
+    padding: 2px;
+    font-size: var(--text-xs, 0.75rem);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-control);
+    cursor: pointer;
+  }
+  .tooth:disabled {
+    cursor: default;
+  }
+  .tooth:hover:not(:disabled) {
+    border-color: var(--color-primary);
+  }
+  .surfaces {
+    display: grid;
+    grid-template: 'v v v' 0.5rem 'm o d' 0.75rem 'l l l' 0.5rem / 0.5rem 0.75rem 0.5rem;
+    gap: 1px;
+  }
+  .surfaces i {
+    background: var(--bg-app);
+    border: 1px solid var(--border-subtle);
+  }
+  .s-V { grid-area: v; }
+  .s-M { grid-area: m; }
+  .s-O { grid-area: o; }
+  .s-D { grid-area: d; }
+  .s-L { grid-area: l; }
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-1) var(--space-3);
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .legend i {
+    display: inline-block;
+    width: 0.75rem;
+    height: 0.75rem;
+    margin-inline-end: var(--space-1);
+    vertical-align: -1px;
+    border: 1px solid var(--border-subtle);
+  }
+  /* One color per finding; a whole-tooth finding tints the tooth */
+  .c-healthy { --c: #16a34a; }
+  .c-caries { --c: #dc2626; }
+  .c-filled { --c: #2563eb; }
+  .c-crown { --c: #ca8a04; }
+  .c-root_canal { --c: #7c3aed; }
+  .c-missing { --c: #6b7280; }
+  .c-extraction { --c: #ea580c; }
+  .c-implant { --c: #0891b2; }
+  .c-fracture { --c: #be185d; }
+  .c-sealant { --c: #65a30d; }
+  .surfaces i[class*='c-'],
+  .legend i {
+    background: var(--c);
+  }
+  .tooth[class*='c-'] {
+    border-color: var(--c);
+    box-shadow: inset 0 -3px 0 var(--c);
+  }
+  .tooth.c-missing {
+    opacity: 0.45;
+  }
+  @media (max-width: 60rem) {
+    .layout {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .upload {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .rows li {
+      grid-template-columns: minmax(0, 1fr) auto;
+    }
+  }
+</style>

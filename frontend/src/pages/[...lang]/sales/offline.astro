@@ -1,0 +1,113 @@
+---
+// Sales made without internet that didn't match when they came back: stock that wasn't there, a price that changed.
+// They are already recorded (the customer paid); someone checks each one and marks it reviewed.
+import AppLayout from '@/layouts/AppLayout.astro';
+import Button from '@/components/ui/Button.astro';
+import Notice from '@/components/ui/Notice.astro';
+import { fmt, getLocale, localePath, money, useTranslations } from '@/i18n';
+import { ApiError } from '@/lib/api';
+import { offlineIssues, resolveOfflineIssue } from '@/lib/sales';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const o = t.offline;
+const { session, accessToken, branch } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'sales')?.permissions ?? [];
+if (!perms.includes('read') || !branch) return Astro.rewrite('/404');
+const canResolve = perms.includes('update');
+const reviewed = Astro.url.searchParams.has('reviewed');
+const selfPath = localePath(locale, '/sales/offline');
+
+let error: string | undefined;
+if (Astro.request.method === 'POST' && canResolve) {
+  const data = await Astro.request.formData();
+  try {
+    await resolveOfflineIssue(accessToken, branch.id, String(data.get('id')), String(data.get('note') ?? '').trim() || null);
+    return Astro.redirect(selfPath, 303);
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    error = t.ui.failed;
+  }
+}
+
+const issues = await offlineIssues(accessToken, branch.id, reviewed);
+const when = new Intl.DateTimeFormat(t.intl, { dateStyle: 'medium', timeStyle: 'short', timeZone: session.user.timezone });
+const n = (v?: string) => String(Number(v ?? 0));
+const describe = (i: (typeof issues)[number]) => i.kind === 'stock'
+  ? fmt(o.issueStock, { product: i.detail.product, needed: n(i.detail.needed), available: n(i.detail.available) })
+  : fmt(o.issuePrice, { product: i.detail.product, charged: money(locale, Number(i.detail.charged)), current: money(locale, Number(i.detail.current)) });
+---
+
+<AppLayout title={o.issuesTitle} current="/sales">
+  <a class="ui-back" href={localePath(locale, '/sales')}>← {t.sales.title}</a>
+  <header class="ui-header">
+    <div><h1>{o.issuesTitle}</h1><p class="ui-sub">{branch.name}</p></div>
+  </header>
+  <p class="ui-muted intro">{o.issuesIntro}</p>
+  <nav class="ui-tabs" aria-label={o.issuesTitle}>
+    <a href={selfPath} aria-current={!reviewed ? 'page' : undefined}>{o.issuesOpen}</a>
+    <a href={`${selfPath}?reviewed=1`} aria-current={reviewed ? 'page' : undefined}>{o.issuesReviewed}</a>
+  </nav>
+  <div class="ui-notices">{error && <Notice tone="error">{error}</Notice>}</div>
+
+  {issues.length === 0 ? <p class="ui-muted">{o.issuesNone}</p> : (
+    <ul class="issues" role="list">
+      {issues.map((i) => (
+        <li>
+          <div class="what">
+            <a class="ui-strong num" href={localePath(locale, `/sales/${i.sale_id}`)}>{i.folio}</a>
+            <span class="ui-muted ui-small num">{i.offline_folio} · {when.format(new Date(i.sold_at))}</span>
+            <p>{describe(i)}</p>
+            {i.resolved_at && <p class="ui-muted ui-small">{fmt(o.issueResolved, { who: i.resolved_by ?? '—', when: when.format(new Date(i.resolved_at)) })}{i.note && ` — ${i.note}`}</p>}
+          </div>
+          {!i.resolved_at && canResolve && (
+            <form method="post" class="resolve">
+              <input type="hidden" name="id" value={i.id} />
+              <label class="visually-hidden" for={`note-${i.id}`}>{o.issueNote}</label>
+              <input class="ui-input" id={`note-${i.id}`} name="note" maxlength="500" placeholder={o.issueNote} />
+              <Button type="submit" variant="secondary" icon="check">{o.issueResolve}</Button>
+            </form>
+          )}
+        </li>
+      ))}
+    </ul>
+  )}
+</AppLayout>
+
+<style>
+  .intro {
+    max-width: 48rem;
+    margin: 0 0 var(--space-4);
+  }
+  .issues {
+    display: grid;
+    gap: var(--space-2);
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .issues li {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    padding: var(--space-3) var(--space-4);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-container);
+  }
+  .what {
+    display: grid;
+    gap: var(--space-1);
+    flex: 1 1 22rem;
+  }
+  .what p {
+    margin: 0;
+  }
+  .resolve {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+  }
+</style>

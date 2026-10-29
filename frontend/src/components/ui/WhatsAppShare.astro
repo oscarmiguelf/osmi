@@ -1,0 +1,84 @@
+---
+// Sends a PDF (ticket, prescription) by WhatsApp. On phones and tablets it shares the file itself (the system share sheet,
+// no public link with the customer's data); on computers it downloads the PDF and opens the chat (WhatsApp Web) with the message.
+import Button from './Button.astro';
+
+interface Props {
+  /** Same-origin URL of the PDF route */
+  pdf: string;
+  fileName: string;
+  /** The message; the chat opens with it */
+  text: string;
+  /** Customer phone ('' = WhatsApp asks who to send it to) */
+  phone?: string | null;
+  labels: { whatsapp: string; pdf: string; preparing: string; fallback: string; failed: string };
+}
+
+const { pdf, fileName, text, phone, labels } = Astro.props;
+const digits = (phone ?? '').replace(/\D/g, '');
+const chat = `https://wa.me/${digits.length === 10 ? `52${digits}` : digits}?text=${encodeURIComponent(text)}`;
+const sep = pdf.includes('?') ? '&' : '?';
+---
+
+<div class="share no-print" data-share data-pdf={pdf} data-file={fileName} data-text={text} data-chat={chat}
+  data-preparing={labels.preparing} data-fallback={labels.fallback} data-failed={labels.failed}>
+  <Button variant="secondary" icon="message-circle" data-share-send>{labels.whatsapp}</Button>
+  <Button variant="tertiary" icon="file-down" href={`${pdf}${sep}download=1`}>{labels.pdf}</Button>
+  <p class="status ui-small ui-muted" role="status" aria-live="polite" data-share-status></p>
+</div>
+
+<script>
+  document.querySelectorAll<HTMLElement>('[data-share]').forEach((box) => {
+    const { pdf, file, text, chat, preparing, fallback, failed } = box.dataset as Record<string, string>;
+    const status = box.querySelector<HTMLElement>('[data-share-status]')!;
+    const send = box.querySelector<HTMLButtonElement>('[data-share-send]')!;
+    let pending: Promise<File> | null = null;
+    // Fetched ahead (pointer over / focus) so the share happens right on the click: browsers only allow it then
+    const load = () => (pending ??= fetch(pdf, { credentials: 'same-origin' }).then(async (r) => {
+      if (!r.ok) throw new Error(String(r.status));
+      return new File([await r.blob()], file, { type: 'application/pdf' });
+    }).catch((e) => { pending = null; throw e; }));
+    ['pointerenter', 'focus', 'touchstart'].forEach((ev) => send.addEventListener(ev, () => load().catch(() => {}), { passive: true }));
+
+    send.addEventListener('click', async () => {
+      status.textContent = preparing;
+      send.disabled = true;
+      try {
+        const pdfFile = await load();
+        // Desktop share sheets (macOS, Windows) often don't list WhatsApp: there, download + chat is more predictable
+        if (matchMedia('(pointer: coarse)').matches && navigator.canShare?.({ files: [pdfFile] })) {
+          try {
+            await navigator.share({ files: [pdfFile], text });
+            status.textContent = '';
+            return;
+          } catch (e) {
+            if ((e as DOMException).name === 'AbortError') { status.textContent = ''; return; } // closed the share sheet
+          }
+        }
+        const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(pdfFile), download: file });
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 10_000);
+        window.open(chat, '_blank', 'noopener');
+        status.textContent = fallback;
+      } catch {
+        status.textContent = failed;
+      } finally {
+        send.disabled = false;
+      }
+    });
+  });
+</script>
+
+<style>
+  /* Its buttons join the row they are placed in (a header's actions) */
+  .share {
+    display: contents;
+  }
+  .status:empty {
+    display: none;
+  }
+  .status {
+    flex-basis: 100%;
+    margin: 0;
+  }
+</style>

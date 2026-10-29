@@ -1,0 +1,294 @@
+---
+// A quote, ready to print or share, with its actions: convert into a sale, start a new one from it, cancel.
+import AppLayout from '@/layouts/AppLayout.astro';
+import Badge from '@/components/ui/Badge.astro';
+import Button from '@/components/ui/Button.astro';
+import Card from '@/components/ui/Card.astro';
+import Notice from '@/components/ui/Notice.astro';
+import Timeline from '@/components/ui/Timeline.astro';
+import { fmt, getLocale, localePath, money, useTranslations } from '@/i18n';
+import { ApiError } from '@/lib/api';
+import { formatPhone } from '@/lib/customers';
+import { cancelQuote, getQuote, getSale, quoteHistory, type Quote } from '@/lib/sales';
+import { listPaymentMethods } from '@/lib/cash';
+import AbonoDialog from '@/components/sales/AbonoDialog.astro';
+
+import { setFlash, takeFlash } from '@/lib/session';
+import { HIDDEN_MODULES } from '@/i18n/giro';
+import NewAppointmentDialog from '@/components/appointments/NewAppointmentDialog.astro';
+import { appointmentStaff, bookableServices, newAppointmentValues, saveNewAppointment, type NewAppointmentValues } from '@/lib/appointments';
+import { listFields } from '@/lib/customFields';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const qt = t.quotes;
+const { session, accessToken, branch } = Astro.locals as Required<App.Locals>;
+const can = (module: string, p: string) => (session.modules.find((m) => m.code === module)?.permissions ?? []).includes(p);
+if (!can('quotes', 'read') || !branch) return Astro.rewrite('/404');
+const id = Astro.params.id!;
+const selfPath = localePath(locale, `/quotes/${id}`);
+
+let pageError: string | undefined;
+// "Book event": the dialog opens here (no trip to the calendar); posted with intent=appointment
+let apValues: NewAppointmentValues | undefined;
+let apError: string | undefined;
+let apExtraErrors: Record<string, string> | undefined;
+const postData = Astro.request.method === 'POST' ? await Astro.request.formData() : null;
+if (postData?.get('intent') === 'appointment' && can('appointments', 'create')) {
+  const saved = await saveNewAppointment(accessToken, branch.id, session.user.timezone, postData, t.appointments.errors, t.ui.failed,
+    await listFields(accessToken, 'appointment'), t.customers.extraErrors);
+  if (saved.created) {
+    setFlash(Astro.cookies, { booked: saved.created.id, pay_sale: saved.created.sale_id ?? '', pending: saved.created.sale_pending ?? '' });
+    return Astro.redirect(selfPath, 303);
+  }
+  ({ values: apValues, error: apError, extraErrors: apExtraErrors } = saved);
+  Astro.response.status = 422;
+} else if (postData && can('quotes', 'update')) {
+  try {
+    await cancelQuote(accessToken, branch.id, id);
+    setFlash(Astro.cookies, { cancelled: '1' });
+    return Astro.redirect(selfPath, 303);
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    pageError = e.status === 409 ? qt.notOpen : t.ui.failed;
+  }
+}
+
+let quote: Quote;
+try {
+  quote = await getQuote(accessToken, branch.id, id);
+} catch (e) {
+  if (e instanceof ApiError && (e.status === 404 || e.status === 422)) return Astro.rewrite('/404');
+  throw e;
+}
+const history = await quoteHistory(accessToken, branch.id, id);
+const flash = takeFlash(Astro.cookies);
+// Just booked (or a payment failed): the abono dialog for its sale, here
+const paySale = flash.pay_sale && branch ? await getSale(accessToken, branch.id, flash.pay_sale).catch(() => null) : null;
+const payMethods = paySale && Number(paySale.credit_outstanding) > 0 ? (await listPaymentMethods(accessToken)).filter((m) => !m.is_credit) : [];
+const tz = session.user.timezone;
+const when = new Intl.DateTimeFormat(t.intl, { dateStyle: 'medium', timeStyle: 'short', timeZone: tz });
+const day = new Intl.DateTimeFormat(t.intl, { dateStyle: 'long', timeZone: tz });
+const status = quote.is_expired ? 'EXPIRED' : quote.status;
+const tone = { OPEN: 'success', EXPIRED: 'warning', CONVERTED: 'accent', CANCELLED: 'neutral' } as const;
+const open = quote.status === 'OPEN' && !quote.is_expired;
+// An event booked from this quote (a band's quote becomes the event and its deposit)
+const canBook = open && !quote.appointment_id && !!quote.customer_id && can('appointments', 'create')
+  && !HIDDEN_MODULES[session.business_type].includes('appointments');
+const [apStaff, apServices, apFields] = canBook
+  ? await Promise.all([appointmentStaff(accessToken, branch.id), bookableServices(accessToken), listFields(accessToken, 'appointment')]) : [[], [], []];
+apValues ??= { ...newAppointmentValues(session.user.timezone, { id: quote.customer_id ?? '', title: quote.customer ?? '' }), quote_id: quote.id,
+  title: quote.notes?.slice(0, 200) ?? '', services: quote.items.map((i) => i.product_id) };
+const unit = (u: string) => t.products.unitNames[u] ?? u;
+const taxTotal = quote.tax_breakdown.reduce((s, x) => s + Number(x.tax_amount), 0);
+const timeline = history.filter((h) => h.entity_type === 'quote').map((h) => ({
+  title: h.action === 'INSERT' ? qt.created : qt.statuses[(h.to_status ?? 'OPEN') as keyof typeof qt.statuses] ?? h.action,
+  meta: `${h.changed_by ?? '—'}, ${when.format(new Date(h.changed_at))}`,
+})).reverse();
+---
+
+<AppLayout title={fmt(qt.detailTitle, { folio: quote.folio })} current="/quotes">
+  <a class="ui-back no-print" href={localePath(locale, '/quotes')}>← {qt.back}</a>
+  <header class="ui-header no-print">
+    <div>
+      <h1 class="num">{fmt(qt.detailTitle, { folio: quote.folio })}</h1>
+      <p class="ui-sub">{quote.customer ?? qt.noCustomer} <Badge tone={tone[status]}>{qt.statuses[status]}</Badge></p>
+    </div>
+    <div class="ui-actions">
+      <Button variant="secondary" icon="printer" data-print>{t.sales.detail.print}</Button>
+      {can('quotes', 'create') && <Button variant="secondary" icon="copy" href={`${localePath(locale, '/quotes/new')}?from=${id}`}>{open ? qt.edit : qt.duplicate}</Button>}
+      {open && can('quotes', 'update') && (
+        <form method="post" data-confirm={qt.cancelText} data-confirm-title={qt.cancelTitle} data-confirm-action={qt.cancel}>
+          <Button type="submit" variant="danger" icon="x">{qt.cancel}</Button>
+        </form>
+      )}
+      {canBook && <Button variant="secondary" icon="calendar-plus" data-dialog="new-appointment">{qt.bookEvent}</Button>}
+      {open && can('sales', 'create') && <Button icon="shopping-cart" href={`${localePath(locale, '/sales/new')}?quote=${id}`}>{qt.convert}</Button>}
+    </div>
+  </header>
+
+  <div class="ui-notices no-print">
+    {flash.created && <Notice>{flash.replaced ? fmt(qt.replacedDone, { folio: flash.replaced }) : qt.createdDone}</Notice>}
+    {flash.stock && <Notice tone="warning">{qt.stockNote}</Notice>}
+    {flash.cancelled && <Notice tone="warning">{qt.cancelledDone}</Notice>}
+    {quote.sale_id && <Notice>{qt.convertedTo} <a class="num" href={localePath(locale, `/sales/${quote.sale_id}`)}>{quote.sale_folio}</a></Notice>}
+    {flash.booked && <Notice>{t.appointments.created}</Notice>}
+    {flash.paid && <Notice tone="success">{flash.paid}</Notice>}
+    {flash.pending && <Notice tone="warning">{fmt(t.appointments.salePending, { reason: t.appointments.salePendingReasons[flash.pending] ?? '' })}</Notice>}
+    {quote.is_expired && <Notice tone="warning">{qt.expiredNote}</Notice>}
+    {quote.appointment_id && <Notice><a href={localePath(locale, `/appointments/${quote.appointment_id}`)}>{fmt(qt.forEvent, { title: quote.appointment_title ?? '', date: when.format(new Date(quote.appointment_at!)) })}</a></Notice>}
+    {pageError && <Notice tone="error">{pageError}</Notice>}
+  </div>
+
+  <div class="layout">
+    <article class="doc" aria-label={qt.document}>
+      <header class="doc-head">
+        <div>
+          <strong class="branch">{quote.branch}</strong>
+          {quote.branch_address && <span>{quote.branch_address}</span>}
+          {quote.branch_phone && <span class="num">{formatPhone(quote.branch_phone)}</span>}
+        </div>
+        <div class="meta">
+          <strong class="num">{fmt(qt.detailTitle, { folio: quote.folio })}</strong>
+          <span>{fmt(qt.issued, { date: day.format(new Date(quote.created_at)) })}</span>
+          <span class="ui-strong">{fmt(qt.validLong, { date: day.format(new Date(quote.valid_until)) })}</span>
+        </div>
+      </header>
+      <section class="customer">
+        <span class="ui-muted ui-small">{qt.customer}</span>
+        <strong>{quote.customer ?? qt.noCustomer}</strong>
+        {quote.customer_phone && <span class="num">{formatPhone(quote.customer_phone)}</span>}
+        {quote.customer_email && <span>{quote.customer_email}</span>}
+      </section>
+      <table class="lines">
+        <thead><tr><th scope="col">{t.sales.cart.product}</th><th scope="col" class="end">{t.sales.cart.quantity}</th><th scope="col" class="end">{t.sales.cart.price}</th><th scope="col" class="end">{t.sales.cart.lineTotal}</th></tr></thead>
+        <tbody>
+          {quote.items.map((i) => (
+            <tr>
+              <td>{i.product}{Number(i.discount) > 0 && <span class="sub">{fmt(qt.lineDiscount, { amount: money(locale, Number(i.discount)) })}</span>}
+                {!i.product_active && <span class="sub no-print">{qt.productRemoved}</span>}</td>
+              <td class="end num">{Number(i.quantity)} {unit(i.unit)}</td>
+              <td class="end num">{money(locale, Number(i.unit_price))}</td>
+              <td class="end num">{money(locale, Number(i.line_total))}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <dl class="sums">
+        <div><dt>{t.sales.cart.subtotal}</dt><dd class="num">{money(locale, Number(quote.subtotal))}</dd></div>
+        {Number(quote.discount) > 0 && <div><dt>{t.sales.cart.discount}</dt><dd class="num">−{money(locale, Number(quote.discount))}</dd></div>}
+        <div class="grand"><dt>{t.sales.cart.total}</dt><dd class="num">{money(locale, Number(quote.total))}</dd></div>
+        <div class="muted"><dt>{qt.taxNote}</dt><dd class="num">{money(locale, taxTotal)}</dd></div>
+      </dl>
+      {quote.notes && <p class="notes">{quote.notes}</p>}
+      <p class="fine">{qt.fine}</p>
+    </article>
+
+    <div class="side no-print">
+      <Card title={t.ui.history}>
+        <Timeline items={timeline} />
+      </Card>
+    </div>
+  </div>
+  {paySale && payMethods.length > 0 && (
+    <AbonoDialog locale={locale} saleId={paySale.id} balance={Number(paySale.credit_outstanding)} methods={payMethods} back={selfPath}
+      open error={flash.pay_error} />
+  )}
+  {canBook && (
+    <NewAppointmentDialog locale={locale} values={apValues} error={apError} extraErrors={apExtraErrors} staff={apStaff} services={apServices}
+      fields={apFields} customerFixed />
+  )}
+</AppLayout>
+
+<script>
+  document.querySelector('[data-print]')?.addEventListener('click', () => window.print());
+</script>
+
+<style>
+  .layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 20rem);
+    align-items: start;
+    gap: var(--space-4);
+  }
+  .doc {
+    display: grid;
+    gap: var(--space-4);
+    padding: var(--space-6, 2rem);
+    background: var(--bg-app);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-container);
+  }
+  .doc-head {
+    display: flex;
+    justify-content: space-between;
+    gap: var(--space-4);
+    padding-bottom: var(--space-4);
+    border-bottom: 2px solid var(--color-primary);
+  }
+  .doc-head > div,
+  .customer {
+    display: grid;
+    gap: 2px;
+  }
+  .branch {
+    font-size: var(--text-lg);
+    color: var(--text-title);
+  }
+  .meta {
+    text-align: end;
+  }
+  .lines {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: var(--text-sm);
+  }
+  .lines th {
+    padding: var(--space-2);
+    border-bottom: 1px solid var(--border-subtle);
+    color: var(--text-muted);
+    font-weight: var(--weight-medium);
+    text-align: start;
+  }
+  .lines td {
+    padding: var(--space-2);
+    border-bottom: 1px solid var(--border-subtle);
+    vertical-align: top;
+  }
+  .end {
+    text-align: end !important;
+  }
+  .sub {
+    display: block;
+    color: var(--text-muted);
+    font-size: var(--text-xs);
+  }
+  .sums {
+    display: grid;
+    gap: var(--space-1);
+    justify-self: end;
+    min-width: 16rem;
+    margin: 0;
+  }
+  .sums div {
+    display: flex;
+    justify-content: space-between;
+    gap: var(--space-4);
+  }
+  .sums dd {
+    margin: 0;
+  }
+  .grand {
+    font-size: var(--text-lg);
+    font-weight: var(--weight-bold);
+  }
+  .muted,
+  .fine {
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+  }
+  .notes {
+    white-space: pre-line;
+  }
+  @media (max-width: 60rem) {
+    .layout {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+  @media print {
+    :global(#sidebar),
+    :global(.no-print),
+    .no-print,
+    :global(header.topbar) {
+      display: none !important;
+    }
+    .layout {
+      display: block;
+    }
+    .doc {
+      border: 0;
+      padding: 0;
+      color: #000;
+    }
+  }
+</style>

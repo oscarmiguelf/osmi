@@ -1,0 +1,297 @@
+---
+// Categories, units, product types, tax rates and brands: one screen, one tab each (suppliers have their own module).
+import AppLayout from '@/layouts/AppLayout.astro';
+import Badge from '@/components/ui/Badge.astro';
+import Button from '@/components/ui/Button.astro';
+import Dialog from '@/components/ui/Dialog.astro';
+import Field from '@/components/ui/Field.astro';
+import Notice from '@/components/ui/Notice.astro';
+import { fmt, getLocale, localePath, useTranslations } from '@/i18n';
+import { ApiError } from '@/lib/api';
+import { createCatalog, deleteCatalog, listCatalog, mergeBrands, restoreCatalog, updateCatalog, type CatalogKey } from '@/lib/products';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const ct = t.catalogs;
+const pr = t.products;
+const { session, accessToken } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'products')?.permissions ?? [];
+if (!perms.includes('read')) return Astro.rewrite('/404');
+const canCreate = perms.includes('create');
+const canUpdate = perms.includes('update');
+const canDelete = perms.includes('delete');
+
+const KEYS: CatalogKey[] = ['categories', 'units', 'product-types', 'tax-rates', 'brands'];
+const params = Astro.url.searchParams;
+const key = (KEYS.includes(params.get('tab') as CatalogKey) ? params.get('tab') : 'categories') as CatalogKey;
+const hardDelete = key === 'brands'; // brands are deleted for good: nothing to show or restore
+const showDeleted = !hardDelete && params.get('deleted') === '1';
+const basePath = localePath(locale, '/products/catalogs');
+const here = `${basePath}?tab=${key}${showDeleted ? '&deleted=1' : ''}`;
+
+// Fields per catalog (the rate is typed as a percentage, the API wants a fraction)
+const readFields = (data: FormData) => {
+  const f: Record<string, unknown> = { name: String(data.get('name') ?? '').trim() };
+  if (key === 'tax-rates' && data.has('rate')) f.rate = (Number(data.get('rate')) / 100).toFixed(4);
+  if (key === 'product-types' && data.get('intent') === 'create') Object.assign(f, { tracks_stock: data.has('tracks_stock'), is_kit: data.has('is_kit') });
+  return f;
+};
+
+let pageError: string | undefined;
+let addError: string | undefined;
+if (Astro.request.method === 'POST') {
+  const data = await Astro.request.formData();
+  const intent = data.get('intent');
+  const id = String(data.get('id') ?? '');
+  try {
+    if (intent === 'create') await createCatalog(accessToken, key, readFields(data));
+    if (intent === 'update') await updateCatalog(accessToken, key, id, readFields(data));
+    if (intent === 'default') await updateCatalog(accessToken, key, id, { is_default: true });
+    if (intent === 'delete') await deleteCatalog(accessToken, key, id);
+    if (intent === 'restore') await restoreCatalog(accessToken, key, id);
+    if (intent === 'merge' && key === 'brands') {
+      const r = await mergeBrands(accessToken, data.getAll('from_ids').map(String), String(data.get('to_id') ?? ''));
+      return Astro.redirect(`${here}&merged=${r.products_moved}&removed=${r.brands_removed}`, 303);
+    }
+    return Astro.redirect(here, 303);
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    const detail = e.body?.detail;
+    const message = detail?.field === 'name' ? ct.nameTaken : detail?.products ? fmt(ct.inUse, { n: detail.products })
+      : typeof detail?.message === 'string' && detail.message.includes('default') ? ct.defaultLocked
+      : e.status === 422 ? t.ui.formError : e.status === 403 ? t.ui.forbidden : t.ui.failed;
+    if (intent === 'create') addError = message;
+    else pageError = message;
+  }
+  Astro.response.status = 422;
+}
+
+const items = await listCatalog(accessToken, key, showDeleted);
+const label = (name: string) => (key === 'units' ? pr.unitNames[name] : key === 'product-types' ? pr.typeNames[name] : undefined) ?? name;
+const pct = (r?: number) => `${Math.round(Number(r ?? 0) * 10000) / 100}%`;
+---
+
+<AppLayout title={ct.title} current="/products">
+  <a class="ui-back" href={localePath(locale, '/products')}>← {ct.back}</a>
+  <header class="ui-header">
+    <h1>{ct.title}</h1>
+    {canDelete && !hardDelete && <Button variant="tertiary" href={`${basePath}?tab=${key}${showDeleted ? '' : '&deleted=1'}`}>{showDeleted ? t.ui.hideDeleted : t.ui.showDeleted}</Button>}
+  </header>
+
+  <nav class="ui-tabs tabs" aria-label={ct.title}>
+    {KEYS.map((k) => <a href={`${basePath}?tab=${k}`} aria-current={k === key ? 'page' : undefined}>{ct.tabs[k]}</a>)}
+  </nav>
+
+  <div class="ui-notices" data-flash={params.has('merged') ? '' : undefined}>
+    {pageError && <Notice tone="error">{pageError}</Notice>}
+    {params.has('merged') && <Notice tone="success">{fmt(ct.merged, { brands: params.get('removed') ?? '0', products: params.get('merged') ?? '0' })}</Notice>}
+  </div>
+  {key === 'brands' && (
+    <div class="brand-tools">
+      <p class="ui-muted ui-small">{ct.brandsHint}</p>
+      {canUpdate && canDelete && items.length > 1 && <Button variant="secondary" icon="merge" data-dialog="merge-brands">{ct.mergeBrands}</Button>}
+    </div>
+  )}
+
+  {
+    canCreate && (
+      <form method="post" class="add" novalidate>
+        <input type="hidden" name="intent" value="create" />
+        <Field label={ct.name} name="name" required maxlength={200} error={addError} />
+        {key === 'tax-rates' && <Field label={ct.rate} name="rate" type="number" step="0.01" min="0" max="99.99" required />}
+        {key === 'product-types' && <label class="ui-check"><input type="checkbox" name="tracks_stock" checked />{ct.tracksStock}</label>}
+        {key === 'product-types' && <label class="ui-check"><input type="checkbox" name="is_kit" />{ct.isKit}</label>}
+        <Button type="submit" icon="plus">{ct.add}</Button>
+      </form>
+    )
+  }
+
+  {
+    items.length === 0 ? <p class="ui-muted">{ct.empty}</p> : (
+      <div class="ui-table-wrap">
+        <table class="ui-table">
+          <thead>
+            <tr>
+              <th scope="col">{ct.name}</th>
+              {key === 'tax-rates' && <th scope="col" class="ui-end">{ct.rate}</th>}
+              {key === 'product-types' && <th scope="col">{ct.tracksStock}</th>}
+              {key === 'brands' && <th scope="col" class="ui-end">{ct.products}</th>}
+              <th scope="col"><span class="visually-hidden">{t.ui.edit}</span></th>
+            </tr>
+          </thead>
+          <tbody>
+            {items.map((i) => (
+              <tr>
+                <td data-label={ct.name}>
+                  <span class="ui-strong">{label(i.name)}</span>
+                  {i.is_default && <Badge tone="accent">{ct.default}</Badge>}
+                  {i.is_kit && <Badge>{ct.isKit}</Badge>}
+                  {i.deleted_at && <Badge tone="error">{t.ui.deletedBadge}</Badge>}
+                </td>
+                {key === 'tax-rates' && <td data-label={ct.rate} class="ui-end num">{pct(i.rate)}</td>}
+                {key === 'product-types' && <td data-label={ct.tracksStock}>{i.tracks_stock ? t.ui.yes : 'No'}</td>}
+                {key === 'brands' && <td data-label={ct.products} class="ui-end num">{i.products ?? 0}</td>}
+                <td class="ui-row-action ui-end">
+                  <span class="ui-actions row-actions">
+                    {i.deleted_at ? canDelete && (
+                      <form method="post"><input type="hidden" name="intent" value="restore" /><input type="hidden" name="id" value={i.id} /><Button type="submit" variant="tertiary" icon="rotate-ccw">{t.ui.restore}</Button></form>
+                    ) : (
+                      <>
+                        {key === 'tax-rates' && !i.is_default && canUpdate && (
+                          <form method="post"><input type="hidden" name="intent" value="default" /><input type="hidden" name="id" value={i.id} /><Button type="submit" variant="tertiary">{ct.makeDefault}</Button></form>
+                        )}
+                        {canUpdate && (
+                          <Button variant="tertiary" icon="pencil" data-edit={JSON.stringify({ id: i.id, name: i.name, rate: i.rate !== undefined ? String(Math.round(Number(i.rate) * 10000) / 100) : '' })}
+                            aria-label={`${t.ui.edit}: ${label(i.name)}`} />
+                        )}
+                        {canDelete && (
+                          <form method="post" data-confirm={hardDelete ? ct.deleteBrandText : ct.deleteText} data-confirm-title={fmt(ct.deleteTitle, { name: label(i.name) })} data-confirm-action={t.ui.delete}>
+                            <input type="hidden" name="intent" value="delete" /><input type="hidden" name="id" value={i.id} />
+                            <Button type="submit" variant="danger" icon="trash-2" aria-label={`${t.ui.delete}: ${label(i.name)}`} />
+                          </form>
+                        )}
+                      </>
+                    )}
+                  </span>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    )
+  }
+
+  {
+    canUpdate && (
+      <Dialog id="edit-item" title={t.ui.edit} closeLabel={t.ui.close}>
+        <form method="post" class="ui-form" novalidate data-edit-form>
+          <input type="hidden" name="intent" value="update" />
+          <input type="hidden" name="id" />
+          <div class="ui-full"><Field label={ct.name} name="name" required maxlength={200} id="edit-name" /></div>
+          {key === 'tax-rates' && <div class="ui-full"><Field label={ct.rate} name="rate" type="number" step="0.01" min="0" max="99.99" id="edit-rate" /></div>}
+          <div class="ui-form-actions">
+            <Button variant="tertiary" data-dialog-close>{t.ui.cancel}</Button>
+            <Button type="submit">{t.ui.saveChanges}</Button>
+          </div>
+        </form>
+      </Dialog>
+    )
+  }
+  {key === 'brands' && canUpdate && canDelete && items.length > 1 && (
+    <Dialog id="merge-brands" title={ct.mergeBrands} closeLabel={t.ui.close}>
+      <form method="post" class="merge" data-merge-form data-labels={JSON.stringify({ summary: ct.mergeSummary, pick: ct.mergePick })}>
+        <input type="hidden" name="intent" value="merge" />
+        <p class="ui-muted ui-small">{ct.mergeIntro}</p>
+        <fieldset class="ui-checks merge-list">
+          <legend>{ct.mergeFrom}</legend>
+          {items.map((i) => (
+            <label class="ui-check"><input type="checkbox" name="from_ids" value={i.id} data-products={i.products ?? 0} />{i.name} <span class="ui-muted num">({i.products ?? 0})</span></label>
+          ))}
+        </fieldset>
+        <Field label={ct.mergeTo} name="to_id" id="merge-to" as="select" required>
+          <option value="">—</option>
+          {items.map((i) => <option value={i.id}>{i.name}</option>)}
+        </Field>
+        <p class="summary" data-merge-summary aria-live="polite"></p>
+        <div class="ui-form-actions">
+          <Button variant="tertiary" data-dialog-close>{t.ui.cancel}</Button>
+          <Button type="submit" icon="merge" data-merge-submit>{ct.mergeAction}</Button>
+        </div>
+      </form>
+    </Dialog>
+  )}
+</AppLayout>
+
+<script>
+  // Merge brands: the target can't be one of the merged ones; the summary says what will happen
+  const merge = document.querySelector<HTMLFormElement>('[data-merge-form]');
+  if (merge) {
+    const L = JSON.parse(merge.dataset.labels!);
+    const target = merge.querySelector<HTMLSelectElement>('select[name=to_id]')!;
+    const update = () => {
+      const boxes = [...merge.querySelectorAll<HTMLInputElement>('input[name=from_ids]')];
+      boxes.forEach((b) => {
+        b.disabled = b.value === target.value;
+        if (b.disabled) b.checked = false;
+      });
+      const chosen = boxes.filter((b) => b.checked);
+      const products = chosen.reduce((s, b) => s + Number(b.dataset.products), 0);
+      const name = target.selectedOptions[0]?.textContent ?? '';
+      const ok = chosen.length > 0 && !!target.value;
+      merge.querySelector('[data-merge-summary]')!.textContent = ok
+        ? L.summary.replace('{brands}', String(chosen.length)).replace('{products}', String(products)).replace('{target}', name)
+        : L.pick;
+      merge.querySelector<HTMLButtonElement>('[data-merge-submit]')!.disabled = !ok;
+    };
+    merge.addEventListener('change', update);
+    update();
+  }
+  if (document.querySelector('[data-flash]')) {
+    const url = new URL(location.href);
+    url.searchParams.delete('merged');
+    url.searchParams.delete('removed');
+    history.replaceState(null, '', url);
+  }
+  const dialog = document.querySelector<HTMLDialogElement>('#edit-item');
+  const form = dialog?.querySelector<HTMLFormElement>('[data-edit-form]');
+  document.querySelectorAll<HTMLElement>('[data-edit]').forEach((btn) =>
+    btn.addEventListener('click', () => {
+      const v = JSON.parse(btn.dataset.edit!);
+      for (const [k, value] of Object.entries(v)) {
+        const field = form?.elements.namedItem(k) as HTMLInputElement | null;
+        if (field) field.value = value as string;
+      }
+      dialog?.showModal();
+    }),
+  );
+</script>
+
+<style>
+  .brand-tools {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    margin-bottom: var(--space-4);
+  }
+  .merge {
+    display: grid;
+    gap: var(--space-4);
+  }
+  .merge-list {
+    max-height: 16rem;
+    overflow-y: auto;
+  }
+  .merge-list legend {
+    margin-bottom: var(--space-2);
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
+  }
+  .summary {
+    margin: 0;
+    font-weight: var(--weight-medium);
+  }
+  .tabs {
+    margin-bottom: var(--space-4);
+  }
+  .add {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: var(--space-3);
+    margin-bottom: var(--space-5);
+    padding: var(--space-4);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-container);
+  }
+  .add > :global(.field) {
+    flex: 1 1 12rem;
+  }
+  .row-actions {
+    justify-content: flex-end;
+    flex-wrap: nowrap;
+  }
+</style>

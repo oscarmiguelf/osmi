@@ -1,0 +1,64 @@
+---
+// One confirmation dialog for the whole app. Any form with data-confirm asks before submitting:
+//   <form method="post" data-confirm="Text" data-confirm-title="Title?" data-confirm-action="Delete">
+import Button from './Button.astro';
+import Dialog from './Dialog.astro';
+
+interface Props {
+  cancelLabel: string;
+  defaultTitle: string;
+}
+
+const { cancelLabel, defaultTitle } = Astro.props;
+---
+
+<Dialog id="confirm-dialog" title={defaultTitle} closeLabel={cancelLabel}>
+  <p class="message" data-confirm-message></p>
+  <div class="actions">
+    <Button variant="tertiary" data-dialog-close>{cancelLabel}</Button>
+    <Button variant="destructive" data-confirm-accept>OK</Button>
+  </div>
+</Dialog>
+
+<script>
+  const dialog = document.querySelector<HTMLDialogElement>('#confirm-dialog')!;
+  const title = dialog.querySelector('[data-dialog-title]')!;
+  const message = dialog.querySelector('[data-confirm-message]')!;
+  const accept = dialog.querySelector<HTMLButtonElement>('[data-confirm-accept]')!;
+  const defaultTitle = title.textContent;
+  let pending: HTMLFormElement | null = null;
+
+  // Delegated, so forms rendered anywhere (popovers, other dialogs) are covered.
+  document.addEventListener('submit', (e) => {
+    const form = e.target as HTMLFormElement;
+    if (!form.matches('form[data-confirm]')) return;
+    e.preventDefault();
+    pending = form;
+    title.textContent = form.dataset.confirmTitle ?? defaultTitle;
+    message.textContent = form.dataset.confirm ?? '';
+    accept.textContent = form.dataset.confirmAction ?? 'OK';
+    dialog.showModal();
+    // Safe default: Enter cancels, the destructive button needs a deliberate click or Tab
+    dialog.querySelector<HTMLElement>('[data-dialog-close]:not(.close)')?.focus();
+  });
+
+  accept.addEventListener('click', () => {
+    dispatchEvent(new Event('app:navigating')); // the page skeleton: submit() fires no submit event
+    pending?.submit(); // submit() skips the submit event, so it doesn't ask again
+    dialog.close();
+  });
+  dialog.addEventListener('close', () => (pending = null));
+</script>
+
+<style>
+  .message {
+    color: var(--text-body);
+  }
+
+  .actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--space-2);
+    margin-top: var(--space-6);
+  }
+</style>

@@ -1,0 +1,281 @@
+---
+import Icon from '@/components/ui/Icon.astro';
+import { alternatePath, localePath, useTranslations, type Locale } from '@/i18n';
+import type { Session } from '@/lib/api';
+
+interface Props {
+  locale: Locale;
+  session: Session;
+  /** App path of the current page, e.g. '/' or '/sales'. */
+  current: string;
+}
+
+const { locale, session, current } = Astro.props;
+const t = useTranslations(locale);
+// Whoever can sell starts at the point of sale (home renders it)
+const canSell = session.modules.find((m) => m.code === 'sales')?.permissions.includes('create') && !!Astro.locals.branch;
+const items = [
+  canSell ? { href: '/', label: t.app.pos, icon: 'scan-barcode' } : { href: '/', label: t.app.home, icon: 'house' },
+  ...session.modules.filter((m) => !HIDDEN_MODULES[session.business_type ?? 'retail'].includes(m.code))
+    .map((m) => ({ href: m.route, label: t.modules[m.code] ?? m.name, icon: m.icon })),
+];
+const branch = Astro.locals.branch;
+const canSwitch = session.branches.length > 1;
+import { HIDDEN_MODULES } from '@/i18n/giro';
+---
+
+<aside id="sidebar" class="sidebar" aria-label={t.app.mainNav}>
+  <div class="top">
+    <a class="brand" href={localePath(locale, '/')}>
+      <span class="mark" aria-hidden="true"></span>
+      {t.app.name}
+    </a>
+    <button type="button" class="close" data-menu-close aria-label={t.app.closeMenu}>
+      <Icon name="x" />
+    </button>
+  </div>
+
+  {
+    branch &&
+      (canSwitch ? (
+        <a class="branch switch" href={localePath(locale, '/branch')} title={t.branch.change}>
+          <Icon name="store" size={18} />
+          <span class="branch-name">
+            <span class="visually-hidden">{t.app.branch}: </span>
+            {branch.name}
+          </span>
+          <Icon name="chevrons-up-down" size={16} />
+          <span class="visually-hidden">({t.branch.change})</span>
+        </a>
+      ) : (
+        <p class="branch">
+          <Icon name="store" size={18} />
+          <span>
+            <span class="visually-hidden">{t.app.branch}: </span>
+            {branch.name}
+          </span>
+        </p>
+      ))
+  }
+
+  <nav>
+    <ul role="list">
+      {
+        items.map((item) => (
+          <li>
+            <a href={localePath(locale, item.href)} aria-current={item.href === current ? 'page' : undefined}>
+              <Icon name={item.icon} />
+              {item.label}
+            </a>
+          </li>
+        ))
+      }
+    </ul>
+  </nav>
+
+  <div class="bottom">
+    <a class="user" href={localePath(locale, '/profile')} aria-current={current === '/profile' ? 'page' : undefined} title={t.profile.title}>
+      <span class="user-name">{session.user.name}</span>
+      <span class="user-email">{session.user.email}</span>
+    </a>
+    <a href={localePath(locale, '/design-system')} aria-current={current === '/design-system' ? 'page' : undefined}>
+      <Icon name="palette" size={18} />
+      {t.app.designSystem}
+    </a>
+    <a href={alternatePath(locale, Astro.url.pathname)} lang={locale === 'es' ? 'en' : 'es'}>
+      <Icon name="languages" size={18} />
+      {t.app.switchLanguage}
+    </a>
+    <form method="post" action="/logout">
+      <input type="hidden" name="locale" value={locale} />
+      <button type="submit">
+        <Icon name="log-out" size={18} />
+        {t.app.logout}
+      </button>
+    </form>
+  </div>
+</aside>
+
+<style>
+  .sidebar {
+    position: sticky;
+    top: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+    height: 100dvh;
+    padding: var(--space-4) var(--space-3);
+    background: var(--bg-surface);
+    border-inline-end: 1px solid var(--border-subtle);
+    overflow-y: auto;
+  }
+
+  .top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding-inline: var(--space-3);
+  }
+
+  .brand {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    color: var(--text-title);
+    font-size: var(--text-lg);
+    font-weight: var(--weight-bold);
+    text-decoration: none;
+  }
+
+  .mark {
+    width: 1.25rem;
+    height: 1.25rem;
+    border: 3px solid var(--color-primary);
+    border-radius: 4px;
+  }
+
+  .branch {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    margin-inline: var(--space-3);
+    padding: var(--space-2) var(--space-3);
+    background: var(--bg-app);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-control);
+    color: var(--text-title);
+    font-weight: var(--weight-medium);
+  }
+
+  .switch {
+    text-decoration: none;
+    cursor: pointer;
+  }
+
+  .switch:hover {
+    border-color: var(--border-input);
+  }
+
+  .switch .branch-name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .switch :global(svg:last-of-type) {
+    color: var(--text-muted);
+  }
+
+  ul {
+    display: grid;
+    gap: 2px;
+    padding: 0;
+    list-style: none;
+  }
+
+  nav a,
+  .bottom a,
+  .bottom button,
+  .close {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    width: 100%;
+    min-height: 2.5rem;
+    padding: var(--space-2) var(--space-3);
+    background: none;
+    border: 0;
+    border-radius: var(--radius-control);
+    color: var(--text-body);
+    text-align: start;
+    text-decoration: none;
+    cursor: pointer;
+  }
+
+  nav a:hover,
+  .bottom a:hover,
+  .bottom button:hover,
+  .close:hover {
+    background: var(--color-primary-tint);
+    color: var(--color-primary);
+  }
+
+  /* After the shared rule above, which would otherwise show it on desktop */
+  .close {
+    display: none;
+  }
+
+  nav a[aria-current='page'],
+  .bottom a[aria-current='page'] {
+    background: var(--bg-app);
+    color: var(--text-title);
+    font-weight: var(--weight-bold);
+  }
+
+  /* The accent's main job: marking where you are */
+  nav a[aria-current='page']::before,
+  .bottom a[aria-current='page']::before {
+    content: '';
+    position: absolute;
+    inset-block: var(--space-2);
+    inset-inline-start: calc(-1 * var(--space-3));
+    width: 3px;
+    border-radius: 0 3px 3px 0;
+    background: var(--color-accent);
+  }
+
+  .bottom {
+    display: grid;
+    gap: 2px;
+    margin-top: auto;
+    padding-top: var(--space-3);
+    border-top: 1px solid var(--border-subtle);
+    font-size: var(--text-sm);
+  }
+
+  /* The name opens "My profile"; stacked, unlike the icon links around it */
+  .bottom a.user {
+    display: grid;
+    gap: 0;
+  }
+
+  .user-name {
+    color: var(--text-title);
+    font-weight: var(--weight-bold);
+  }
+
+  .user-email {
+    color: var(--text-muted);
+  }
+
+  @media (max-width: 60rem) {
+    .sidebar {
+      position: fixed;
+      inset-block: 0;
+      inset-inline-start: 0;
+      z-index: 20;
+      width: min(var(--sidebar-width), 85vw);
+      box-shadow: var(--shadow-overlay);
+      transform: translateX(-100%);
+      visibility: hidden;
+      transition:
+        transform var(--duration-fast) ease,
+        visibility 0s linear var(--duration-fast);
+    }
+
+    .sidebar[data-open] {
+      transform: none;
+      visibility: visible;
+      transition: transform var(--duration-fast) ease;
+    }
+
+    .close {
+      display: flex;
+      width: auto;
+      padding: var(--space-2);
+    }
+  }
+</style>

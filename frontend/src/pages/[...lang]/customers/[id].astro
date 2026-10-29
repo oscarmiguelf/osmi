@@ -1,0 +1,699 @@
+---
+import AppLayout from '@/layouts/AppLayout.astro';
+import NewAppointmentDialog from '@/components/appointments/NewAppointmentDialog.astro';
+import CustomerFields from '@/components/customers/CustomerFields.astro';
+import Badge from '@/components/ui/Badge.astro';
+import Button from '@/components/ui/Button.astro';
+import Card from '@/components/ui/Card.astro';
+import Dialog from '@/components/ui/Dialog.astro';
+import Field from '@/components/ui/Field.astro';
+import Icon from '@/components/ui/Icon.astro';
+import Notice from '@/components/ui/Notice.astro';
+import Timeline from '@/components/ui/Timeline.astro';
+import { fmt, getLocale, localePath, money, useTranslations } from '@/i18n';
+import { listPriceLists } from '@/lib/priceLists';
+import { listPaymentMethods } from '@/lib/cash';
+import { customerAbono, getSale, listSales, pendingCredit, saleErrorText } from '@/lib/sales';
+import AbonoDialog from '@/components/sales/AbonoDialog.astro';
+
+import { customerBenefits } from '@/lib/benefits';
+import { extraErrors, listFields, readExtra, showExtra } from '@/lib/customFields';
+import { appointmentStaff, bookableServices, customerAppointments, newAppointmentValues, saveNewAppointment } from '@/lib/appointments';
+import { ApiError, apiFieldErrors } from '@/lib/api';
+import { setFlash, takeFlash } from '@/lib/session';
+import {
+  customerCredit, customerHistory, formatPhone, getCustomer, restoreCustomer, updateCustomer,
+  type CustomerDetail, type HistoryEntry,
+} from '@/lib/customers';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const cu = t.customers;
+const { session, accessToken, branch } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'customers')?.permissions ?? [];
+if (!perms.includes('read')) return Astro.rewrite('/404');
+const canUpdate = perms.includes('update');
+const canDelete = perms.includes('delete');
+const canCredit = perms.includes('credit');
+// Their purchases and paying what they owe (sales of the working branch)
+const salesPerms = session.modules.find((m) => m.code === 'sales')?.permissions ?? [];
+const canSeeSales = salesPerms.includes('read') && !!branch;
+const canAbono = salesPerms.includes('update') && !!branch;
+const canRecord = session.business_type === 'health' && session.modules.some((m) => m.code === 'clinical' && m.permissions.includes('read'));
+const id = Astro.params.id!;
+const selfPath = localePath(locale, `/customers/${id}`);
+
+let customer: CustomerDetail;
+try {
+  customer = await getCustomer(accessToken, id);
+} catch (e) {
+  if (e instanceof ApiError && (e.status === 404 || e.status === 422)) return Astro.rewrite('/404');
+  throw e;
+}
+
+const toValues = (c: CustomerDetail) => ({
+  full_name: c.full_name,
+  phone: c.phone,
+  additional_phone: c.additional_phone ?? '',
+  email: c.email ?? '',
+  company: c.company ?? '',
+  address: c.address ?? '',
+  credit_limit: String(c.credit_limit),
+});
+
+// --- Edit / restore (form POST, then back here with a notice) ---
+let values = toValues(customer);
+const [fields, priceLists] = await Promise.all([listFields(accessToken), listPriceLists(accessToken)]);
+let priceListId = customer.price_list_id ?? '';
+let extra: Record<string, unknown> = customer.extra ?? {};
+let extraErrs: Record<string, string> = {};
+let fieldErrors: Record<string, string> = {};
+let formError: string | undefined;
+let creditError: string | undefined;
+let abonoError: string | undefined;
+let abonoValues = { payment_method_id: '', amount: '', amount_tendered: '', reference: '' };
+// "Schedule appointment" opens its dialog here; the customer is this one
+const apPerms = session.modules.find((m) => m.code === 'appointments')?.permissions ?? [];
+const canSchedule = apPerms.includes('create') && !!branch && customer.deleted_at === null;
+const apFields = canSchedule ? await listFields(accessToken, 'appointment') : [];
+let apValues = newAppointmentValues(session.user.timezone, { id: customer.id, title: customer.full_name });
+let apError: string | undefined;
+let apExtraErrors: Record<string, string> | undefined;
+
+if (Astro.request.method === 'POST') {
+  const data = await Astro.request.formData();
+  if (data.get('intent') === 'appointment') {
+    if (canSchedule) {
+      const saved = await saveNewAppointment(accessToken, branch.id, session.user.timezone, data, t.appointments.errors, t.ui.failed,
+        apFields, t.customers.extraErrors);
+      if (saved.created) {
+        setFlash(Astro.cookies, { pay_sale: saved.created.sale_id ?? '', pending: saved.created.sale_pending ?? '' });
+        return Astro.redirect(`${selfPath}?scheduled=1`, 303);
+      }
+      ({ values: apValues, error: apError, extraErrors: apExtraErrors } = saved);
+    } else apError = t.calendar.forbidden;
+  } else if (data.get('intent') === 'restore') {
+    if (canDelete) {
+      await restoreCustomer(accessToken, id);
+      return Astro.redirect(`${selfPath}?restored=1`, 303);
+    }
+    formError = t.calendar.forbidden;
+  } else if (data.get('intent') === 'abono' && canAbono) {
+    abonoValues = Object.fromEntries(Object.keys(abonoValues).map((k) => [k, String(data.get(k) ?? '').trim()])) as typeof abonoValues;
+    try {
+      const r = await customerAbono(accessToken, branch.id, { customer_id: id, payment_method_id: abonoValues.payment_method_id,
+        amount: abonoValues.amount || '0', amount_tendered: abonoValues.amount_tendered || null, reference: abonoValues.reference || null });
+      setFlash(Astro.cookies, { abono: abonoValues.amount, change: String(r.change ?? 0), folios: r.applied.map((a) => a.folio).join(', ') });
+      return Astro.redirect(selfPath, 303);
+    } catch (e) {
+      if (!(e instanceof ApiError)) throw e;
+      const detail = e.body?.detail;
+      abonoError = detail?.outstanding !== undefined ? fmt(t.sales.detail.tooMuch, { amount: money(locale, Number(detail.outstanding)) }) : saleErrorText(e.status, detail, t).text;
+    }
+  } else if (data.get('intent') === 'credit') {
+    // Quick "give this customer credit" from the credit card: only the limit changes
+    values.credit_limit = String(data.get('credit_limit') ?? '').trim();
+    if (!(Number(values.credit_limit) > 0)) creditError = cu.creditPositive;
+    else if (!canUpdate || !canCredit) creditError = cu.creditNoPermission;
+    else {
+      try {
+        await updateCustomer(accessToken, id, { credit_limit: values.credit_limit });
+        return Astro.redirect(`${selfPath}?saved=1`, 303);
+      } catch (e) {
+        if (!(e instanceof ApiError)) throw e;
+        creditError = e.status === 403 ? cu.creditNoPermission : e.status === 422 ? cu.creditPositive : cu.failed;
+      }
+    }
+  } else {
+    values = Object.fromEntries(Object.keys(values).map((k) => [k, String(data.get(k) ?? '').trim()])) as typeof values;
+    extra = readExtra(data, fields);
+    priceListId = String(data.get('price_list_id') ?? '');
+    if (!values.full_name) fieldErrors.full_name = cu.errors.full_name;
+    if (!values.phone) fieldErrors.phone = cu.errors.phone;
+    if (!canUpdate) formError = t.calendar.forbidden;
+    else if (!Object.keys(fieldErrors).length) {
+      try {
+        const saved = await updateCustomer(accessToken, id, {
+          full_name: values.full_name,
+          phone: values.phone,
+          additional_phone: values.additional_phone || null,
+          email: values.email || null,
+          company: values.company || null,
+          address: values.address || null,
+          // Without customers.credit the limit isn't sent, so it stays as it was
+          ...(canCredit && { credit_limit: values.credit_limit || '0' }),
+          extra: extra as Record<string, string | boolean>,
+          ...(priceLists.length > 0 && { price_list_id: priceListId || null }),
+        });
+        const notice = new URLSearchParams({ saved: '1' });
+        for (const w of saved.warnings) {
+          if (w.code === 'credit_limit_below_balance') notice.set('below', String(w.balance));
+          if (w.code === 'duplicate_phone') notice.set('dup', String(w.count));
+        }
+        return Astro.redirect(`${selfPath}?${notice}`, 303);
+      } catch (e) {
+        if (!(e instanceof ApiError)) throw e;
+        fieldErrors = e.status === 422 ? apiFieldErrors(e.body, cu.errors) : {};
+        extraErrs = e.body?.detail?.field === 'extra' ? extraErrors(e.body.detail, cu.extraErrors) : {};
+        if (e.status === 403) fieldErrors.credit_limit = cu.creditNoPermission;
+        else if (!Object.keys(fieldErrors).length && !Object.keys(extraErrs).length) formError = cu.failed;
+      }
+    }
+    if (Object.keys(fieldErrors).length || Object.keys(extraErrs).length) formError ??= cu.formError;
+  }
+  Astro.response.status = 422;
+}
+
+const deleted = customer.deleted_at !== null;
+const params = Astro.url.searchParams;
+const historyPage = Math.max(1, Number.parseInt(params.get('history') ?? '1', 10) || 1);
+// Appointments follow-up, for whoever can see appointments
+const benefits = deleted ? [] : await customerBenefits(accessToken, id);
+const [credit, history, appointments, staff] = await Promise.all([
+  deleted ? null : customerCredit(accessToken, id),
+  customerHistory(accessToken, id, historyPage),
+  apPerms.includes('read') ? customerAppointments(accessToken, id) : Promise.resolve(undefined),
+  canSchedule ? appointmentStaff(accessToken, branch.id) : Promise.resolve([]),
+]);
+const ap = t.appointments;
+const [purchases, pending, payMethods] = canSeeSales && !deleted ? await Promise.all([
+  listSales(accessToken, branch.id, { customer_id: id, page_size: 10 }),
+  pendingCredit(accessToken, branch.id, id),
+  canAbono ? listPaymentMethods(accessToken).then((ms) => ms.filter((m) => !m.is_credit)) : Promise.resolve([]),
+]) : [null, [], []];
+const owedHere = pending.reduce((sum, p) => sum + Number(p.credit_outstanding), 0);
+const owedBySale = new Map(pending.map((p) => [p.sale_id, Number(p.credit_outstanding)]));
+const flash = takeFlash(Astro.cookies);
+const saleTone = { PAID: 'success', PENDING: 'warning', RETURNED: 'neutral' } as const;
+// Just booked (or a payment failed): the abono dialog for its sale, here
+const paySale = flash.pay_sale && branch ? await getSale(accessToken, branch.id, flash.pay_sale).catch(() => null) : null;
+const saleMethods = paySale && Number(paySale.credit_outstanding) > 0 ? (await listPaymentMethods(accessToken)).filter((m) => !m.is_credit) : [];
+
+const tz = session.user.timezone;
+const when = new Intl.DateTimeFormat(t.intl, { dateStyle: 'medium', timeStyle: 'short', timeZone: tz });
+const day = new Intl.DateTimeFormat(t.intl, { dateStyle: 'long', timeZone: tz });
+
+function show(field: string, value: unknown) {
+  if (value === null || value === undefined || value === '') return '—';
+  if (field === 'credit_limit') return money(locale, Number(value));
+  if (field.endsWith('phone')) return formatPhone(String(value));
+  return String(value);
+}
+
+/** Fields people care about, with old -> new, for one history entry */
+const changes = (h: HistoryEntry) =>
+  h.action === 'UPDATE'
+    ? (h.changed_fields ?? [])
+        .filter((f) => f in cu.fields)
+        .map((f) => ({ label: cu.fields[f], from: show(f, h.old_data?.[f]), to: show(f, h.new_data?.[f]) }))
+    : [];
+
+const timeline = history.items.map((h) => ({
+  title: cu.actions[h.action],
+  meta: `${h.changed_by_email ?? cu.unknownUser}, ${when.format(new Date(h.changed_at))}`,
+  changes: changes(h),
+}));
+
+const used = credit && credit.credit_limit > 0 ? Math.min(100, (credit.balance / credit.credit_limit) * 100) : 0;
+const below = params.get('below');
+const dup = Number(params.get('dup') ?? 0);
+const contact = [
+  { label: cu.phone, icon: 'phone', value: customer.phone, href: `tel:${customer.phone}`, text: formatPhone(customer.phone) },
+  {
+    label: cu.additionalPhone,
+    icon: 'phone',
+    value: customer.additional_phone,
+    href: `tel:${customer.additional_phone}`,
+    text: customer.additional_phone && formatPhone(customer.additional_phone),
+  },
+  { label: cu.email, icon: 'mail', value: customer.email, href: `mailto:${customer.email}`, text: customer.email },
+  { label: cu.address, icon: 'map-pin', value: customer.address, text: customer.address },
+];
+---
+
+<AppLayout title={customer.full_name} current="/customers">
+  <header class="page-header">
+    <Button variant="tertiary" icon="arrow-left" href={localePath(locale, '/customers')} class="back">{cu.back}</Button>
+    <div class="title-row">
+      <div>
+        <h1>{customer.full_name}</h1>
+        {customer.company && <p class="company">{customer.company}</p>}
+      </div>
+      {deleted && <Badge tone="error">{cu.deletedBadge}</Badge>}
+      {canRecord && !deleted && <Button icon="stethoscope" href={localePath(locale, `/clinical/patients/${id}`)} class="edit">{t.clinical.title}</Button>}
+      {canUpdate && !deleted && (
+        <Button variant="secondary" icon="pencil" data-dialog="edit-customer" class={canRecord ? undefined : 'edit'}>{cu.edit}</Button>
+      )}
+    </div>
+  </header>
+
+  <div class="notices" data-flash={params.size || flash.abono || flash.paid ? '' : undefined}>
+    {params.get('saved') && (
+      <Notice tone="success">{cu.saved}</Notice>
+    )}
+    {params.get('scheduled') && (
+      <Notice tone="success">{t.appointments.created}</Notice>
+    )}
+    {flash.paid && <Notice tone="success">{flash.paid}</Notice>}
+    {flash.pending && <Notice tone="warning">{fmt(t.appointments.salePending, { reason: t.appointments.salePendingReasons[flash.pending] ?? '' })}</Notice>}
+    {flash.abono && (
+      <Notice tone="success">{fmt(cu.abonoDone, { amount: money(locale, Number(flash.abono)), folios: flash.folios })}{Number(flash.change) > 0 && ` ${fmt(t.sales.credit.change, { change: money(locale, Number(flash.change)) })}`}</Notice>
+    )}
+    {params.get('restored') && (
+      <Notice tone="success">{cu.restored}</Notice>
+    )}
+    {below && (
+      <Notice tone="warning">{fmt(cu.belowBalance, { amount: money(locale, Number(below)) })}</Notice>
+    )}
+    {dup > 0 && (
+      <Notice tone="warning">{dup === 1 ? cu.duplicatePhone : fmt(cu.duplicatePhoneMany, { n: dup })}</Notice>
+    )}
+    {deleted && (
+      <Notice tone="error">
+        {fmt(cu.deletedBanner, { date: day.format(new Date(customer.deleted_at!)) })}
+        {canDelete && (
+          <form method="post" slot="action" data-restore>
+            <input type="hidden" name="intent" value="restore" />
+            <Button type="submit" variant="secondary" icon="rotate-ccw">{cu.restore}</Button>
+          </form>
+        )}
+      </Notice>
+    )}
+  </div>
+
+  <div class="grid">
+    <Card title={cu.contact}>
+      <dl class="rows">
+        {
+          contact.map((row) => (
+            <div>
+              <dt>
+                <Icon name={row.icon} size={16} />
+                {row.label}
+              </dt>
+              <dd class:list={{ num: row.icon === 'phone' }}>
+                {row.value ? row.href ? <a href={row.href}>{row.text}</a> : row.text : <span class="muted">—</span>}
+              </dd>
+            </div>
+          ))
+        }
+        {customer.price_list && <div><dt>{t.priceLists.customerList}</dt><dd class="ui-strong">{customer.price_list}</dd></div>}
+        </dl>
+    </Card>
+
+    {benefits.length > 0 && (
+      <Card title={t.benefits.customerTitle}>
+        <ul class="benefits" role="list">
+          {benefits.map((bf) => (
+            <li class:list={{ inactive: !bf.active }}>
+              <strong>{bf.product}</strong>
+              <span class="ui-muted ui-small">
+                {bf.kind === 'package' ? fmt(t.benefits.left, { n: bf.sessions_left ?? 0, total: bf.sessions_total ?? 0, service: bf.service ?? '' })
+                  : bf.price_list ? fmt(t.benefits.withList, { list: bf.price_list }) : t.benefits.kinds.membership}
+                {bf.ends_at && ` · ${fmt(bf.active ? t.benefits.until : t.benefits.ended, { date: day.format(new Date(bf.ends_at)) })}`}
+              </span>
+            </li>
+          ))}
+        </ul>
+      </Card>
+    )}
+    {fields.length > 0 && (
+      <Card title={cu.extraTitle}>
+        <dl class="ui-rows">
+          {fields.map((f) => <div><dt>{f.label}</dt><dd class="extra-value">{showExtra(f, customer.extra?.[f.id], t.intl, t.ui.yes, 'No')}</dd></div>)}
+        </dl>
+      </Card>
+    )}
+
+    {
+      credit && (
+        <Card title={cu.credit}>
+          {credit.credit_limit === 0 && credit.balance === 0 ? (
+            <>
+              <p class="muted">{cu.noCreditText}</p>
+              {canUpdate && canCredit && !deleted && (
+                <Button variant="secondary" icon="hand-coins" data-dialog="set-credit" class="give-credit">{cu.giveCredit}</Button>
+              )}
+            </>
+          ) : (
+            <>
+              <dl class="figures">
+                <div>
+                  <dt>{cu.creditLimitLabel}</dt>
+                  <dd class="num">{money(locale, credit.credit_limit)}</dd>
+                </div>
+                <div>
+                  <dt>{cu.balance}</dt>
+                  <dd class="num">{money(locale, credit.balance)}</dd>
+                </div>
+                <div>
+                  <dt>{cu.available}</dt>
+                  <dd class:list={['num', { negative: credit.available_credit < 0 }]}>
+                    {money(locale, credit.available_credit)}
+                  </dd>
+                </div>
+              </dl>
+              {/* Share of the limit already owed; the numbers above carry the meaning, the bar is a glance */}
+              <div class:list={['usage', { over: credit.available_credit < 0 }]} aria-hidden="true">
+                <span style={`width: ${used}%`} />
+              </div>
+              {credit.available_credit < 0 && <p class="over-text">{cu.overLimit}</p>}
+            </>
+          )}
+          {owedHere > 0 && (
+            <div class="owed-here">
+              <span class="ui-small">{fmt(cu.owedHere, { amount: money(locale, owedHere) })}</span>
+              {canAbono && <Button variant="secondary" icon="hand-coins" data-dialog="customer-abono">{cu.collect}</Button>}
+            </div>
+          )}
+        </Card>
+      )
+    }
+
+    {appointments && (
+      <Card title={ap.customerCard.title}>
+        {appointments.items.length === 0 ? <p class="ui-muted ui-small">{ap.customerCard.empty}</p> : (
+          <dl class="ui-rows">
+            {appointments.items.map((a) => (
+              <div>
+                <dt><a href={localePath(locale, `/appointments/${a.id}`)}>{a.title}</a>
+                  <span class="ui-line2">{when.format(new Date(a.starts_at))}{a.assigned_to && ` · ${a.assigned_to}`}{Number(a.note_count) > 0 && ` · ${fmt(ap.customerCard.notes, { n: Number(a.note_count) })}`}</span></dt>
+                <dd><Badge tone={({ SCHEDULED: 'accent', CONFIRMED: 'success', COMPLETED: 'neutral', NO_SHOW: 'warning', CANCELLED: 'error' } as const)[a.status]}>{ap.statuses[a.status]}</Badge></dd>
+              </div>
+            ))}
+          </dl>
+        )}
+        {canSchedule && <Button variant="secondary" icon="calendar-plus" data-dialog="new-appointment">{ap.customerCard.schedule}</Button>}
+      </Card>
+    )}
+
+    {purchases && (
+      <Card title={cu.purchases}>
+        {purchases.items.length === 0 ? <p class="ui-muted ui-small">{cu.purchasesEmpty}</p> : (
+          <dl class="ui-rows">
+            {purchases.items.map((x) => (
+              <div>
+                <dt><a class="num" href={localePath(locale, `/sales/${x.id}`)}>{x.folio}</a>
+                  <span class="ui-line2">{when.format(new Date(x.sold_at))}{owedBySale.get(x.id) && ` · ${fmt(cu.owesOnSale, { amount: money(locale, owedBySale.get(x.id)!) })}`}</span></dt>
+                <dd><span class="num">{money(locale, Number(x.total))}</span> <Badge tone={saleTone[x.status]}>{t.sales.status[x.status]}</Badge></dd>
+              </div>
+            ))}
+          </dl>
+        )}
+        {(purchases.has_more || purchases.items.length > 0) && (
+          <Button variant="tertiary" href={`${localePath(locale, '/sales')}?customer_id=${id}`}>{cu.purchasesAll}</Button>
+        )}
+      </Card>
+    )}
+
+    <Card title={cu.history} class="history">
+      <Timeline items={timeline} />
+      {
+        (historyPage > 1 || history.has_more) && (
+          <div class="history-pager">
+            {historyPage > 1 && <Button variant="tertiary" href={`${selfPath}?history=${historyPage - 1}`}>{cu.newerHistory}</Button>}
+            {history.has_more && <Button variant="tertiary" href={`${selfPath}?history=${historyPage + 1}`}>{cu.olderHistory}</Button>}
+          </div>
+        )
+      }
+    </Card>
+  </div>
+
+  {
+    canUpdate && !deleted && (
+      <Dialog id="set-credit" title={cu.giveCredit} closeLabel={cu.close} open={!!creditError}>
+        <form method="post" class="form" novalidate>
+          <input type="hidden" name="intent" value="credit" />
+          <Field label={cu.creditLimit} name="credit_limit" id="credit-limit-quick" type="number" inputmode="decimal" min="0.01" step="0.01"
+            value={creditError ? values.credit_limit : ''} hint={creditError ? undefined : cu.creditHint} error={creditError} autofocus />
+          <div class="actions">
+            <Button variant="tertiary" data-dialog-close>{cu.cancel}</Button>
+            <Button type="submit">{cu.saveCredit}</Button>
+          </div>
+        </form>
+      </Dialog>
+      <Dialog id="edit-customer" title={cu.editTitle} closeLabel={cu.close} open={!!formError}>
+        <form method="post" class="form" novalidate>
+          {formError && <p class="alert" role="alert">{formError}</p>}
+          <CustomerFields locale={locale} values={values} errors={fieldErrors} canCredit={canCredit} fields={fields} extra={extra} extraErrors={extraErrs}
+            priceLists={priceLists} priceListId={priceListId} />
+          <div class="actions">
+            <Button variant="tertiary" data-dialog-close>{cu.cancel}</Button>
+            <Button type="submit">{cu.saveChanges}</Button>
+          </div>
+        </form>
+      </Dialog>
+    )
+  }
+  {canSchedule && <NewAppointmentDialog locale={locale} values={apValues} error={apError} staff={staff} services={await bookableServices(accessToken)}
+    fields={apFields} extraErrors={apExtraErrors} customerFixed />}
+  {paySale && saleMethods.length > 0 && (
+    <AbonoDialog locale={locale} saleId={paySale.id} balance={Number(paySale.credit_outstanding)} methods={saleMethods} back={selfPath}
+      open error={flash.pay_error} />
+  )}
+  {canAbono && owedHere > 0 && (
+    <Dialog id="customer-abono" title={cu.collect} closeLabel={cu.close} open={!!abonoError}>
+      <form method="post" class="ui-form" novalidate>
+        <input type="hidden" name="intent" value="abono" />
+        {abonoError && <p class="ui-alert ui-full" role="alert">{abonoError}</p>}
+        <p class="ui-full"><strong>{customer.full_name}</strong> <span class="ui-muted">{money(locale, owedHere)}</span></p>
+        <p class="ui-full ui-muted ui-small">{t.sales.credit.spread}</p>
+        <Field label={t.sales.cart.method} name="payment_method_id" as="select" id="abono-method">
+          {payMethods.map((m) => <option value={m.id} selected={m.id === abonoValues.payment_method_id}>{t.cash.methodNames[m.description] ?? m.description}</option>)}
+        </Field>
+        <Field label={t.sales.cart.amount} name="amount" id="abono-amount" type="number" step="0.01" min="0.01" inputmode="decimal"
+          value={abonoValues.amount || owedHere.toFixed(2)} required />
+        <Field label={t.sales.cart.tendered} name="amount_tendered" id="abono-tendered" type="number" step="0.01" min="0" inputmode="decimal"
+          value={abonoValues.amount_tendered} hint={t.sales.detail.tenderedHint} />
+        <Field label={t.sales.cart.reference} name="reference" id="abono-reference" maxlength={100} value={abonoValues.reference} />
+        <div class="ui-form-actions">
+          <Button variant="tertiary" data-dialog-close>{cu.cancel}</Button>
+          <Button type="submit">{t.sales.detail.abonoSave}</Button>
+        </div>
+      </form>
+    </Dialog>
+  )}
+</AppLayout>
+
+<script>
+  // Notices show once: reloading or sharing the URL shouldn't repeat them
+  if (document.querySelector('[data-flash]')) {
+    const url = new URL(location.href);
+    ['saved', 'restored', 'below', 'dup'].forEach((key) => url.searchParams.delete(key));
+    history.replaceState(null, '', url);
+  }
+</script>
+
+<style>
+  .owed-here {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+    margin-top: var(--space-3);
+    padding-top: var(--space-3);
+    border-top: 1px solid var(--border-subtle);
+  }
+  .page-header {
+    display: grid;
+    gap: var(--space-2);
+    margin-bottom: var(--space-6);
+  }
+
+  .page-header > :global(.back) {
+    justify-self: start;
+    margin-inline-start: calc(-1 * var(--space-2));
+  }
+
+  .title-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-3);
+  }
+
+  :global(.give-credit) {
+    margin-top: var(--space-3);
+  }
+  .title-row > :global(.edit) {
+    margin-inline-start: auto;
+  }
+
+  .company {
+    margin-top: var(--space-1);
+    color: var(--text-muted);
+  }
+
+  /* --- Notices --- */
+  .notices {
+    display: grid;
+    gap: var(--space-2);
+    margin-bottom: var(--space-4);
+  }
+
+  .notices:empty {
+    display: none;
+  }
+
+  /* --- Cards --- */
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 22rem), 1fr));
+    align-items: start;
+    gap: var(--space-4);
+  }
+
+  .grid > :global(.history) {
+    grid-column: 1 / -1;
+  }
+
+  .rows {
+    display: grid;
+  }
+
+  .rows > div {
+    display: flex;
+    justify-content: space-between;
+    gap: var(--space-4);
+    padding-block: var(--space-2);
+    border-top: 1px solid var(--border-subtle);
+  }
+
+  .rows > div:first-child {
+    border-top: 0;
+  }
+
+  .rows dt {
+    display: flex;
+    flex-shrink: 0;
+    align-items: center;
+    gap: var(--space-2);
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+  }
+
+  .rows dd {
+    min-width: 0;
+    color: var(--text-title);
+    text-align: end;
+    overflow-wrap: anywhere;
+  }
+
+  .rows a {
+    color: inherit;
+    text-decoration: none;
+  }
+
+  .rows a:hover {
+    color: var(--color-primary);
+    text-decoration: underline;
+  }
+
+  .muted {
+    color: var(--text-muted);
+  }
+
+  .figures {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: var(--space-4);
+  }
+
+  .figures dt {
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+  }
+
+  .figures dd {
+    color: var(--text-title);
+    font-size: var(--text-lg);
+    font-weight: var(--weight-bold);
+  }
+
+  .negative {
+    color: var(--status-error-text) !important;
+  }
+
+  .usage {
+    height: 0.5rem;
+    background: var(--bg-app);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-pill);
+    overflow: hidden;
+  }
+
+  .usage span {
+    display: block;
+    height: 100%;
+    background: var(--color-primary);
+    border-radius: inherit;
+  }
+
+  .usage.over span {
+    background: var(--status-error);
+  }
+
+  .over-text {
+    color: var(--status-error-text);
+    font-size: var(--text-sm);
+  }
+
+  .history-pager {
+    display: flex;
+    justify-content: space-between;
+  }
+
+  /* --- Edit form (same layout as "New customer") --- */
+  .form {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--space-4);
+  }
+
+  .alert,
+  .actions,
+  .form > :global(.field:has(textarea)),
+  .form > :global(.field:first-of-type) {
+    grid-column: 1 / -1;
+  }
+
+  .alert {
+    padding: var(--space-3);
+    background: color-mix(in srgb, var(--status-error) 8%, var(--bg-app));
+    border: 1px solid var(--status-error);
+    border-radius: var(--radius-control);
+    color: var(--text-title);
+    font-size: var(--text-sm);
+  }
+
+  .actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--space-2);
+  }
+
+  @media (max-width: 30rem) {
+    .form,
+    .figures {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+  .extra-value {
+    white-space: pre-line;
+    text-align: end;
+  }
+  .benefits {
+    display: grid;
+    gap: var(--space-2);
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .benefits li {
+    display: grid;
+  }
+  .benefits .inactive {
+    opacity: 0.6;
+  }
+</style>

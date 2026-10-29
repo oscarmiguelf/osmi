@@ -1,0 +1,171 @@
+---
+// Reports: today at a glance (vs yesterday and the same weekday last week) and the catalog by section.
+import AppLayout from '@/layouts/AppLayout.astro';
+import Card from '@/components/ui/Card.astro';
+import Icon from '@/components/ui/Icon.astro';
+import Notice from '@/components/ui/Notice.astro';
+import { fmt, getLocale, localePath, money, useTranslations } from '@/i18n';
+import { reportCatalog, reportDashboard } from '@/lib/reports';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const r = t.reports;
+const { session, accessToken, branch } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'reports')?.permissions ?? [];
+if (!perms.includes('read')) return Astro.rewrite('/404');
+
+const [catalog, dash] = await Promise.all([reportCatalog(accessToken), branch ? reportDashboard(accessToken, branch.id, '') : Promise.resolve(undefined)]);
+const SECTIONS = ['sales', 'cash', 'credit', 'inventory', 'purchases', 'admin'] as const;
+const icons = { sales: 'shopping-cart', cash: 'wallet', credit: 'hand-coins', inventory: 'boxes', purchases: 'truck', admin: 'shield' };
+const names = r.names as Record<string, { title: string; text: string }>;
+const pct = (now: number, before: number) => (before ? Math.round(((now - before) / before) * 100) : null);
+const compare = (key: 'tickets' | 'net_sales' | 'avg_ticket') => {
+  if (!dash) return [];
+  const now = Number(dash.day[key]);
+  return [[r.vsYesterday, pct(now, Number(dash.previous_day[key]))], [r.vsLastWeek, pct(now, Number(dash.same_weekday_last_week[key]))]] as const;
+};
+const show = (key: 'tickets' | 'net_sales' | 'avg_ticket', v: unknown) => (key === 'tickets' ? String(v) : money(locale, Number(v)));
+---
+
+<AppLayout title={r.title} current="/reports">
+  <header class="ui-header">
+    <div>
+      <h1>{r.title}</h1>
+      {branch && <p class="ui-sub">{branch.name} · {r.today}</p>}
+    </div>
+  </header>
+
+  {!branch && <Notice tone="warning">{t.ui.noBranch}</Notice>}
+  {dash && (
+    <section class="kpis" aria-label={r.today}>
+      {(['net_sales', 'tickets', 'avg_ticket'] as const).map((key) => (
+        <div class="kpi">
+          <span class="kpi-label">{r.columns[key]}</span>
+          <strong class="kpi-value num">{show(key, dash.day[key])}</strong>
+          <ul class="deltas" role="list">
+            {compare(key).map(([label, d]) => (
+              <li class:list={[d === null ? '' : d >= 0 ? 'up' : 'down']}>{d === null ? '—' : `${d >= 0 ? '+' : ''}${d} %`} <span class="ui-muted">{label}</span></li>
+            ))}
+          </ul>
+        </div>
+      ))}
+      <div class="kpi">
+        <span class="kpi-label">{r.lowStock}</span>
+        <strong class="kpi-value num">{dash.low_stock}</strong>
+        <a href={localePath(locale, '/reports/inventory/low-stock')} class="ui-small">{r.see}</a>
+      </div>
+      <div class="kpi">
+        <span class="kpi-label">{r.creditPending}</span>
+        <strong class="kpi-value num">{money(locale, Number(dash.credit_pending))}</strong>
+        <a href={localePath(locale, '/reports/credit/receivables')} class="ui-small">{r.see}</a>
+      </div>
+    </section>
+  )}
+  {dash && (
+    <div class="ui-grid today">
+      <Card title={r.topToday}>
+        {dash.top_products.length === 0 ? <p class="ui-muted ui-small">{r.noSalesToday}</p> : (
+          <dl class="ui-rows">{dash.top_products.map((x: any) => <div><dt>{x.product}<span class="ui-line2">{Number(x.units) === 1 ? r.unitOne : fmt(r.unitsN, { n: Number(x.units) })}</span></dt><dd class="num">{money(locale, Number(x.revenue))}</dd></div>)}</dl>
+        )}
+      </Card>
+      <Card title={r.cashNow}>
+        {dash.cash.length === 0 ? <p class="ui-muted ui-small">—</p> : (
+          <dl class="ui-rows">{dash.cash.map((x: any) => <div><dt>{t.cash.methodNames[x.method] ?? x.method}</dt><dd class="num">{money(locale, Number(x.balance))}</dd></div>)}</dl>
+        )}
+      </Card>
+    </div>
+  )}
+
+  <div class="sections">
+    {SECTIONS.map((section) => {
+      const list = catalog.filter((x) => x.name.startsWith(`${section}/`));
+      return list.length > 0 && (
+        <section class="section">
+          <h2><Icon name={icons[section]} size={20} />{r.sections[section]}</h2>
+          <ul role="list">
+            {list.map((x) => (
+              <li><a href={localePath(locale, `/reports/${x.name}`)}><strong>{names[x.name]?.title ?? x.name}</strong><span>{names[x.name]?.text}</span></a></li>
+            ))}
+          </ul>
+        </section>
+      );
+    })}
+  </div>
+</AppLayout>
+
+<style>
+  .kpis {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+    gap: var(--space-3);
+    margin-bottom: var(--space-4);
+  }
+  .kpi {
+    display: grid;
+    gap: var(--space-1);
+    align-content: start;
+    padding: var(--space-4);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-container);
+  }
+  .kpi-label {
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+  }
+  .kpi-value {
+    color: var(--text-title);
+    font-size: var(--text-2xl, 1.75rem);
+  }
+  .deltas {
+    margin: 0;
+    padding: 0;
+    font-size: var(--text-sm);
+    list-style: none;
+  }
+  .up {
+    color: var(--status-success-text, #15803d);
+  }
+  .down {
+    color: var(--status-error-text);
+  }
+  .today {
+    margin-bottom: var(--space-6);
+  }
+  .sections {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(20rem, 1fr));
+    gap: var(--space-5);
+  }
+  .section h2 {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    margin-bottom: var(--space-2);
+    font-size: var(--text-lg);
+  }
+  .section ul {
+    display: grid;
+    gap: var(--space-1);
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .section a {
+    display: grid;
+    padding: var(--space-2) var(--space-3);
+    border-radius: var(--radius-control);
+    color: var(--text-body);
+    text-decoration: none;
+  }
+  .section a:hover {
+    background: var(--color-primary-tint);
+  }
+  .section a strong {
+    color: var(--text-title);
+  }
+  .section a span {
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+  }
+</style>

@@ -1,0 +1,164 @@
+---
+// WhatsApp reminders of a day's appointments (tomorrow by default): the app opens the customer's chat with the message
+// ready; the person sends it. Sending marks the appointment as reminded.
+import AppLayout from '@/layouts/AppLayout.astro';
+import Badge from '@/components/ui/Badge.astro';
+import Button from '@/components/ui/Button.astro';
+import Field from '@/components/ui/Field.astro';
+import Notice from '@/components/ui/Notice.astro';
+import { fmt, getLocale, localePath, useTranslations } from '@/i18n';
+import { ApiError } from '@/lib/api';
+import { appointmentAction, getAppointment, listAppointments, markReminded, reminderLink, reminderText } from '@/lib/appointments';
+import { startOfDay } from '@/lib/time';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const ap = t.appointments;
+const r = t.reminders;
+const { session, accessToken, branch } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'appointments')?.permissions ?? [];
+if (!perms.includes('read') || !branch) return Astro.rewrite('/404');
+const canUpdate = perms.includes('update');
+const tz = session.user.timezone;
+const selfPath = localePath(locale, '/appointments/reminders');
+const today = Temporal.Now.plainDateISO(tz);
+let day = today.add({ days: 1 });
+try { if (Astro.url.searchParams.get('day')) day = Temporal.PlainDate.from(Astro.url.searchParams.get('day')!); } catch { /* keep tomorrow */ }
+
+const fullDate = new Intl.DateTimeFormat(t.intl, { dateStyle: 'full', timeZone: tz });
+const hour = new Intl.DateTimeFormat(t.intl, { timeStyle: 'short', timeZone: tz });
+const textFor = (a: { customer: string; starts_at: string; services_text?: string | null }) => reminderText(session.reminder_template, r.defaultText, {
+  cliente: a.customer.split(' ')[0], fecha: fullDate.format(new Date(a.starts_at)), hora: hour.format(new Date(a.starts_at)),
+  sucursal: branch.name, servicios: a.services_text ? ` (${a.services_text})` : '',
+});
+
+let error: string | undefined;
+if (Astro.request.method === 'POST' && canUpdate) {
+  const data = await Astro.request.formData();
+  const id = String(data.get('id'));
+  try {
+    if (data.get('intent') === 'remind') {
+      // Opened in a new tab: mark it, then go to WhatsApp with the message
+      const a = await getAppointment(accessToken, branch.id, id);
+      if (!a.customer_phone) throw new ApiError(422, null);
+      await markReminded(accessToken, branch.id, id);
+      return Astro.redirect(reminderLink(a.customer_phone, textFor(a)), 303);
+    }
+    await appointmentAction(accessToken, branch.id, id, 'confirm');
+    return Astro.redirect(`${selfPath}?day=${day}&confirmed=1`, 303);
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    error = t.ui.failed;
+  }
+}
+
+const list = (await listAppointments(accessToken, branch.id, { from: startOfDay(day, tz), to: startOfDay(day.add({ days: 1 }), tz), hide_cancelled: true }))
+  .filter((a) => a.status === 'SCHEDULED' || a.status === 'CONFIRMED');
+const pending = list.filter((a) => !a.reminded_at && a.status === 'SCHEDULED').length;
+---
+
+<AppLayout title={r.title} current="/appointments">
+  <a class="ui-back" href={localePath(locale, '/appointments')}>← {ap.title}</a>
+  <header class="ui-header">
+    <div><h1>{r.title}</h1><p class="ui-sub">{fullDate.format(new Date(`${day}T12:00:00Z`))}</p></div>
+  </header>
+  <div class="ui-notices">
+    {error && <Notice tone="error">{error}</Notice>}
+    {Astro.url.searchParams.has('confirmed') && <Notice>{r.confirmedOk}</Notice>}
+  </div>
+
+  <form method="get" class="day">
+    <Field label={r.day} name="day" type="date" value={day.toString()} />
+    <Button type="submit" variant="secondary">{t.ui.search}</Button>
+    <Button variant="tertiary" href={`${selfPath}?day=${today.add({ days: 1 })}`}>{r.tomorrow}</Button>
+  </form>
+
+  {list.length === 0 ? <p class="ui-muted">{r.empty}</p> : (
+    <>
+      <p class="ui-muted ui-small">{fmt(r.summary, { n: list.length, pending })}</p>
+      <ul class="list" role="list">
+        {list.map((a) => (
+          <li>
+            <span class="when num">{hour.format(new Date(a.starts_at))}</span>
+            <span class="who">
+              <a class="ui-strong" href={localePath(locale, `/appointments/${a.id}`)}>{a.customer}</a>
+              <span class="ui-muted ui-small">{a.title}{a.services_text && ` · ${a.services_text}`}{a.assigned_to && ` · ${a.assigned_to}`}</span>
+            </span>
+            <span class="badges">
+              {a.status === 'CONFIRMED' ? <Badge tone="success">{ap.statuses.CONFIRMED}</Badge> : <Badge tone="accent">{ap.statuses.SCHEDULED}</Badge>}
+              {a.reminded_at && <Badge>{r.sent}</Badge>}
+            </span>
+            {canUpdate && (
+              <span class="ui-actions actions">
+                {a.customer_phone ? (
+                  <form method="post" target="_blank" data-remind>
+                    <input type="hidden" name="intent" value="remind" /><input type="hidden" name="id" value={a.id} />
+                    <Button type="submit" variant={a.reminded_at ? 'tertiary' : 'secondary'} icon="message-circle">{a.reminded_at ? r.again : r.send}</Button>
+                  </form>
+                ) : <span class="ui-muted ui-small">{r.noPhone}</span>}
+                {a.status === 'SCHEDULED' && (
+                  <form method="post"><input type="hidden" name="intent" value="confirm" /><input type="hidden" name="id" value={a.id} />
+                    <Button type="submit" variant="tertiary" icon="check">{r.confirm}</Button></form>
+                )}
+              </span>
+            )}
+          </li>
+        ))}
+      </ul>
+    </>
+  )}
+</AppLayout>
+
+<script>
+  // WhatsApp opens in a new tab; this one refreshes to show the reminder as sent
+  document.querySelectorAll<HTMLFormElement>('[data-remind]').forEach((f) => f.addEventListener('submit', () => setTimeout(() => location.reload(), 1500)));
+</script>
+
+<style>
+  .day {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: var(--space-3);
+    margin-bottom: var(--space-4);
+  }
+  .list {
+    display: grid;
+    gap: var(--space-2);
+    margin: var(--space-2) 0 0;
+    padding: 0;
+    list-style: none;
+  }
+  .list li {
+    display: grid;
+    grid-template-columns: 4.5rem minmax(0, 1fr) auto auto;
+    align-items: center;
+    gap: var(--space-3);
+    padding: var(--space-3) var(--space-4);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-container);
+  }
+  .when {
+    font-weight: var(--weight-bold);
+  }
+  .who {
+    display: grid;
+  }
+  .badges {
+    display: flex;
+    gap: var(--space-1);
+  }
+  .actions {
+    flex-wrap: nowrap;
+  }
+  @media (max-width: 48rem) {
+    .list li {
+      grid-template-columns: 4rem minmax(0, 1fr);
+    }
+    .badges,
+    .actions {
+      grid-column: 2;
+    }
+  }
+</style>

@@ -1,0 +1,323 @@
+---
+import AppLayout from '@/layouts/AppLayout.astro';
+import CalendarFields from '@/components/calendar/CalendarFields.astro';
+import Badge from '@/components/ui/Badge.astro';
+import Button from '@/components/ui/Button.astro';
+import Dialog from '@/components/ui/Dialog.astro';
+import EmptyState from '@/components/ui/EmptyState.astro';
+import Icon from '@/components/ui/Icon.astro';
+import { fmt, getLocale, localePath, useTranslations } from '@/i18n';
+import {
+  ApiError, CALENDAR_COLORS, createCalendar, deleteCalendar, listCalendars, listEvents, type CalendarEvent,
+} from '@/lib/calendar';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const c = t.calendar;
+const { session, accessToken } = Astro.locals as Required<App.Locals>;
+const tz = session.user.timezone;
+
+// Form POSTs: delete a calendar (stay on the list), or create one and go straight to it to add events.
+let formError: string | undefined;
+let pageError: string | undefined;
+let form = { name: '', description: '', color: CALENDAR_COLORS[0] };
+const data = Astro.request.method === 'POST' ? await Astro.request.formData() : undefined;
+if (data?.get('intent') === 'delete') {
+  try {
+    await deleteCalendar(accessToken, String(data.get('calendar_id')));
+    return Astro.redirect(Astro.url.pathname, 303);
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    pageError = e.status === 403 ? c.forbidden : c.failed;
+  }
+} else if (data) {
+  form = {
+    name: String(data.get('name') ?? '').trim(),
+    description: String(data.get('description') ?? '').trim(),
+    color: String(data.get('color') ?? ''),
+  };
+  if (!CALENDAR_COLORS.includes(form.color)) form.color = CALENDAR_COLORS[0];
+  if (!form.name) {
+    formError = c.nameRequired;
+  } else {
+    try {
+      const created = await createCalendar(accessToken, { ...form, description: form.description || null });
+      return Astro.redirect(localePath(locale, `/calendar/${created.id}`), 303);
+    } catch (e) {
+      if (!(e instanceof ApiError)) throw e;
+      formError = c.failed;
+    }
+  }
+  Astro.response.status = 422;
+}
+
+const now = Temporal.Now.instant();
+const [calendars, upcoming] = await Promise.all([
+  listCalendars(accessToken),
+  listEvents(accessToken, now.toString(), now.add({ hours: 24 * 30 }).toString()),
+]);
+
+const byCalendar = new Map<string, CalendarEvent[]>();
+for (const event of upcoming) byCalendar.set(event.calendar_id, [...(byCalendar.get(event.calendar_id) ?? []), event]);
+
+const nextFormat = new Intl.DateTimeFormat(t.intl, {
+  weekday: 'short', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit', timeZone: tz,
+});
+
+function upcomingLabel(n: number) {
+  return n === 0 ? c.upcomingNone : n === 1 ? c.upcomingOne : fmt(c.upcoming, { n });
+}
+---
+
+<AppLayout title={c.title} current="/calendar">
+  <header class="page-header">
+    <h1>{c.title}</h1>
+    {calendars.length > 0 && <Button icon="plus" data-dialog="new-calendar">{c.newCalendar}</Button>}
+  </header>
+
+  {pageError && <p class="form-error page-error" role="alert">{pageError}</p>}
+
+  {
+    calendars.length === 0 ? (
+      <EmptyState icon="calendar-plus" title={c.emptyTitle} text={c.emptyText}>
+        <Button icon="plus" data-dialog="new-calendar">{c.emptyAction}</Button>
+      </EmptyState>
+    ) : (
+      <ul class="grid" role="list">
+        {calendars.map((cal) => {
+          const events = byCalendar.get(cal.id) ?? [];
+          const next = events[0];
+          return (
+            <li class="item">
+              <a
+                class:list={['calendar', { owned: cal.access_level === 'owner' }]}
+                href={localePath(locale, `/calendar/${cal.id}`)}
+                style={`--cal: ${cal.color ?? 'var(--color-primary)'}`}
+              >
+                <span class="top">
+                  <span class="name">{cal.name}</span>
+                  {cal.access_level !== 'owner' && <Badge>{c.access[cal.access_level]}</Badge>}
+                </span>
+                {cal.description && <span class="description">{cal.description}</span>}
+                <span class="meta">
+                  <Icon name="calendar-days" size={16} />
+                  {upcomingLabel(events.length)}
+                </span>
+                {next && (
+                  <span class="next">
+                    <span class="next-label">{c.next}</span>
+                    <span class="next-title">{next.title}</span>
+                    <time class="next-when num" datetime={next.start_at}>
+                      {nextFormat.format(new Date(next.start_at))}
+                    </time>
+                  </span>
+                )}
+              </a>
+              {cal.access_level === 'owner' && (
+                // A sibling of the card link, not inside it: a button can't live in a link
+                <form
+                  method="post"
+                  class="delete"
+                  data-confirm={fmt(c.deleteCalendarText, { name: cal.name })}
+                  data-confirm-title={c.deleteCalendarTitle}
+                  data-confirm-action={c.deleteCalendar}
+                >
+                  <input type="hidden" name="intent" value="delete" />
+                  <input type="hidden" name="calendar_id" value={cal.id} />
+                  <button type="submit" aria-label={`${c.deleteCalendar}: ${cal.name}`}>
+                    <Icon name="trash-2" size={18} />
+                  </button>
+                </form>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+    )
+  }
+
+  <Dialog id="new-calendar" title={c.newCalendar} closeLabel={c.close} open={!!formError}>
+    <form method="post" class="form">
+      {formError && <p class="form-error" role="alert">{formError}</p>}
+      <CalendarFields locale={locale} values={form} />
+      <div class="actions">
+        <Button variant="tertiary" data-dialog-close>{c.cancel}</Button>
+        <Button type="submit">{c.create}</Button>
+      </div>
+    </form>
+  </Dialog>
+</AppLayout>
+
+<style>
+  .page-header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-4);
+    margin-bottom: var(--space-6);
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 17rem), 1fr));
+    gap: var(--space-4);
+    padding: 0;
+    list-style: none;
+  }
+
+  .item {
+    position: relative;
+  }
+
+  .delete {
+    position: absolute;
+    top: var(--space-3);
+    inset-inline-end: var(--space-3);
+  }
+
+  .delete button {
+    display: grid;
+    place-items: center;
+    width: 2.25rem;
+    height: 2.25rem;
+    background: none;
+    border: 0;
+    border-radius: var(--radius-control);
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+
+  .delete button:hover {
+    background: color-mix(in srgb, var(--status-error) 8%, transparent);
+    color: var(--status-error-text);
+  }
+
+  /* With a mouse it shows on the card you point at; touch screens and keyboard focus always see it */
+  @media (hover: hover) {
+    .delete button {
+      opacity: 0;
+    }
+    .item:hover .delete button,
+    .delete button:focus-visible {
+      opacity: 1;
+    }
+  }
+
+  /* Keep the name clear of the delete button */
+  .owned .top {
+    padding-inline-end: var(--space-8);
+  }
+
+  .page-error {
+    margin-bottom: var(--space-4);
+  }
+
+  .calendar {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    height: 100%;
+    padding: var(--space-5) var(--space-5) var(--space-5) calc(var(--space-5) + 4px);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-container);
+    color: var(--text-body);
+    text-decoration: none;
+    overflow: hidden;
+    transition: border-color var(--duration-fast) ease;
+  }
+
+  /* The calendar's color runs down the edge, the same color its events get */
+  .calendar::before {
+    content: '';
+    position: absolute;
+    inset-block: 0;
+    inset-inline-start: 0;
+    width: 5px;
+    background: var(--cal);
+  }
+
+  .calendar:hover {
+    border-color: var(--border-input);
+  }
+
+  .top {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--space-2);
+  }
+
+  .name {
+    color: var(--text-title);
+    font-size: var(--text-lg);
+    font-weight: var(--weight-bold);
+    line-height: var(--leading-tight);
+  }
+
+  .description {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+  }
+
+  .meta {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    margin-top: auto;
+    padding-top: var(--space-2);
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+  }
+
+  .next {
+    display: grid;
+    padding: var(--space-3);
+    background: var(--bg-app);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-control);
+  }
+
+  .next-label {
+    color: var(--text-muted);
+    font-size: var(--text-xs);
+  }
+
+  .next-title {
+    overflow: hidden;
+    color: var(--text-title);
+    font-weight: var(--weight-bold);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .next-when {
+    font-size: var(--text-sm);
+  }
+
+  .form {
+    display: grid;
+    gap: var(--space-5);
+  }
+
+  .form-error {
+    padding: var(--space-3);
+    background: color-mix(in srgb, var(--status-error) 8%, var(--bg-app));
+    border: 1px solid var(--status-error);
+    border-radius: var(--radius-control);
+    color: var(--text-title);
+    font-size: var(--text-sm);
+  }
+
+  .actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--space-2);
+  }
+</style>

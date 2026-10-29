@@ -1,0 +1,420 @@
+---
+// Appointments calendar of the working branch: a month grid (an agenda on narrow screens), colored by status.
+// ?customer=<id>&customer_name=<name> opens "New appointment" for that customer (from the customer's page).
+import AppLayout from '@/layouts/AppLayout.astro';
+import NewAppointmentDialog from '@/components/appointments/NewAppointmentDialog.astro';
+import Button from '@/components/ui/Button.astro';
+import Icon from '@/components/ui/Icon.astro';
+import Notice from '@/components/ui/Notice.astro';
+import { fmt, getLocale, localePath, useTranslations } from '@/i18n';
+import { listFields } from '@/lib/customFields';
+import { getQuote } from '@/lib/sales';
+import { appointmentStaff, bookableServices, listAppointments, newAppointmentValues, saveNewAppointment, type Appointment } from '@/lib/appointments';
+import { setFlash } from '@/lib/session';
+import { monthGrid, startOfDay, weekdayNames, zoned } from '@/lib/time';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const ap = t.appointments;
+const { session, accessToken, branch } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'appointments')?.permissions ?? [];
+if (!perms.includes('read')) return Astro.rewrite('/404');
+const canCreate = perms.includes('create') && !!branch;
+const tz = session.user.timezone;
+const basePath = localePath(locale, '/appointments');
+const params = Astro.url.searchParams;
+
+// --- "New appointment" ---
+let values = newAppointmentValues(tz, params.get('customer') ? { id: params.get('customer')!, title: params.get('customer_name') ?? '' } : undefined);
+// Booked from a quote: its customer (fixed) and services; converting the quote later charges the appointment
+const canReadQuotes = session.modules.some((m) => m.code === 'quotes' && m.permissions.includes('read'));
+const fromQuote = canCreate && branch && params.get('quote') && canReadQuotes
+  ? await getQuote(accessToken, branch.id, params.get('quote')!).catch(() => null) : null;
+if (fromQuote?.customer_id && Astro.request.method === 'GET') {
+  values = { ...newAppointmentValues(tz, { id: fromQuote.customer_id, title: fromQuote.customer ?? '' }), quote_id: fromQuote.id,
+    title: fromQuote.notes?.slice(0, 200) ?? '', services: fromQuote.items.map((i) => i.product_id) };
+}
+let formError: string | undefined;
+let extraErrors: Record<string, string> | undefined;
+const fields = canCreate ? await listFields(accessToken, 'appointment') : [];
+if (branch && canCreate && Astro.request.method === 'POST') {
+  const saved = await saveNewAppointment(accessToken, branch.id, tz, await Astro.request.formData(), ap.errors, t.ui.failed, fields, t.customers.extraErrors);
+  if (saved.created) {
+    setFlash(Astro.cookies, { created: '1', ...(saved.created.sale_pending && { pending: saved.created.sale_pending }) });
+    return Astro.redirect(localePath(locale, `/appointments/${saved.created.id}`), 303);
+  }
+  ({ values, error: formError, extraErrors } = saved);
+  Astro.response.status = 422;
+}
+
+// --- Month ---
+const today = Temporal.Now.plainDateISO(tz);
+let month: Temporal.PlainYearMonth;
+try {
+  month = Temporal.PlainYearMonth.from(params.get('month') ?? '');
+} catch {
+  month = today.toPlainYearMonth();
+}
+const who = params.get('who') ?? '';
+const showCancelled = params.get('cancelled') === '1';
+const days = monthGrid(month, t.intl);
+const services = canCreate ? await bookableServices(accessToken) : [];
+const [appointments, staff] = branch
+  ? await Promise.all([
+      listAppointments(accessToken, branch.id, {
+        from: startOfDay(days[0], tz), to: startOfDay(days[days.length - 1].add({ days: 1 }), tz),
+        assigned_to: who || undefined, hide_cancelled: !showCancelled,
+      }),
+      appointmentStaff(accessToken, branch.id),
+    ])
+  : [[], []];
+const byDay = new Map<string, Appointment[]>();
+for (const a of appointments) {
+  const key = zoned(a.starts_at, tz).toPlainDate().toString();
+  byDay.set(key, [...(byDay.get(key) ?? []), a]);
+}
+const capitalize = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+const monthLabel = capitalize(month.toPlainDate({ day: 1 }).toLocaleString(t.intl, { month: 'long', year: 'numeric' }));
+const link = (extra: Record<string, string>) => {
+  const q = new URLSearchParams({ ...(who && { who }), ...(showCancelled && { cancelled: '1' }), month: month.toString(), ...extra });
+  return `${basePath}?${q}`;
+};
+const dayLabel = (d: Temporal.PlainDate) => capitalize(d.toLocaleString(t.intl, { weekday: 'long', day: 'numeric', month: 'long' }));
+const timeOf = (instant: string) => zoned(instant, tz).toLocaleString(t.intl, { hour: 'numeric', minute: '2-digit' });
+const staffName = (s: { name: string | null; email: string }) => s.name ?? s.email;
+const VISIBLE = 4;
+const agendaDays = days.filter((d) => d.month === month.month && byDay.has(d.toString()));
+---
+
+<AppLayout title={ap.title} current="/appointments">
+  <header class="ui-header">
+    <div>
+      <h1>{ap.title}</h1>
+      {branch && <p class="ui-sub">{branch.name}</p>}
+    </div>
+    <div class="ui-actions">
+      {branch && <Button variant="secondary" icon="message-circle" href={localePath(locale, '/appointments/reminders')}>{t.reminders.link}</Button>}
+      {canCreate && <Button icon="calendar-plus" data-new-appointment={values.start}>{ap.new}</Button>}
+    </div>
+  </header>
+
+  {
+    !branch ? <Notice tone="warning">{t.ui.noBranch}</Notice> : (
+      <>
+        <div class="toolbar">
+          <div class="month-nav">
+            <h2 class="month-label">{monthLabel}</h2>
+            <a class="icon-link" href={link({ month: month.subtract({ months: 1 }).toString() })} aria-label={t.calendar.previousMonth}><Icon name="chevron-left" /></a>
+            <a class="icon-link" href={link({ month: month.add({ months: 1 }).toString() })} aria-label={t.calendar.nextMonth}><Icon name="chevron-right" /></a>
+            <Button variant="secondary" href={link({ month: today.toPlainYearMonth().toString() })}>{t.calendar.today}</Button>
+          </div>
+          <form method="get" class="filters">
+            <input type="hidden" name="month" value={month.toString()} />
+            <label class="filter">
+              <span class="visually-hidden">{ap.who}</span>
+              <select class="ui-select" name="who" data-autosubmit>
+                <option value="">{ap.everyone}</option>
+                {staff.map((s) => <option value={s.id} selected={s.id === who}>{staffName(s)}</option>)}
+              </select>
+            </label>
+            <label class="ui-check"><input type="checkbox" name="cancelled" value="1" checked={showCancelled} data-autosubmit />{ap.showCancelled}</label>
+            <noscript><Button type="submit" variant="secondary">{t.purchases.filter}</Button></noscript>
+          </form>
+        </div>
+        <ul class="legend" role="list">
+          {(['SCHEDULED', 'CONFIRMED', 'COMPLETED', 'NO_SHOW', 'CANCELLED'] as const).map((s) => <li class={`st-${s}`}><span class="swatch" aria-hidden="true"></span>{ap.statuses[s]}</li>)}
+        </ul>
+
+        <div class="month">
+          <div class="weekdays" aria-hidden="true">{weekdayNames(t.intl, 'short').map((n) => <span>{n}</span>)}</div>
+          <ol class="days" role="list">
+            {days.map((day) => {
+              const list = byDay.get(day.toString()) ?? [];
+              return (
+                <li class:list={['day', { outside: day.month !== month.month, today: day.equals(today) }]}>
+                  <div class="day-head">
+                    <time class="day-number num" datetime={day.toString()} aria-label={dayLabel(day)}>{day.day}</time>
+                    {canCreate && (
+                      <button type="button" class="add" data-new-appointment={day.toPlainDateTime({ hour: 9 }).toString({ smallestUnit: 'minute' })}
+                        aria-label={fmt(ap.newOn, { date: dayLabel(day) })}><Icon name="plus" size={16} /></button>
+                    )}
+                  </div>
+                  <ul class="chips" role="list">
+                    {list.slice(0, VISIBLE).map((a) => (
+                      <li><a class={`chip st-${a.status}`} href={localePath(locale, `/appointments/${a.id}`)} title={`${a.customer} · ${a.title}`}>
+                        <span class="chip-time num">{timeOf(a.starts_at)}</span><span class="chip-title">{a.customer}</span>
+                      </a></li>
+                    ))}
+                  </ul>
+                  {list.length > VISIBLE && <a class="more" href={`${link({})}#d-${day}`}>{fmt(t.calendar.more, { n: list.length - VISIBLE })}</a>}
+                </li>
+              );
+            })}
+          </ol>
+        </div>
+
+        <!-- Agenda: narrow screens, and "+N more" -->
+        <section class="agenda" aria-label={ap.agenda}>
+          {agendaDays.length === 0 ? <p class="ui-muted">{ap.emptyMonth}</p> : agendaDays.map((day) => (
+            <div class="agenda-day" id={`d-${day}`}>
+              <h3>{dayLabel(day)}</h3>
+              <ul role="list">
+                {(byDay.get(day.toString()) ?? []).map((a) => (
+                  <li><a class={`agenda-item st-${a.status}`} href={localePath(locale, `/appointments/${a.id}`)}>
+                    <span class="num time">{timeOf(a.starts_at)}–{timeOf(a.ends_at)}</span>
+                    <span class="what"><strong>{a.customer}</strong> · {a.title}{a.assigned_to && <span class="who">{a.assigned_to}</span>}</span>
+                    <span class="status">{ap.statuses[a.status]}</span>
+                  </a></li>
+                ))}
+              </ul>
+            </div>
+          ))}
+        </section>
+      </>
+    )
+  }
+
+  {canCreate && (
+    <NewAppointmentDialog locale={locale} values={values} error={formError} staff={staff} services={services} fields={fields} extraErrors={extraErrors}
+      customerFixed={!!values.quote_id}
+      open={(!!params.get('customer') || !!values.quote_id) && Astro.request.method === 'GET'} />
+  )}
+</AppLayout>
+
+<script>
+  const dialog = document.querySelector<HTMLDialogElement>('#new-appointment');
+  document.querySelectorAll<HTMLElement>('[data-new-appointment]').forEach((b) => b.addEventListener('click', () => {
+    // A day's "+" starts the appointment that day at 9:00
+    const start = dialog?.querySelector<HTMLInputElement>('input[name=start]');
+    if (start && b.dataset.newAppointment) start.value = b.dataset.newAppointment;
+    dialog?.showModal();
+    dialog?.querySelector<HTMLInputElement>('#ap-customer')?.focus();
+  }));
+  document.querySelectorAll<HTMLElement>('[data-autosubmit]').forEach((el) => el.addEventListener('change', () => {
+    dispatchEvent(new Event('app:navigating')); // submit() fires no submit event: show the page skeleton anyway
+    el.closest('form')?.submit();
+  }));
+</script>
+
+<style>
+  .toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    margin-bottom: var(--space-3);
+  }
+  .month-nav,
+  .filters {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+  }
+  .month-label {
+    min-width: 11rem;
+    font-size: var(--text-xl, 1.5rem);
+  }
+  .icon-link {
+    display: grid;
+    place-items: center;
+    width: 2.5rem;
+    height: 2.5rem;
+    border-radius: var(--radius-control);
+    color: var(--text-body);
+  }
+  .icon-link:hover {
+    background: var(--color-primary-tint);
+  }
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-4);
+    margin: 0 0 var(--space-3);
+    padding: 0;
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+    list-style: none;
+  }
+  .legend li {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+  }
+  .swatch {
+    width: 0.75rem;
+    height: 0.75rem;
+    border-radius: 3px;
+    background: var(--st);
+  }
+  /* Status colors (text always says the status too) */
+  .st-SCHEDULED { --st: var(--color-primary); }
+  .st-CONFIRMED { --st: var(--status-success, #15803d); }
+  .st-COMPLETED { --st: var(--text-muted); }
+  .st-NO_SHOW { --st: var(--status-warning, #b45309); }
+  .st-CANCELLED { --st: var(--status-error, #b91c1c); }
+
+  .month {
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-container);
+    overflow: hidden;
+  }
+  .weekdays,
+  .days {
+    display: grid;
+    grid-template-columns: repeat(7, minmax(0, 1fr));
+  }
+  .weekdays span {
+    padding: var(--space-2);
+    background: var(--bg-surface);
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+    text-align: center;
+  }
+  .days {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .day {
+    min-height: 7.5rem;
+    padding: var(--space-1);
+    border-top: 1px solid var(--border-subtle);
+    border-inline-end: 1px solid var(--border-subtle);
+  }
+  .day:nth-child(7n) {
+    border-inline-end: 0;
+  }
+  .outside {
+    background: var(--bg-surface);
+  }
+  .outside .day-number {
+    color: var(--text-muted);
+  }
+  .day-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .day-number {
+    display: grid;
+    place-items: center;
+    width: 1.75rem;
+    height: 1.75rem;
+    border-radius: 50%;
+    font-size: var(--text-sm);
+  }
+  .today .day-number {
+    background: var(--color-primary);
+    color: var(--text-on-primary, #fff);
+    font-weight: var(--weight-bold);
+  }
+  .add {
+    display: grid;
+    place-items: center;
+    width: 1.75rem;
+    height: 1.75rem;
+    background: none;
+    border: 0;
+    border-radius: var(--radius-control);
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+  .add:hover {
+    background: var(--color-primary-tint);
+    color: var(--color-primary);
+  }
+  @media (hover: hover) {
+    .add {
+      opacity: 0;
+    }
+    .day:hover .add,
+    .add:focus-visible {
+      opacity: 1;
+    }
+  }
+  .chips {
+    display: grid;
+    gap: 2px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .chip {
+    display: flex;
+    gap: var(--space-1);
+    padding: 1px var(--space-1);
+    border-inline-start: 3px solid var(--st);
+    border-radius: 3px;
+    background: color-mix(in srgb, var(--st) 12%, var(--bg-app));
+    color: var(--text-title);
+    font-size: var(--text-xs, 0.75rem);
+    text-decoration: none;
+    white-space: nowrap;
+    overflow: hidden;
+  }
+  .chip.st-CANCELLED .chip-title {
+    text-decoration: line-through;
+  }
+  .chip-title {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .more {
+    display: inline-block;
+    margin-top: 2px;
+    font-size: var(--text-xs, 0.75rem);
+  }
+  .agenda {
+    display: grid;
+    gap: var(--space-4);
+    margin-top: var(--space-5);
+  }
+  .agenda-day h3 {
+    margin-bottom: var(--space-2);
+    font-size: var(--text-base, 1rem);
+  }
+  .agenda-day ul {
+    display: grid;
+    gap: var(--space-1);
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .agenda-item {
+    display: grid;
+    grid-template-columns: 9rem minmax(0, 1fr) auto;
+    gap: var(--space-3);
+    align-items: center;
+    padding: var(--space-2) var(--space-3);
+    border-inline-start: 4px solid var(--st);
+    border-radius: var(--radius-control);
+    background: var(--bg-surface);
+    color: var(--text-body);
+    text-decoration: none;
+  }
+  .agenda-item:hover {
+    background: var(--color-primary-tint);
+  }
+  .agenda-item .who {
+    display: block;
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+  }
+  .agenda-item .status {
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+  }
+  /* Narrow screens: the agenda instead of the grid */
+  @media (max-width: 48rem) {
+    .month,
+    .legend {
+      display: none;
+    }
+    .agenda-item {
+      grid-template-columns: minmax(0, 1fr);
+      gap: var(--space-1);
+    }
+  }
+</style>

@@ -1,0 +1,621 @@
+---
+import AppLayout from '@/layouts/AppLayout.astro';
+import CustomerFields from '@/components/customers/CustomerFields.astro';
+import Button from '@/components/ui/Button.astro';
+import Dialog from '@/components/ui/Dialog.astro';
+import EmptyState from '@/components/ui/EmptyState.astro';
+import Icon from '@/components/ui/Icon.astro';
+import Notice from '@/components/ui/Notice.astro';
+import { fmt, getLocale, localePath, money, useTranslations } from '@/i18n';
+import { ApiError, apiFieldErrors } from '@/lib/api';
+import { createCustomer, deleteCustomer, formatPhone, listCustomers } from '@/lib/customers';
+import { listPriceLists } from '@/lib/priceLists';
+import { expiringMemberships } from '@/lib/benefits';
+import { extraErrors, listFields, readExtra } from '@/lib/customFields';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const cu = t.customers;
+const { session, accessToken } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'customers')?.permissions ?? [];
+if (!perms.includes('read')) return Astro.rewrite('/404');
+const canCreate = perms.includes('create');
+const canCredit = perms.includes('credit');
+const canDelete = perms.includes('delete');
+
+const PAGE_SIZE = 25;
+const params = Astro.url.searchParams;
+const q = (params.get('q') ?? '').trim().slice(0, 100);
+const sort = params.get('sort') === 'recent' ? 'recent' : 'name';
+const page = Math.max(1, Number.parseInt(params.get('page') ?? '1', 10) || 1);
+const basePath = localePath(locale, '/customers');
+
+// --- Create (form POST). On success, show the new customer at the top of the "most recent" list. ---
+const empty = { full_name: '', phone: '', additional_phone: '', email: '', company: '', address: '', credit_limit: '0' };
+const [fields, priceLists] = await Promise.all([listFields(accessToken), listPriceLists(accessToken)]);
+let priceListId = '';
+let extra: Record<string, unknown> = {};
+let extraErrs: Record<string, string> = {};
+let values = { ...empty };
+let fieldErrors: Record<string, string> = {};
+let formError: string | undefined;
+let pageError: string | undefined;
+
+const data = Astro.request.method === 'POST' ? await Astro.request.formData() : undefined;
+if (data?.get('intent') === 'delete') {
+  // Delete from the list, then come back to the same search and page
+  const name = String(data.get('customer_name') ?? '');
+  try {
+    await deleteCustomer(accessToken, String(data.get('customer_id')));
+    const back = new URL(Astro.url);
+    back.searchParams.set('deleted', name);
+    return Astro.redirect(back.pathname + back.search, 303);
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    pageError = e.status === 409
+      ? fmt(cu.owesMoney, { name, amount: money(locale, Number(e.body?.detail?.balance ?? 0)) })
+      : e.status === 403 ? t.calendar.forbidden : cu.failed;
+  }
+} else if (data) {
+  values = Object.fromEntries(Object.keys(empty).map((k) => [k, String(data.get(k) ?? '').trim()])) as typeof empty;
+  extra = readExtra(data, fields);
+  priceListId = String(data.get('price_list_id') ?? '');
+  if (!values.full_name) fieldErrors.full_name = cu.errors.full_name;
+  if (!values.phone) fieldErrors.phone = cu.errors.phone;
+
+  if (!canCreate) {
+    formError = t.calendar.forbidden;
+  } else if (Object.keys(fieldErrors).length === 0) {
+    try {
+      const created = await createCustomer(accessToken, {
+        full_name: values.full_name,
+        phone: values.phone,
+        additional_phone: values.additional_phone || null,
+        email: values.email || null,
+        company: values.company || null,
+        address: values.address || null,
+        ...(canCredit && { credit_limit: values.credit_limit || '0' }),
+        extra: readExtra(data, fields),
+        ...(priceLists.length > 0 && { price_list_id: priceListId || null }),
+      });
+      const dup = created.warnings.find((w) => w.code === 'duplicate_phone')?.count ?? 0;
+      return Astro.redirect(`${basePath}?sort=recent&created=${created.id}${dup ? `&dup=${dup}` : ''}`, 303);
+    } catch (e) {
+      if (!(e instanceof ApiError)) throw e;
+      fieldErrors = e.status === 422 ? apiFieldErrors(e.body, cu.errors) : {};
+      extraErrs = e.body?.detail?.field === 'extra' ? extraErrors(e.body.detail, cu.extraErrors) : {};
+      if (e.status === 403) fieldErrors.credit_limit = cu.creditNoPermission;
+      else if (!Object.keys(fieldErrors).length && !Object.keys(extraErrs).length) formError = cu.failed;
+    }
+  }
+  if (Object.keys(fieldErrors).length || Object.keys(extraErrs).length) formError ??= cu.formError;
+  Astro.response.status = 422;
+}
+
+const result = await listCustomers(accessToken, { q, page, pageSize: PAGE_SIZE, sort });
+const expiring = await expiringMemberships(accessToken);
+const dayFmt = new Intl.DateTimeFormat(t.intl, { dateStyle: 'medium', timeZone: session.user.timezone });
+const from = result.total === 0 ? 0 : (page - 1) * PAGE_SIZE + 1;
+const to = Math.min(page * PAGE_SIZE, result.total);
+const pageLink = (p: number) => `${basePath}?${new URLSearchParams({ ...(q && { q }), sort, page: String(p) })}`;
+
+const createdId = params.get('created');
+const createdName = result.items.find((c) => c.id === createdId)?.full_name;
+const dup = Number(params.get('dup') ?? 0);
+const deletedName = params.get('deleted');
+---
+
+<AppLayout title={cu.title} current="/customers">
+  <header class="page-header">
+    <div>
+      <h1>{cu.title}</h1>
+      {(result.total > 0 || q) && <p class="count num">{result.total === 1 ? cu.countOne : fmt(cu.count, { n: result.total })}</p>}
+    </div>
+    {canCreate && (result.total > 0 || q) && <Button icon="user-plus" data-dialog="new-customer">{cu.newCustomer}</Button>}
+  </header>
+
+  {expiring.length > 0 && (
+    <div class="notices">
+      <Notice tone="warning">
+        <strong>{t.benefits.expiringTitle}</strong> · {fmt(t.benefits.expiringText, { n: expiring.length })}
+        <ul class="expiring">
+          {expiring.map((m) => <li><a href={localePath(locale, `/customers/${m.customer_id}`)}>{m.customer}</a> — {m.product}, {dayFmt.format(new Date(m.ends_at))}</li>)}
+        </ul>
+      </Notice>
+    </div>
+  )}
+
+  {
+    (deletedName || pageError) && (
+      <div class="notices" data-flash>
+        {deletedName && (
+          <Notice tone="success">{fmt(cu.deleted, { name: deletedName })}</Notice>
+        )}
+        {pageError && (
+          <Notice tone="error">{pageError}</Notice>
+        )}
+      </div>
+    )
+  }
+
+  {
+    createdId && (
+      <div class="notices" data-flash>
+        <Notice tone="success">{createdName ? fmt(cu.created, { name: createdName }) : fmt(cu.created, { name: '' }).replace(' “”', '')}</Notice>
+        {dup > 0 && (
+          <Notice tone="warning">{dup === 1 ? cu.duplicatePhone : fmt(cu.duplicatePhoneMany, { n: dup })}</Notice>
+        )}
+      </div>
+    )
+  }
+
+  {
+    (result.total > 0 || q) && (
+      <form method="get" class="filters" role="search" data-filters>
+        <label class="visually-hidden" for="customer-search">{cu.searchLabel}</label>
+        <div class="search-box">
+          <Icon name="search" size={18} />
+          <input
+            id="customer-search"
+            type="search"
+            name="q"
+            value={q}
+            placeholder={cu.searchPlaceholder}
+            autocomplete="off"
+            spellcheck="false"
+            maxlength={100}
+            autofocus={!!q}
+          />
+        </div>
+        <label class="sort">
+          <span>{cu.sortLabel}</span>
+          <select name="sort">
+            <option value="name" selected={sort === 'name'}>{cu.sortName}</option>
+            <option value="recent" selected={sort === 'recent'}>{cu.sortRecent}</option>
+          </select>
+        </label>
+        <noscript><Button type="submit" variant="secondary">{cu.searchLabel}</Button></noscript>
+      </form>
+    )
+  }
+
+  {
+    result.total === 0 && !q ? (
+      <EmptyState icon="users" title={cu.emptyTitle} text={cu.emptyText}>
+        {canCreate && <Button icon="user-plus" data-dialog="new-customer">{cu.newCustomer}</Button>}
+      </EmptyState>
+    ) : result.total === 0 ? (
+      <EmptyState icon="search-x" title={fmt(cu.noMatchTitle, { q })} text={cu.noMatchText}>
+        <Button variant="secondary" href={`${basePath}?sort=${sort}`}>{cu.clearSearch}</Button>
+      </EmptyState>
+    ) : (
+      <>
+        <div class="table-wrap">
+          <table class="table">
+            <thead>
+              <tr>
+                <th scope="col">{cu.colName}</th>
+                <th scope="col">{cu.colPhone}</th>
+                <th scope="col">{cu.colEmail}</th>
+                <th scope="col" class="numeric">{cu.colCredit}</th>
+                {canDelete && <th scope="col"><span class="visually-hidden">{cu.deleteAction}</span></th>}
+              </tr>
+            </thead>
+            <tbody>
+              {result.items.map((c) => (
+                <tr class:list={{ highlight: c.id === createdId }}>
+                  <td data-label={cu.colName}>
+                    <a class="name" href={localePath(locale, `/customers/${c.id}`)}>{c.full_name}</a>
+                    {c.company && <span class="company">{c.company}</span>}
+                  </td>
+                  <td data-label={cu.colPhone} class="num">
+                    <a href={`tel:${c.phone}`}>{formatPhone(c.phone)}</a>
+                  </td>
+                  <td data-label={cu.colEmail}>
+                    {c.email ? <a href={`mailto:${c.email}`}>{c.email}</a> : <span class="muted">—</span>}
+                  </td>
+                  <td data-label={cu.colCredit} class="numeric num">
+                    {c.credit_limit > 0 ? money(locale, c.credit_limit) : <span class="muted">{cu.noCredit}</span>}
+                  </td>
+                  {canDelete && (
+                    <td class="row-actions">
+                      <form
+                        method="post"
+                        data-confirm={fmt(cu.deleteText, { name: c.full_name })}
+                        data-confirm-title={cu.deleteTitle}
+                        data-confirm-action={cu.deleteAction}
+                      >
+                        <input type="hidden" name="intent" value="delete" />
+                        <input type="hidden" name="customer_id" value={c.id} />
+                        <input type="hidden" name="customer_name" value={c.full_name} />
+                        <button type="submit" class="delete" aria-label={fmt(cu.deleteRow, { name: c.full_name })}>
+                          <Icon name="trash-2" size={18} />
+                        </button>
+                      </form>
+                    </td>
+                  )}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        <nav class="pager" aria-label={cu.pagination}>
+          <p class="num">{fmt(cu.showing, { from, to, total: result.total })}</p>
+          <div class="pager-links">
+            {page > 1 && <Button variant="secondary" icon="chevron-left" href={pageLink(page - 1)}>{cu.previous}</Button>}
+            {to < result.total && <Button variant="secondary" href={pageLink(page + 1)}>{cu.next}</Button>}
+          </div>
+        </nav>
+      </>
+    )
+  }
+
+  {
+    canCreate && (
+      <Dialog id="new-customer" title={cu.newCustomer} closeLabel={cu.close} open={!!formError}>
+        <form method="post" class="form" novalidate>
+          {formError && <p class="alert" role="alert">{formError}</p>}
+          <CustomerFields locale={locale} values={values} errors={fieldErrors} canCredit={canCredit} fields={fields} extra={extra} extraErrors={extraErrs}
+            priceLists={priceLists} priceListId={priceListId} />
+          <div class="actions">
+            <Button variant="tertiary" data-dialog-close>{cu.cancel}</Button>
+            <Button type="submit">{cu.save}</Button>
+          </div>
+        </form>
+      </Dialog>
+    )
+  }
+</AppLayout>
+
+<script>
+  // Filter as you type (debounced) and when the sort changes; the URL keeps the search shareable.
+  const form = document.querySelector<HTMLFormElement>('[data-filters]');
+  const search = form?.querySelector<HTMLInputElement>('input[name=q]');
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  search?.addEventListener('input', () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => form!.requestSubmit(), 350);
+  });
+  form?.querySelector('select')?.addEventListener('change', () => form.requestSubmit());
+  // After a search reload, keep typing where you left off
+  if (search && document.activeElement === search) search.setSelectionRange(search.value.length, search.value.length);
+
+  // The "saved" notice is shown once: reloading or sharing the URL shouldn't repeat it
+  if (document.querySelector('[data-flash]')) {
+    const url = new URL(location.href);
+    url.searchParams.delete('created');
+    url.searchParams.delete('dup');
+    url.searchParams.delete('deleted');
+    history.replaceState(null, '', url);
+  }
+</script>
+
+<style>
+  .page-header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: var(--space-4);
+    margin-bottom: var(--space-6);
+  }
+
+  .count {
+    margin-top: var(--space-1);
+    color: var(--text-muted);
+  }
+
+  /* --- Notices --- */
+  .notices {
+    display: grid;
+    gap: var(--space-2);
+    margin-bottom: var(--space-4);
+  }
+
+  /* --- Filters --- */
+  .filters {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-3);
+    margin-bottom: var(--space-4);
+  }
+
+  .search-box {
+    display: flex;
+    flex: 1 1 20rem;
+    align-items: center;
+    gap: var(--space-2);
+    max-width: 32rem;
+    min-height: var(--control-height);
+    padding: 0 var(--space-3);
+    background: var(--bg-input);
+    border: 1px solid var(--border-input);
+    border-radius: var(--radius-control);
+  }
+
+  .search-box:focus-within {
+    border-color: var(--color-primary);
+    box-shadow: 0 0 0 3px var(--focus-ring);
+  }
+
+  .search-box :global(svg) {
+    flex-shrink: 0;
+    color: var(--text-muted);
+  }
+
+  .search-box input {
+    flex: 1;
+    min-width: 0;
+    padding: var(--space-2) 0;
+    background: none;
+    border: 0;
+    outline: none;
+  }
+
+  .sort {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+  }
+
+  .sort select {
+    min-height: var(--control-height);
+    padding: 0 2.5rem 0 var(--space-3);
+    background-color: var(--bg-input);
+    border: 1px solid var(--border-input);
+    border-radius: var(--radius-control);
+    color: var(--text-body);
+    cursor: pointer;
+  }
+
+  .sort select:focus-visible {
+    outline: none;
+    border-color: var(--color-primary);
+    box-shadow: 0 0 0 3px var(--focus-ring);
+  }
+
+  /* --- Table --- */
+  .table-wrap {
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-container);
+    overflow-x: auto;
+  }
+
+  .table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: var(--text-sm);
+  }
+
+  th {
+    padding: var(--space-3) var(--space-4);
+    background: var(--bg-surface);
+    border-bottom: 1px solid var(--border-subtle);
+    color: var(--text-muted);
+    font-weight: var(--weight-medium);
+    text-align: start;
+    white-space: nowrap;
+  }
+
+  td {
+    padding: var(--space-3) var(--space-4);
+    border-bottom: 1px solid var(--border-subtle);
+    vertical-align: top;
+  }
+
+  tbody tr:last-child td {
+    border-bottom: 0;
+  }
+
+  tbody tr:hover {
+    background: color-mix(in srgb, var(--bg-surface) 50%, var(--bg-app));
+  }
+
+  .numeric {
+    text-align: end;
+  }
+
+  /* The customer just saved: a brief accent so the eye finds it */
+  .highlight {
+    animation: found 2.4s ease-out;
+  }
+
+  @keyframes found {
+    from {
+      background: color-mix(in srgb, var(--color-accent) 18%, var(--bg-app));
+    }
+  }
+
+  td a.name {
+    display: block;
+    color: var(--text-title);
+    font-size: var(--text-md);
+    font-weight: var(--weight-bold);
+  }
+
+  td a.name:hover {
+    color: var(--color-primary);
+  }
+
+  .row-actions {
+    width: 1%;
+    padding-block: var(--space-2);
+    text-align: end;
+  }
+
+  .delete {
+    display: inline-grid;
+    place-items: center;
+    width: 2.25rem;
+    height: 2.25rem;
+    background: none;
+    border: 0;
+    border-radius: var(--radius-control);
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+
+  .delete:hover {
+    background: color-mix(in srgb, var(--status-error) 8%, transparent);
+    color: var(--status-error-text);
+  }
+
+  /* With a mouse it shows on the row you point at; touch and keyboard focus always see it */
+  @media (hover: hover) {
+    .delete {
+      opacity: 0;
+    }
+    tr:hover .delete,
+    .delete:focus-visible {
+      opacity: 1;
+    }
+  }
+
+  .company,
+  .muted {
+    color: var(--text-muted);
+  }
+
+  td a {
+    color: var(--text-body);
+    text-decoration: none;
+  }
+
+  td a:hover {
+    color: var(--color-primary);
+    text-decoration: underline;
+  }
+
+  /* --- Pagination --- */
+  .pager {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    margin-top: var(--space-4);
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+  }
+
+  .pager-links {
+    display: flex;
+    gap: var(--space-2);
+  }
+
+  /* --- Create form --- */
+  .form {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--space-4);
+  }
+
+  .alert,
+  .actions,
+  .form > :global(.field:has(textarea)),
+  .form > :global(.field:first-of-type) {
+    grid-column: 1 / -1;
+  }
+
+  .alert {
+    padding: var(--space-3);
+    background: color-mix(in srgb, var(--status-error) 8%, var(--bg-app));
+    border: 1px solid var(--status-error);
+    border-radius: var(--radius-control);
+    color: var(--text-title);
+    font-size: var(--text-sm);
+  }
+
+  .actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--space-2);
+  }
+
+  @media (max-width: 48rem) {
+    /* The table becomes one card per customer */
+    .table-wrap {
+      border: 0;
+      overflow: visible;
+    }
+
+    thead {
+      display: none;
+    }
+
+    .table,
+    tbody,
+    tr,
+    td {
+      display: block;
+    }
+
+    tbody {
+      display: grid;
+      gap: var(--space-3);
+    }
+
+    tr {
+      padding: var(--space-3) var(--space-4);
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-container);
+    }
+
+    td {
+      display: flex;
+      justify-content: space-between;
+      gap: var(--space-4);
+      padding: var(--space-1) 0;
+      border: 0;
+    }
+
+    td:first-child {
+      display: block;
+      padding-bottom: var(--space-2);
+    }
+
+    td:not(:first-child)::before {
+      content: attr(data-label);
+      color: var(--text-muted);
+    }
+
+    tr {
+      position: relative;
+    }
+
+    td:first-child {
+      padding-inline-end: var(--space-8);
+    }
+
+    .row-actions {
+      position: absolute;
+      top: var(--space-2);
+      inset-inline-end: var(--space-2);
+      width: auto;
+      padding: 0;
+    }
+
+    .row-actions::before {
+      content: none;
+    }
+
+    .numeric {
+      text-align: end;
+    }
+  }
+
+  @media (max-width: 30rem) {
+    .form {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+  .expiring {
+    margin: var(--space-1) 0 0;
+    padding-inline-start: var(--space-5);
+  }
+</style>

@@ -1,0 +1,58 @@
+---
+// Page-level message after an action: what happened, or what needs attention. Text always carries the meaning.
+import Icon from './Icon.astro';
+
+interface Props {
+  tone?: 'success' | 'warning' | 'error';
+}
+
+const { tone = 'success' } = Astro.props;
+const icon = { success: 'circle-check', warning: 'triangle-alert', error: 'circle-alert' }[tone];
+---
+
+<div class:list={['notice', tone]} role={tone === 'error' ? 'alert' : 'status'}>
+  <Icon name={icon} size={18} />
+  <div class="body"><slot /></div>
+  {Astro.slots.has('action') && <div class="action"><slot name="action" /></div>}
+</div>
+
+<style>
+  .notice {
+    --tone: var(--status-success);
+    --tone-text: var(--status-success-text);
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: var(--space-2) var(--space-3);
+    padding: var(--space-3) var(--space-4);
+    background: color-mix(in srgb, var(--tone) 10%, var(--bg-app));
+    border: 1px solid color-mix(in srgb, var(--tone) 45%, var(--bg-app));
+    border-radius: var(--radius-control);
+    color: var(--text-title);
+    font-size: var(--text-sm);
+  }
+
+  .warning {
+    --tone: var(--status-warning);
+    --tone-text: var(--status-warning-text);
+  }
+
+  .error {
+    --tone: var(--status-error);
+    --tone-text: var(--status-error-text);
+  }
+
+  .notice > :global(svg) {
+    flex-shrink: 0;
+    margin-top: 0.1em;
+    color: var(--tone-text);
+  }
+
+  .body {
+    flex: 1 1 16rem;
+  }
+
+  .action {
+    align-self: center;
+  }
+</style>

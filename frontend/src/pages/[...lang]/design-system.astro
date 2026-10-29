@@ -1,0 +1,275 @@
+---
+import AppLayout from '@/layouts/AppLayout.astro';
+import Badge from '@/components/ui/Badge.astro';
+import Button from '@/components/ui/Button.astro';
+import Card from '@/components/ui/Card.astro';
+import Field from '@/components/ui/Field.astro';
+import { getLocale, useTranslations } from '@/i18n';
+
+const locale = getLocale(Astro.currentLocale);
+const session = Astro.locals.session!;
+const t = useTranslations(locale);
+const ds = t.ds;
+
+const colorGroups = [
+  ['--color-primary', '--color-primary-hover', '--bg-app', '--bg-surface'],
+  ['--text-title', '--text-body', '--text-muted', '--border-input'],
+  ['--color-accent', '--status-error', '--status-success', '--status-warning'],
+  ['--color-accent-text', '--status-error-text', '--status-success-text', '--status-warning-text'],
+];
+
+const typeScale = [
+  ['--text-2xl', 'h1'],
+  ['--text-xl', 'h2'],
+  ['--text-lg', 'h3'],
+  ['--text-md', 'body'],
+  ['--text-sm', 'small'],
+  ['--text-xs', 'badge'],
+];
+---
+
+<AppLayout title={ds.title} current="/design-system">
+  <header class="intro">
+    <h1>{ds.title}</h1>
+    <p>{ds.intro}</p>
+  </header>
+
+  <section aria-labelledby="colors">
+    <h2 id="colors">{ds.colors}</h2>
+    <p class="lede">{ds.colorsIntro}</p>
+    {
+      colorGroups.map((group) => (
+        <ul class="swatches" role="list">
+          {group.map((token) => (
+            <li>
+              <span class="chip" style={`background: var(${token})`} />
+              <code>{token}</code>
+              <code class="hex" data-token={token} />
+            </li>
+          ))}
+        </ul>
+      ))
+    }
+  </section>
+
+  <section aria-labelledby="type">
+    <h2 id="type">{ds.typography}</h2>
+    <ul class="scale" role="list">
+      {
+        typeScale.map(([token, role]) => (
+          <li>
+            <code>{token}</code>
+            <span style={`font-size: var(${token})`} class:list={{ heading: role.startsWith('h') }}>
+              {ds.typeSample}
+            </span>
+          </li>
+        ))
+      }
+    </ul>
+    <p class="body-sample">{ds.bodySample}</p>
+  </section>
+
+  <section aria-labelledby="buttons">
+    <h2 id="buttons">{ds.buttons}</h2>
+    <p class="lede">{ds.buttonsIntro}</p>
+    <div class="row">
+      <Button>{ds.primary}</Button>
+      <Button variant="secondary">{ds.secondary}</Button>
+      <Button variant="tertiary">{ds.tertiary}</Button>
+    </div>
+    <div class="row">
+      <Button icon="plus">{ds.withIcon}</Button>
+      <Button variant="secondary" icon="file-text">{ds.secondary}</Button>
+      <Button disabled>{ds.disabled}</Button>
+    </div>
+  </section>
+
+  <section aria-labelledby="badges">
+    <h2 id="badges">{ds.badges}</h2>
+    <div class="row">
+      <Badge tone="success">{ds.statusOk}</Badge>
+      <Badge tone="warning">{ds.statusPending}</Badge>
+      <Badge tone="error">{ds.statusError}</Badge>
+      <Badge tone="accent">{ds.statusNew}</Badge>
+      <Badge>{ds.statusNeutral}</Badge>
+    </div>
+  </section>
+
+  <section aria-labelledby="skeletons">
+    <h2 id="skeletons">{ds.skeletons}</h2>
+    <p class="intro">{ds.skeletonsIntro}</p>
+    <div class="skeleton-demo" aria-hidden="true">
+      <span class="ui-skel ui-skel-title"></span>
+      <span class="ui-skel ui-skel-text"></span>
+      <span class="ui-skel ui-skel-control"></span>
+      <span class="ui-skel ui-skel-block"></span>
+    </div>
+  </section>
+
+  <section aria-labelledby="form">
+    <h2 id="form">{ds.form}</h2>
+    <p class="lede">{ds.formIntro}</p>
+    <Card title={ds.formTitle} level={3} class="form-card">
+      <form class="form" novalidate>
+        <Field label={ds.name} name="name" placeholder={ds.namePlaceholder} required autocomplete="name" />
+        <Field
+          label={ds.email}
+          name="email"
+          type="email"
+          value="maria.lopez@"
+          error={ds.emailError}
+          required
+          autocomplete="email"
+        />
+        <Field label={ds.phone} name="phone" type="tel" inputmode="numeric" hint={ds.phoneHint} autocomplete="tel" />
+        <Field label={ds.branch} name="branch" as="select">
+          {session.branches.map((b) => <option value={b.id}>{b.name}</option>)}
+        </Field>
+        <Field label={ds.rfc} name="rfc" hint={ds.rfcHint} disabled />
+        <Field label={ds.notes} name="notes" as="textarea" placeholder={ds.notesPlaceholder} />
+        <div class="actions">
+          <Button type="submit">{ds.save}</Button>
+          <Button variant="tertiary">{ds.cancel}</Button>
+        </div>
+      </form>
+    </Card>
+  </section>
+</AppLayout>
+
+<script>
+  // Show each token's real value, read from tokens.css, so this page never drifts from the source.
+  const styles = getComputedStyle(document.documentElement);
+  document.querySelectorAll<HTMLElement>('[data-token]').forEach((el) => {
+    el.textContent = styles.getPropertyValue(el.dataset.token!).trim();
+  });
+</script>
+
+<style>
+  .skeleton-demo {
+    display: grid;
+    gap: var(--space-3);
+    max-width: 32rem;
+  }
+  .intro {
+    margin-bottom: var(--space-8);
+  }
+
+  .intro p,
+  .lede {
+    margin-top: var(--space-2);
+    color: var(--text-muted);
+  }
+
+  section {
+    padding-block: var(--space-8);
+    border-top: 1px solid var(--border-subtle);
+  }
+
+  section > h2 {
+    font-size: var(--text-lg);
+  }
+
+  .swatches {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 12rem), 1fr));
+    gap: var(--space-4);
+    margin-top: var(--space-5);
+    padding: 0;
+    list-style: none;
+  }
+
+  .swatches li {
+    display: grid;
+    gap: var(--space-1);
+  }
+
+  .chip {
+    height: 3.5rem;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-control);
+  }
+
+  code {
+    font-family: inherit;
+    font-size: var(--text-sm);
+    color: var(--text-body);
+  }
+
+  .hex {
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .scale {
+    display: grid;
+    gap: var(--space-4);
+    margin-top: var(--space-5);
+    padding: 0;
+    list-style: none;
+  }
+
+  .scale li {
+    display: grid;
+    grid-template-columns: 9rem minmax(0, 1fr);
+    align-items: baseline;
+    gap: var(--space-4);
+  }
+
+  .scale code {
+    color: var(--text-muted);
+  }
+
+  .heading {
+    color: var(--text-title);
+    font-weight: var(--weight-bold);
+    line-height: var(--leading-tight);
+  }
+
+  .body-sample {
+    margin-top: var(--space-6);
+  }
+
+  .row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-3);
+    margin-top: var(--space-5);
+  }
+
+  .row + .row {
+    margin-top: var(--space-3);
+  }
+
+  section > :global(.form-card) {
+    max-width: 44rem;
+    margin-top: var(--space-5);
+  }
+
+  .form {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--space-5) var(--space-4);
+  }
+
+  .form > :global(.field:has(textarea)),
+  .actions {
+    grid-column: 1 / -1;
+  }
+
+  .actions {
+    display: flex;
+    gap: var(--space-2);
+  }
+
+  @media (max-width: 40rem) {
+    .form {
+      grid-template-columns: minmax(0, 1fr);
+    }
+
+    .scale li {
+      grid-template-columns: minmax(0, 1fr);
+      gap: var(--space-1);
+    }
+  }
+</style>

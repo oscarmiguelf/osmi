@@ -1,0 +1,787 @@
+---
+// Sale / quote cart: products, customer, discounts and (sales) payments. The API prices it live through
+// /api/cart-preview, so what the person sees is what will be saved. On submit the whole cart travels as JSON
+// in the hidden `payload` field (the page re-renders it from `initial` after a server error).
+import Button from '@/components/ui/Button.astro';
+import Dialog from '@/components/ui/Dialog.astro';
+import SearchPicker from '@/components/ui/SearchPicker.astro';
+import { useTranslations, type Locale } from '@/i18n';
+import type { PaymentMethod } from '@/lib/cash';
+import type { Promotion } from '@/lib/sales';
+
+export interface CartItem {
+  product_id: string;
+  product: string;
+  unit: string;
+  quantity: number | string;
+  unit_price: number | string;
+  catalog_price?: number | string;
+  discount?: number | string;
+  promotion_id?: string | null;
+  fulfillment?: 'DELIVERED' | 'RESERVED';
+  /** Price today, when it differs from a quoted price being honored */
+  current_price?: number | string;
+}
+
+export interface CartState {
+  id?: string;
+  /** Converting a quote: the live preview honors its prices */
+  quote_id?: string;
+  /** Charging an appointment: the sale is linked to it */
+  appointment_id?: string;
+  customer?: { id: string; title: string } | null;
+  customer_name?: string | null;
+  discount?: number | string;
+  valid_days?: number | string;
+  notes?: string | null;
+  items: CartItem[];
+  payments?: { payment_method_id: string; amount: number | string; amount_tendered?: number | string | null; reference?: string | null }[];
+}
+
+interface Props {
+  mode: 'sale' | 'quote';
+  locale: Locale;
+  initial: CartState;
+  promotions?: Promotion[];
+  methods?: PaymentMethod[];
+  /** Converting a quote that has a customer: the sale must be for that customer */
+  customerLocked?: boolean;
+}
+
+const { mode, locale, initial, promotions = [], methods = [], customerLocked = false } = Astro.props;
+const t = useTranslations(locale);
+const c = t.sales.cart;
+const methodName = (d: string) => t.cash.methodNames[d] ?? d;
+// Cash first (it's the one that gives change), credit last
+const rank = (m: PaymentMethod) => (m.description === 'Cash' ? 0 : m.is_credit ? 2 : 1);
+---
+
+<div
+  class="cart"
+  data-cart
+  data-mode={mode}
+  data-lang={locale}
+  data-intl={t.intl}
+  data-initial={JSON.stringify(initial)}
+  data-promotions={JSON.stringify(promotions)}
+  data-labels={JSON.stringify({ remove: c.remove, noPromotion: c.noPromotion, reserve: c.reserve, quoted: c.quoted, today: c.today,
+    quantity: c.quantity, price: c.price, discount: c.lineDiscount, promotion: c.promotion, tendered: c.tendered, reference: c.reference,
+    noStock: c.noStock, onlyStock: c.onlyStock, creditNeedsCustomer: c.creditNeedsCustomer, stockWarning: c.stockWarning, usePackage: c.usePackage,
+    overNonCash: c.overNonCash, cashNotNeeded: c.cashNotNeeded, exactCash: c.exactCash })}
+>
+  <input type="hidden" name="payload" data-payload />
+
+  <section class="panel products" aria-labelledby="cart-products">
+    <h2 id="cart-products" class="visually-hidden">{c.products}</h2>
+    <div class="pick">
+      <label class="label" for="cart-search">{c.product}</label>
+      <SearchPicker id="cart-search" name="cart_pick" endpoint={`/api/products?mode=sale&lang=${locale}`} placeholder={c.placeholder}
+        hint={c.hint} noResults={c.noResults} clearLabel={c.clear} autofocus />
+    </div>
+    <div class="ui-table-wrap">
+      <table class="rows">
+        <thead>
+          <tr>
+            <th scope="col">{c.product}</th>
+            <th scope="col" class="end">{c.quantity}</th>
+            <th scope="col" class="end">{c.price}</th>
+            <th scope="col">{mode === 'sale' ? c.promotionOrDiscount : c.lineDiscount}</th>
+            <th scope="col" class="end">{c.lineTotal}</th>
+            <th scope="col"><span class="visually-hidden">{c.remove}</span></th>
+          </tr>
+        </thead>
+        <tbody data-rows></tbody>
+      </table>
+    </div>
+    <p class="empty" data-empty>{c.empty}</p>
+    <div class="notice-slot" data-error role="alert" hidden></div>
+  </section>
+
+  <aside class="panel side">
+    <div class="field-block">
+      <span class="label" id="cart-customer-label">{c.customer}</span>
+      {
+        customerLocked ? (
+          <p class="locked"><strong>{initial.customer?.title}</strong><span class="ui-muted ui-small">{c.customerLocked}</span></p>
+        ) : (
+          <SearchPicker id="cart-customer" name="customer_pick" endpoint="/api/customers" placeholder={c.customerPlaceholder}
+            hint={mode === 'quote' ? c.customerHintQuote : c.customerHint} noResults={c.noCustomers} clearLabel={c.clear}
+            value={initial.customer ?? null} />
+        )
+      }
+      {mode === 'quote' && (
+        <label class="field-block">
+          <span class="label">{c.customerName}</span>
+          <input class="ui-input" type="text" maxlength="200" data-customer-name value={initial.customer_name ?? ''} />
+        </label>
+      )}
+    </div>
+
+    <label class="field-block">
+      <span class="label">{mode === 'sale' ? c.saleDiscount : c.quoteDiscount}</span>
+      <input class="ui-input num" type="number" min="0" step="0.01" inputmode="decimal" data-sale-discount value={initial.discount ?? ''} />
+    </label>
+
+    {mode === 'quote' && (
+      <>
+        <label class="field-block">
+          <span class="label">{c.validDays}</span>
+          <input class="ui-input num" type="number" min="1" max="365" step="1" inputmode="numeric" data-valid-days value={initial.valid_days ?? 15} />
+          <span class="ui-muted ui-small">{c.validDaysHint}</span>
+        </label>
+        <label class="field-block">
+          <span class="label">{c.notes}</span>
+          <textarea class="ui-input notes" rows="2" maxlength="2000" data-notes>{initial.notes ?? ''}</textarea>
+        </label>
+      </>
+    )}
+
+    <dl class="totals" aria-live="polite">
+      <div><dt>{c.subtotal}</dt><dd class="num" data-subtotal>—</dd></div>
+      <div><dt>{c.discount}</dt><dd class="num" data-discount>—</dd></div>
+      <div class="ui-muted"><dt>{mode === 'sale' ? c.tax : c.taxInfo}</dt><dd class="num" data-tax>—</dd></div>
+      <div class="grand"><dt>{c.total}</dt><dd class="num" data-total>—</dd></div>
+    </dl>
+
+    {mode === 'sale' && (
+      <>
+        <Button icon="banknote" class="charge" data-charge>{t.sales.charge}</Button>
+        {/* Charge: how much is received with each method. Only cash may exceed what's left (it gives change) */}
+        <Dialog id="charge-dialog" title={c.chargeTitle} closeLabel={t.ui.close}>
+          <div class="charge-total"><span>{c.total}</span><strong class="num" data-ch-total>—</strong></div>
+          <div class="methods">
+            {[...methods].sort((a, b) => rank(a) - rank(b)).map((m) => {
+              const kind = m.is_credit ? 'credit' : m.description === 'Cash' ? 'cash' : 'other';
+              return (
+                <div class="method" data-ch-method={m.id} data-kind={kind}>
+                  <label class="method-name" for={`ch-${m.id}`}>{methodName(m.description)}</label>
+                  <input id={`ch-${m.id}`} class="ui-input num" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" data-ch-amount />
+                  {kind === 'cash' && <div class="quick" data-ch-quick></div>}
+                  {/* Credit needs a customer: chosen here too, without leaving the dialog (kept in sync with the side panel) */}
+                  {kind === 'credit' && !customerLocked && (
+                    <div class="ch-customer" data-ch-customer hidden>
+                      <label class="ui-small" for="ch-customer">{c.customer}</label>
+                      <SearchPicker id="ch-customer" name="ch_customer_pick" endpoint="/api/customers" placeholder={c.customerPlaceholder}
+                        hint={c.customerHint} noResults={c.noCustomers} clearLabel={c.clear} value={initial.customer ?? null} />
+                    </div>
+                  )}
+                  {kind === 'other' && (
+                    <input class="ui-input ref" type="text" maxlength="100" placeholder={c.reference} aria-label={`${c.reference}: ${methodName(m.description)}`} data-ch-ref />
+                  )}
+                </div>
+              );
+            })}
+          </div>
+          <dl class="totals">
+            <div><dt>{c.received}</dt><dd class="num" data-ch-paid>—</dd></div>
+            <div><dt>{c.remaining}</dt><dd class="num" data-ch-left>—</dd></div>
+            <div class="change"><dt>{c.change}</dt><dd class="num" data-ch-change>—</dd></div>
+          </dl>
+          <label class="ui-check reserve-all"><input type="checkbox" data-ch-reserve />{c.reserveAll}</label>
+          <p class="warn" data-ch-error role="alert" hidden></p>
+          <div class="ui-form-actions">
+            <Button variant="tertiary" data-dialog-close>{t.ui.cancel}</Button>
+            <Button type="submit" icon="check" data-ch-confirm>{c.confirmCharge}</Button>
+          </div>
+        </Dialog>
+      </>
+    )}
+    <slot />
+  </aside>
+</div>
+
+<script>
+  type Promo = { promotion_id: string; product_id: string; name: string };
+  type Item = { product_id: string; product: string; unit: string; quantity: string; unit_price: string; catalog_price: string;
+    discount: string; promotion_id: string; fulfillment: 'DELIVERED' | 'RESERVED'; current_price?: string; price_list?: string; benefit_id?: string };
+
+  document.querySelectorAll<HTMLElement>('[data-cart]').forEach((root) => {
+    const $ = <T extends Element>(sel: string) => root.querySelector<T>(sel);
+    const mode = root.dataset.mode as 'sale' | 'quote';
+    const lang = root.dataset.lang!;
+    const L = JSON.parse(root.dataset.labels!);
+    const promos: Promo[] = JSON.parse(root.dataset.promotions!);
+    const initial = JSON.parse(root.dataset.initial!);
+    const fmtMoney = new Intl.NumberFormat(root.dataset.intl, { style: 'currency', currency: 'MXN' });
+    const money = (v: number | string | undefined) => (v === undefined || v === '' ? '—' : fmtMoney.format(Number(v)));
+    const str = (v: unknown) => (v === undefined || v === null ? '' : String(v));
+
+    const items: Item[] = (initial.items ?? []).map((i: any) => ({
+      product_id: i.product_id, product: i.product, unit: i.unit, quantity: str(i.quantity), unit_price: str(i.unit_price),
+      catalog_price: str(i.catalog_price ?? i.unit_price), discount: str(i.discount && Number(i.discount) ? i.discount : ''),
+      promotion_id: str(i.promotion_id), fulfillment: i.fulfillment ?? 'DELIVERED', current_price: i.current_price === undefined ? undefined : str(i.current_price),
+    }));
+    let total = 0;
+    let customerId: string = initial.customer?.id ?? '';
+    let customerTitle: string = initial.customer?.title ?? '';
+    // The customer's packages with sessions left: a line of that service can be paid with them ($0)
+    let packages: { id: string; service_product_id: string; product: string; sessions_left: number }[] = [];
+    async function loadPackages() {
+      packages = mode === 'sale' && customerId ? await (await fetch(`/api/customer-benefits?customer=${customerId}`)).json().catch(() => []) : [];
+      items.forEach((i) => { if (i.benefit_id && !packages.some((p) => p.id === i.benefit_id)) i.benefit_id = undefined; });
+      renderRows();
+      schedule();
+    }
+
+    const rows = $<HTMLTableSectionElement>('[data-rows]')!;
+    const errorBox = $<HTMLElement>('[data-error]')!;
+    const discountInput = $<HTMLInputElement>('[data-sale-discount]')!;
+
+    const el = (tag: string, attrs: Record<string, string | boolean> = {}, ...children: (Node | string)[]) => {
+      const node = document.createElement(tag);
+      for (const [k, v] of Object.entries(attrs)) {
+        if (v === false) continue;
+        if (k === 'class') node.className = String(v);
+        else node.setAttribute(k, v === true ? '' : v);
+      }
+      node.append(...children);
+      return node;
+    };
+
+    function renderRows() {
+      rows.replaceChildren(...items.map((item, n) => {
+        const qty = el('input', { class: 'ui-input num qty', type: 'number', min: '0', step: '0.001', inputmode: 'decimal', value: item.quantity,
+          'aria-label': `${L.quantity}: ${item.product}` }) as HTMLInputElement;
+        qty.addEventListener('input', () => { item.quantity = qty.value; schedule(); });
+        // Business rule: the price comes from the catalog (or the quote being converted) and can't be edited here
+        const priceCell = el('td', { class: 'end num' }, money(item.unit_price));
+        priceCell.dataset.price = '';
+        if (item.price_list) priceCell.append(el('span', { class: 'hint list' }, item.price_list));
+        if (item.current_price !== undefined && Number(item.current_price) !== Number(item.unit_price)) {
+          priceCell.append(el('span', { class: 'hint' }, `${L.today}: ${money(item.current_price)}`));
+        }
+        const adjust = el('td');
+        const mine = promos.filter((p) => p.product_id === item.product_id);
+        if (mode === 'sale' && mine.length) {
+          const select = el('select', { class: 'ui-select', 'aria-label': `${L.promotion}: ${item.product}` },
+            el('option', { value: '' }, L.noPromotion),
+            ...mine.map((p) => el('option', { value: p.promotion_id, selected: p.promotion_id === item.promotion_id }, p.name))) as HTMLSelectElement;
+          select.addEventListener('change', () => { item.promotion_id = select.value; renderRows(); schedule(); });
+          adjust.append(select);
+        }
+        const pack = mode === 'sale' ? packages.find((p) => p.service_product_id === item.product_id) : undefined;
+        if (pack) {
+          const use = el('input', { type: 'checkbox', checked: item.benefit_id === pack.id }) as HTMLInputElement;
+          use.addEventListener('change', () => {
+            item.benefit_id = use.checked ? pack.id : undefined;
+            if (use.checked) { item.discount = ''; item.promotion_id = ''; }
+            renderRows();
+            schedule();
+          });
+          adjust.append(el('label', { class: 'ui-check use-package' }, use, L.usePackage.replace('{n}', String(pack.sessions_left))));
+        }
+        if (!item.promotion_id && !item.benefit_id) {
+          const disc = el('input', { class: 'ui-input num qty', type: 'number', min: '0', step: '0.01', inputmode: 'decimal', value: item.discount,
+            placeholder: '0.00', 'aria-label': `${L.discount}: ${item.product}` }) as HTMLInputElement;
+          disc.addEventListener('input', () => { item.discount = disc.value; schedule(); });
+          adjust.append(disc);
+        }
+        if (mode === 'sale') {
+          const reserve = el('input', { type: 'checkbox', checked: item.fulfillment === 'RESERVED' }) as HTMLInputElement;
+          reserve.addEventListener('change', () => { item.fulfillment = reserve.checked ? 'RESERVED' : 'DELIVERED'; });
+          adjust.append(el('label', { class: 'ui-check reserve' }, reserve, L.reserve));
+        }
+        const remove = el('button', { type: 'button', class: 'remove', 'aria-label': `${L.remove}: ${item.product}` }, '×');
+        remove.addEventListener('click', () => { items.splice(n, 1); renderRows(); schedule(); });
+        return el('tr', { 'data-row': String(n) },
+          el('td', {}, el('span', { class: 'ui-strong' }, item.product), el('span', { class: 'hint' }, item.unit)),
+          el('td', { class: 'end' }, qty), priceCell, adjust,
+          el('td', { class: 'end num', 'data-line': '' }, '—'),
+          el('td', { class: 'end' }, remove));
+      }));
+      $<HTMLElement>('[data-empty]')!.hidden = items.length > 0;
+    }
+
+    function notice(text: string) {
+      errorBox.className = 'notice-slot error';
+      errorBox.replaceChildren(el('p', {}, text));
+      errorBox.hidden = false;
+    }
+
+    function add(p: { id: string; title: string; unit: string; price: number; tracks?: boolean; stock?: number }) {
+      const same = items.find((i) => i.product_id === p.id); // scanning again adds one more
+      // A sale can't take what the branch doesn't have (quotes reserve nothing, so they may)
+      const wanted = Number(same?.quantity || 0) + 1;
+      if (mode === 'sale' && p.tracks && wanted > Number(p.stock ?? 0)) {
+        notice(Number(p.stock) > 0 ? L.onlyStock.replace('{product}', p.title).replace('{n}', String(Number(p.stock))) : L.noStock.replace('{product}', p.title));
+        return;
+      }
+      if (same) same.quantity = String(wanted);
+      else {
+        // An active promotion is applied by default: the cashier can still switch it off
+        const promo = mode === 'sale' ? promos.find((x) => x.product_id === p.id) : undefined;
+        items.push({ product_id: p.id, product: p.title, unit: p.unit, quantity: '1', unit_price: String(p.price), catalog_price: String(p.price),
+          discount: '', promotion_id: promo?.promotion_id ?? '', fulfillment: 'DELIVERED' });
+      }
+      renderRows();
+      schedule();
+    }
+
+    // Product picker: choose a result, or scan a barcode + Enter (added straight away when it's the only match)
+    const picker = $<HTMLElement>('#cart-search')!.closest<HTMLElement>('[data-picker]')!;
+    const search = $<HTMLInputElement>('#cart-search')!;
+    picker.addEventListener('picker:choose', (e) => {
+      add((e as CustomEvent).detail);
+      picker.dispatchEvent(new CustomEvent('picker:set', { detail: null }));
+      search.focus();
+    });
+    search.addEventListener('keydown', async (e) => {
+      if (e.key !== 'Enter') return;
+      e.preventDefault(); // never submit the sale from the search box
+      const q = search.value.trim();
+      if (q.length < 2) return;
+      const found = await (await fetch(`/api/products?mode=sale&lang=${lang}&q=${encodeURIComponent(q)}`)).json();
+      if (found.length === 1) {
+        add(found[0]);
+        picker.dispatchEvent(new CustomEvent('picker:set', { detail: null }));
+        search.focus();
+      }
+    });
+
+    // The customer can be chosen in the side panel or in the charge dialog: choosing (or clearing) in one updates the other
+    const customerPickers = ['#cart-customer', '#ch-customer'].map((sel) => $<HTMLElement>(sel)?.closest<HTMLElement>('[data-picker]'))
+      .filter((p): p is HTMLElement => !!p);
+    customerPickers.forEach((p) => {
+      const others = customerPickers.filter((o) => o !== p);
+      p.addEventListener('picker:choose', (e) => {
+        const c = (e as CustomEvent).detail;
+        customerId = c.id;
+        customerTitle = c.title;
+        others.forEach((o) => o.dispatchEvent(new CustomEvent('picker:set', { detail: c })));
+        compute();
+        loadPackages(); // another customer: other prices (price list) and other packages
+      });
+      p.querySelector('[data-clear]')?.addEventListener('click', () => {
+        customerId = '';
+        customerTitle = '';
+        others.forEach((o) => o.dispatchEvent(new CustomEvent('picker:set', { detail: null })));
+        compute();
+        loadPackages();
+      });
+    });
+    // Enter in the dialog's customer search must not charge the sale
+    $('#ch-customer')?.addEventListener('keydown', (e) => { if ((e as KeyboardEvent).key === 'Enter') e.preventDefault(); });
+    discountInput.addEventListener('input', schedule);
+
+    // --- charge dialog (sales) ---
+    const dialog = $<HTMLDialogElement>('#charge-dialog');
+    const rowsOf = () => [...(dialog?.querySelectorAll<HTMLElement>('[data-ch-method]') ?? [])];
+    const amountOf = (r: HTMLElement) => Number(r.querySelector<HTMLInputElement>('[data-ch-amount]')!.value || 0);
+    const round = (n: number) => Math.round(n * 100) / 100;
+    let charge = { ok: false, payments: [] as { payment_method_id: string; amount: string; amount_tendered: string | null; reference: string | null }[] };
+
+    function compute() {
+      if (!dialog) return;
+      const rows = rowsOf();
+      const cashRow = rows.find((r) => r.dataset.kind === 'cash');
+      const nonCash = round(rows.filter((r) => r.dataset.kind !== 'cash').reduce((s, r) => s + amountOf(r), 0));
+      const credit = rows.filter((r) => r.dataset.kind === 'credit').reduce((s, r) => s + amountOf(r), 0);
+      const cash = cashRow ? amountOf(cashRow) : 0;
+      const cashNeeded = round(total - nonCash);           // what cash has to cover
+      const left = round(Math.max(total - nonCash - cash, 0));
+      const change = cashNeeded > 0 ? round(Math.max(cash - cashNeeded, 0)) : 0;
+      let error = '';
+      if (nonCash > total) error = L.overNonCash;            // card / transfer / credit never exceed: no change from them
+      else if (credit > 0 && !customerId) error = L.creditNeedsCustomer;
+      else if (cash > 0 && cashNeeded <= 0) error = L.cashNotNeeded;
+      const chCustomer = dialog.querySelector<HTMLElement>('[data-ch-customer]');
+      if (chCustomer) chCustomer.hidden = credit <= 0;
+      dialog.querySelector('[data-ch-total]')!.textContent = money(total);
+      dialog.querySelector('[data-ch-paid]')!.textContent = money(nonCash + cash);
+      dialog.querySelector('[data-ch-left]')!.textContent = money(left);
+      dialog.querySelector('[data-ch-change]')!.textContent = money(change);
+      const box = dialog.querySelector<HTMLElement>('[data-ch-error]')!;
+      box.hidden = !error;
+      box.textContent = error;
+      charge = {
+        ok: !error && left === 0 && items.length > 0,
+        payments: [
+          ...rows.filter((r) => r.dataset.kind !== 'cash' && amountOf(r) > 0).map((r) => ({
+            payment_method_id: r.dataset.chMethod!, amount: amountOf(r).toFixed(2), amount_tendered: null,
+            reference: r.querySelector<HTMLInputElement>('[data-ch-ref]')?.value.trim() || null })),
+          // Cash pays what's left; what was handed over is recorded so the ticket shows the change
+          ...(cashRow && cashNeeded > 0 && cash > 0 ? [{ payment_method_id: cashRow.dataset.chMethod!, amount: cashNeeded.toFixed(2),
+            amount_tendered: cash.toFixed(2), reference: null }] : []),
+        ],
+      };
+      dialog.querySelector<HTMLButtonElement>('[data-ch-confirm]')!.disabled = !charge.ok;
+      // Quick cash: exact, then the next round bills
+      const quick = cashRow?.querySelector<HTMLElement>('[data-ch-quick]');
+      if (quick) {
+        const need = Math.max(cashNeeded, 0);
+        const bills = [...new Set([50, 100, 200, 500].map((b) => Math.ceil(need / b) * b).filter((v) => v > need))].slice(0, 3);
+        quick.replaceChildren(...(need > 0 ? [need, ...bills] : []).map((v, n) => {
+          const b = el('button', { type: 'button', class: 'quick-btn' }, n === 0 ? `${L.exactCash} ${money(v)}` : money(v));
+          b.addEventListener('click', () => { cashRow!.querySelector<HTMLInputElement>('[data-ch-amount]')!.value = v.toFixed(2); compute(); });
+          return b;
+        }));
+      }
+    }
+    dialog?.addEventListener('input', compute);
+    // "Reserve everything": every line is handed over later (delivered from the sale, item by item)
+    const reserveAll = dialog?.querySelector<HTMLInputElement>('[data-ch-reserve]');
+    reserveAll?.addEventListener('change', () => {
+      items.forEach((i) => (i.fulfillment = reserveAll.checked ? 'RESERVED' : 'DELIVERED'));
+      renderRows();
+      schedule();
+    });
+    $('[data-charge]')?.addEventListener('click', async () => {
+      clearTimeout(timer);
+      await price(); // the total on screen must be the one charged
+      if (!items.length || !errorBox.hidden && errorBox.classList.contains('error')) {
+        search.focus();
+        return;
+      }
+      compute();
+      if (reserveAll) reserveAll.checked = items.every((i) => i.fulfillment === 'RESERVED');
+      dialog!.showModal();
+      dialog!.querySelector<HTMLInputElement>('[data-kind=cash] [data-ch-amount]')?.focus();
+    });
+
+    // --- live pricing ---
+    function payload() {
+      const lines = items.map((i) => ({
+        // The API works out the price (catalog or the customer's price list); only a quote being converted keeps its prices
+        product_id: i.product_id, product: i.product, unit: i.unit, quantity: i.quantity || '0',
+        unit_price: mode === 'sale' && i.current_price !== undefined ? i.unit_price || '0' : null,
+        discount: i.promotion_id || i.benefit_id ? '0' : i.discount || '0',
+        ...(mode === 'sale' && { promotion_id: i.promotion_id || null, fulfillment: i.fulfillment, benefit_id: i.benefit_id || null }),
+        ...(i.current_price !== undefined && { current_price: i.current_price }),
+      }));
+      const base = { customer_id: customerId || null, customer_label: customerTitle || null, discount: discountInput.value || '0', items: lines };
+      if (mode === 'quote') {
+        return { ...base, customer_name: $<HTMLInputElement>('[data-customer-name]')!.value.trim() || null,
+          valid_days: $<HTMLInputElement>('[data-valid-days]')!.value || null, notes: $<HTMLTextAreaElement>('[data-notes]')!.value.trim() || null };
+      }
+      return { ...base, id: initial.id, quote_id: initial.quote_id ?? null, appointment_id: initial.appointment_id ?? null, payments: charge.payments };
+    }
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let seq = 0;
+    function schedule() {
+      clearTimeout(timer);
+      timer = setTimeout(price, 250);
+    }
+    async function price() {
+      const mine = ++seq;
+      if (!items.length) {
+        total = 0;
+        for (const k of ['subtotal', 'discount', 'tax', 'total']) $<HTMLElement>(`[data-${k}]`)!.textContent = '—';
+        errorBox.hidden = true;
+        return;
+      }
+      const body = payload();
+      const slow = setTimeout(() => mine === seq && root.classList.add('pricing'), 200);
+      const res = await fetch('/api/cart-preview', { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ mode, lang, payload: { ...body, payments: [] } }) });
+      const out = await res.json().catch(() => ({ error: { text: '…' } }));
+      clearTimeout(slow);
+      if (mine !== seq) return; // a newer change is being priced
+      root.classList.remove('pricing');
+      if (out.error) {
+        errorBox.replaceChildren(el('p', {}, out.error.text), ...(out.error.items?.length ? [el('ul', {}, ...out.error.items.map((x: string) => el('li', {}, x)))] : []));
+        errorBox.className = 'notice-slot error';
+        errorBox.hidden = false;
+        return;
+      }
+      const d = out.data;
+      total = Number(d.total);
+      d.lines.forEach((line: any, n: number) => {
+        // The price that applies (a price list may change it with the customer or the quantity)
+        const item = items[n];
+        if (item && (Number(item.unit_price) !== Number(line.unit_price) || (item.price_list ?? null) !== (line.price_list ?? null))) {
+          item.unit_price = String(line.unit_price);
+          item.price_list = line.price_list ?? undefined;
+          const priceCell = rows.querySelector(`[data-row="${n}"] [data-price]`);
+          priceCell?.replaceChildren(money(item.unit_price), ...(item.price_list ? [el('span', { class: 'hint list' }, item.price_list)] : []));
+        }
+        const cell = rows.querySelector(`[data-row="${n}"] [data-line]`);
+        if (!cell) return;
+        cell.replaceChildren(money(line.line_total), ...(Number(line.discount) ? [el('span', { class: 'hint' }, `−${money(line.discount)}`)] : []));
+      });
+      $<HTMLElement>('[data-subtotal]')!.textContent = money(d.subtotal);
+      $<HTMLElement>('[data-discount]')!.textContent = Number(d.discount) ? `−${money(d.discount)}` : money(0);
+      $<HTMLElement>('[data-tax]')!.textContent = money(d.tax_total);
+      $<HTMLElement>('[data-total]')!.textContent = money(d.total);
+      const warnings = d.stock_warnings ?? [];
+      errorBox.hidden = !warnings.length;
+      if (warnings.length) {
+        errorBox.className = 'notice-slot warning';
+        errorBox.replaceChildren(el('p', {}, L.stockWarning),
+          el('ul', {}, ...warnings.map((w: any) => el('li', {}, `${w.product}: ${Number(w.needed)} / ${Number(w.available)}`))));
+      }
+    }
+
+    root.closest('form')?.addEventListener('submit', (e) => {
+      // A sale is only sent from the charge dialog, once what was received covers the total
+      if (mode === 'sale' && (!dialog?.open || !charge.ok)) {
+        e.preventDefault();
+        return;
+      }
+      $<HTMLInputElement>('[data-payload]')!.value = JSON.stringify(payload());
+    });
+
+    renderRows();
+    price();
+    if (customerId) loadPackages();
+  });
+</script>
+
+<style>
+  .cart {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 22rem;
+    align-items: start;
+    gap: var(--space-4);
+  }
+  .panel {
+    display: grid;
+    gap: var(--space-3);
+    padding: var(--space-4);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-container);
+  }
+  .side {
+    position: sticky;
+    top: var(--space-4);
+  }
+  .label {
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
+  }
+  .pick,
+  .field-block {
+    display: grid;
+    gap: var(--space-1);
+  }
+  .rows {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: var(--text-sm);
+  }
+  .rows th {
+    padding: var(--space-2);
+    color: var(--text-muted);
+    font-weight: var(--weight-medium);
+    text-align: start;
+  }
+  .rows :global(td) {
+    padding: var(--space-2);
+    border-top: 1px solid var(--border-subtle);
+    vertical-align: top;
+  }
+  .rows :global(td:first-child) {
+    display: grid;
+  }
+  .rows .end,
+  .rows :global(.end) {
+    text-align: end;
+  }
+  .rows :global(.qty) {
+    width: 6.5rem;
+    text-align: end;
+  }
+  .rows :global(td .ui-select) {
+    width: 100%;
+    margin-bottom: var(--space-1);
+  }
+  .rows :global(.hint) {
+    display: block;
+    color: var(--text-muted);
+    font-size: var(--text-xs, 0.75rem);
+  }
+  .rows :global(.reserve) {
+    margin-top: var(--space-1);
+    font-size: var(--text-sm);
+  }
+  .rows thead:has(+ tbody:empty) {
+    display: none;
+  }
+  .cart :global(.remove) {
+    width: 2rem;
+    height: 2rem;
+    background: none;
+    border: 0;
+    border-radius: var(--radius-control);
+    color: var(--text-muted);
+    font-size: 1.25rem;
+    cursor: pointer;
+  }
+  .cart :global(.remove:hover) {
+    background: var(--color-primary-tint);
+    color: var(--status-error-text);
+  }
+  .empty {
+    color: var(--text-muted);
+  }
+  .empty[hidden] {
+    display: none;
+  }
+  .notice-slot {
+    padding: var(--space-3);
+    border-radius: var(--radius-control);
+    font-size: var(--text-sm);
+  }
+  .notice-slot[hidden] {
+    display: none;
+  }
+  .notice-slot.error {
+    background: color-mix(in srgb, var(--status-error) 10%, var(--bg-app));
+    color: var(--status-error-text);
+  }
+  .notice-slot.warning {
+    background: color-mix(in srgb, var(--status-warning, #b45309) 12%, var(--bg-app));
+  }
+  .notice-slot :global(ul) {
+    margin: var(--space-1) 0 0;
+    padding-inline-start: var(--space-4);
+  }
+  .locked {
+    display: grid;
+  }
+  .notes {
+    min-height: 4rem;
+    padding: var(--space-2) var(--space-3);
+  }
+  /* While a change is priced: the old numbers aren't shown as if they were right */
+  .cart.pricing .totals dd,
+  .cart.pricing :global([data-line]) {
+    color: transparent;
+    border-radius: var(--radius-control);
+    background: color-mix(in srgb, var(--text-muted) 18%, transparent);
+    animation: pricing 1.2s ease-in-out infinite alternate;
+  }
+  @keyframes pricing {
+    to {
+      background: color-mix(in srgb, var(--text-muted) 8%, transparent);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .cart.pricing .totals dd,
+    .cart.pricing :global([data-line]) {
+      animation: none;
+    }
+  }
+  .totals {
+    display: grid;
+    gap: var(--space-1);
+    margin: 0;
+    padding-top: var(--space-3);
+    border-top: 1px solid var(--border-subtle);
+  }
+  .totals div {
+    display: flex;
+    justify-content: space-between;
+    gap: var(--space-3);
+  }
+  .totals dd {
+    margin: 0;
+  }
+  .totals .grand {
+    font-size: var(--text-xl, 1.5rem);
+    font-weight: var(--weight-bold);
+    color: var(--text-title);
+  }
+  .totals.small {
+    border-top: 0;
+    padding-top: 0;
+  }
+  .totals .change {
+    font-weight: var(--weight-bold);
+  }
+  .side :global(.charge) {
+    width: 100%;
+    min-height: 3rem;
+    font-size: var(--text-lg);
+  }
+  .charge-total {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: var(--space-4);
+    font-size: var(--text-lg);
+  }
+  .charge-total strong {
+    font-size: var(--text-2xl, 2rem);
+    color: var(--text-title);
+  }
+  .methods {
+    display: grid;
+    gap: var(--space-3);
+    margin-bottom: var(--space-4);
+  }
+  .method {
+    display: grid;
+    grid-template-columns: 8rem minmax(0, 1fr);
+    align-items: center;
+    gap: var(--space-2);
+  }
+  .method-name {
+    font-weight: var(--weight-bold);
+  }
+  .method .ref,
+  .method .quick,
+  .method .ch-customer {
+    grid-column: 2;
+  }
+  .quick {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-1);
+  }
+  .ch-customer {
+    display: grid;
+    gap: var(--space-1);
+  }
+  .ch-customer[hidden] {
+    display: none;
+  }
+  .quick:empty {
+    display: none;
+  }
+  .cart :global(.quick-btn) {
+    padding: var(--space-1) var(--space-2);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-control);
+    color: var(--color-primary);
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
+    cursor: pointer;
+  }
+  .cart :global(.quick-btn:hover) {
+    border-color: var(--color-primary);
+  }
+  .reserve-all {
+    margin-bottom: var(--space-2);
+    padding: var(--space-3);
+    background: var(--bg-surface);
+    border-radius: var(--radius-control);
+  }
+  .warn {
+    margin: var(--space-2) 0;
+    color: var(--status-error-text);
+    font-size: var(--text-sm);
+  }
+  .warn[hidden] {
+    display: none;
+  }
+  @media (max-width: 64rem) {
+    .cart {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .side {
+      position: static;
+    }
+  }
+  .cart :global(.hint.list) {
+    color: var(--color-primary);
+    font-weight: var(--weight-medium);
+  }
+  .cart :global(.use-package) {
+    color: var(--color-primary);
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
+  }
+</style>

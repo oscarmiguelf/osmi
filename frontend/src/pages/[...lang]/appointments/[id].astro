@@ -1,0 +1,452 @@
+---
+// One appointment: confirm, attend, no-show, reschedule (with the reason), cancel (with the reason), edit,
+// follow-up notes and everything that happened to it.
+import AppLayout from '@/layouts/AppLayout.astro';
+import Badge from '@/components/ui/Badge.astro';
+import Button from '@/components/ui/Button.astro';
+import Card from '@/components/ui/Card.astro';
+import Dialog from '@/components/ui/Dialog.astro';
+import Field from '@/components/ui/Field.astro';
+import Notice from '@/components/ui/Notice.astro';
+import Timeline from '@/components/ui/Timeline.astro';
+import ServicePicker from '@/components/appointments/ServicePicker.astro';
+import { fmt, getLocale, localePath, money, useTranslations } from '@/i18n';
+import { ApiError } from '@/lib/api';
+import {
+  addAppointmentNote, appointmentAction, appointmentErrorText, appointmentStaff, bookableServices, cancelAppointment, getAppointment, OPEN_STATUSES,
+  rescheduleAppointment, updateAppointment, type Appointment,
+} from '@/lib/appointments';
+import { formatPhone } from '@/lib/customers';
+import { extraErrors as extraErrorsOf, listFields, readExtra, showExtra } from '@/lib/customFields';
+import ExtraFields from '@/components/ui/ExtraFields.astro';
+import { setFlash, takeFlash } from '@/lib/session';
+import { makeAppointmentSale, quoteFromAppointment, reminderLink } from '@/lib/appointments';
+import AbonoDialog from '@/components/sales/AbonoDialog.astro';
+import { listPaymentMethods } from '@/lib/cash';
+import { saleErrorText } from '@/lib/sales';
+import { localInputToInstant, toLocalInput } from '@/lib/time';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const ap = t.appointments;
+const { session, accessToken, branch } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'appointments')?.permissions ?? [];
+if (!perms.includes('read') || !branch) return Astro.rewrite('/404');
+const id = Astro.params.id!;
+const selfPath = localePath(locale, `/appointments/${id}`);
+const tz = session.user.timezone;
+const canUpdate = perms.includes('update');
+const canCancel = perms.includes('delete');
+const canQuote = canUpdate && session.modules.some((m) => m.code === 'quotes' && m.permissions.includes('create'));
+const salesPerms = session.modules.find((m) => m.code === 'sales')?.permissions ?? [];
+const canMakeSale = canUpdate && salesPerms.includes('create');
+const canPay = salesPerms.includes('update');
+
+let appointment: Appointment;
+try {
+  appointment = await getAppointment(accessToken, branch.id, id);
+} catch (e) {
+  if (e instanceof ApiError && (e.status === 404 || e.status === 422)) return Astro.rewrite('/404');
+  throw e;
+}
+const minutes = Temporal.Instant.from(appointment.starts_at).until(Temporal.Instant.from(appointment.ends_at)).total('minutes');
+
+const fields = await listFields(accessToken, 'appointment');
+let errors: Record<string, string> = {};
+let extraErrs: Record<string, string> = {};
+let openDialog: string | undefined;
+let edit = { title: appointment.title, notes: appointment.notes ?? '', assigned_to: appointment.assigned_id ?? '', extra: appointment.extra ?? {} };
+let move = { start: toLocalInput(appointment.starts_at, tz), duration: String(minutes), reason: '' };
+let cancelReason = '';
+let note = '';
+if (Astro.request.method === 'POST') {
+  const data = await Astro.request.formData();
+  const intent = String(data.get('intent'));
+  const v = (k: string) => String(data.get(k) ?? '').trim();
+  try {
+    let after: Appointment | undefined;
+    if (['confirm', 'complete', 'no-show'].includes(intent) && canUpdate) {
+      after = await appointmentAction(accessToken, branch.id, id, intent as 'confirm' | 'complete' | 'no-show');
+    } else if (intent === 'reschedule' && canUpdate) {
+      move = { start: v('start'), duration: v('duration'), reason: v('reason') };
+      openDialog = 'reschedule';
+      const starts = Temporal.Instant.from(localInputToInstant(move.start, tz));
+      await rescheduleAppointment(accessToken, branch.id, id, {
+        starts_at: starts.toString(), ends_at: starts.add({ minutes: Number(move.duration) || minutes }).toString(), reason: move.reason || null,
+      });
+    } else if (intent === 'cancel' && canCancel) {
+      cancelReason = v('reason');
+      openDialog = 'cancel';
+      if (!cancelReason) throw new ApiError(422, { detail: { field: 'reason' } });
+      after = await cancelAppointment(accessToken, branch.id, id, cancelReason);
+    } else if (intent === 'edit' && canUpdate) {
+      edit = { title: v('title'), notes: v('notes'), assigned_to: v('assigned_to'), extra: readExtra(data, fields) };
+      openDialog = 'edit';
+      await updateAppointment(accessToken, branch.id, id, { title: edit.title, notes: edit.notes || null, assigned_to: edit.assigned_to || null,
+        ...(fields.length > 0 && { extra: edit.extra }) });
+    } else if (intent === 'services' && canUpdate) {
+      openDialog = 'services';
+      await updateAppointment(accessToken, branch.id, id, { services: data.getAll('service').map((product_id) => ({ product_id: String(product_id) })) });
+    } else if (intent === 'sale' && canMakeSale) {
+      await makeAppointmentSale(accessToken, branch.id, id);
+      setFlash(Astro.cookies, { done: 'sale', open_abono: '1' });
+      return Astro.redirect(selfPath, 303);
+    } else if (intent === 'quote' && canQuote) {
+      await quoteFromAppointment(accessToken, branch.id, id);
+    } else if (intent === 'note' && canUpdate) {
+      note = v('note');
+      if (!note) throw new ApiError(422, { detail: { field: 'note' } });
+      await addAppointmentNote(accessToken, branch.id, id, note);
+      note = '';
+    }
+    // Cancelled / missed: what's left with its sale (deposits to refund, or it couldn't go back without a register)
+    setFlash(Astro.cookies, { done: intent, ...(after?.sale_followup && { followup: after.sale_followup }) });
+    return Astro.redirect(selfPath, 303);
+  } catch (e) {
+    if (e instanceof RangeError) errors[intent] = ap.errors.start;
+    else if (!(e instanceof ApiError)) throw e;
+    else if (e.body?.detail?.field === 'extra') {
+      errors[intent] = ap.errors.extra;
+      extraErrs = extraErrorsOf(e.body.detail, t.customers.extraErrors);
+    } else if (intent === 'sale') errors.sale = saleErrorText(e.status, e.body?.detail, t).text; // e.g. occupy a register first
+    else errors[intent] = intent === 'note' ? ap.errors.note : appointmentErrorText(e.status, e.body?.detail, ap.errors, t.ui.failed);
+  }
+  Astro.response.status = 422;
+}
+
+const staff = canUpdate ? await appointmentStaff(accessToken, branch.id) : [];
+const services = appointment.services ?? [];
+// With payments on its sale, its services are adjusted from the sale; before that, changing them remakes the sale
+const unpaid = !appointment.sale_id || Number(appointment.sale_balance) === Number(appointment.sale_total);
+const offered = canUpdate && OPEN_STATUSES.includes(appointment.status) && unpaid ? await bookableServices(accessToken) : [];
+const servicesTotal = services.reduce((sum, sv) => sum + Number(sv.price) * Number(sv.quantity), 0);
+// Charge it at the point of sale: with sales.create, not charged yet, not cancelled or missed
+const canCharge = !appointment.sale_id && !['CANCELLED', 'NO_SHOW'].includes(appointment.status)
+  && session.modules.some((m) => m.code === 'sales' && m.permissions.includes('create'));
+// A clinic writes the consultation note from the appointment (it opens the existing one if already written)
+const canNote = session.business_type === 'health' && appointment.status !== 'CANCELLED'
+  && session.modules.some((m) => m.code === 'clinical' && m.permissions.includes('create'));
+// Charged before it started (a deposit): what was paid and what's still owed
+const saleTotal = Number(appointment.sale_total ?? 0);
+const balance = Number(appointment.sale_balance ?? 0);
+const balanceLink = balance > 0 && appointment.customer_phone ? reminderLink(appointment.customer_phone, fmt(ap.balanceText, {
+  cliente: appointment.customer.split(' ')[0], paciente: appointment.customer.split(' ')[0],
+  fecha: new Intl.DateTimeFormat(t.intl, { dateStyle: 'long', timeZone: tz }).format(new Date(appointment.starts_at)), saldo: money(locale, balance),
+})) : null;
+const quoteOpen = appointment.quote_status === 'OPEN' && !appointment.quote_expired;
+const payMethods = balance > 0 && canPay ? (await listPaymentMethods(accessToken)).filter((m) => !m.is_credit) : [];
+// Its sale wasn't made at booking (no register...): made from here
+const needsSale = !appointment.sale_id && services.length > 0 && OPEN_STATUSES.includes(appointment.status);
+const filledExtra = fields.filter((f) => appointment.extra?.[f.id] !== undefined && appointment.extra?.[f.id] !== '');
+const flash = takeFlash(Astro.cookies);
+const open = OPEN_STATUSES.includes(appointment.status);
+const when = new Intl.DateTimeFormat(t.intl, { dateStyle: 'medium', timeStyle: 'short', timeZone: tz });
+const fullDay = new Intl.DateTimeFormat(t.intl, { dateStyle: 'full', timeZone: tz });
+const hour = new Intl.DateTimeFormat(t.intl, { timeStyle: 'short', timeZone: tz });
+const tone = { SCHEDULED: 'accent', CONFIRMED: 'success', COMPLETED: 'neutral', NO_SHOW: 'warning', CANCELLED: 'error' } as const;
+const DURATIONS = [15, 30, 45, 60, 90, 120];
+const durationLabel = (m: number) => (m < 60 ? fmt(ap.minutes, { n: m }) : fmt(ap.hours, { n: m / 60 }));
+const timeline = (appointment.history ?? []).map((h) => ({
+  title: h.action === 'CREATED' ? fmt(ap.events.created, { status: ap.statuses[h.to_status!] })
+    : h.action === 'RESCHEDULED' ? fmt(ap.events.rescheduled, { from: when.format(new Date(h.from_starts_at!)), to: when.format(new Date(h.to_starts_at!)) })
+      + (h.reason ? ` — ${h.reason}` : '')
+    : h.action === 'STATUS' ? ap.statusEvents[h.to_status!] + (h.reason ? ` — ${h.reason}` : '')
+    : fmt(ap.events.updated, { fields: (h.changed_fields ?? []).map((f) => ap.fields[f] ?? f).join(', ') }),
+  meta: `${h.changed_by}, ${when.format(new Date(h.changed_at))}`,
+}));
+const doneText: Record<string, string> = { ...ap.done, services: ap.servicesSaved, quote: ap.quoteMade, sale: ap.saleMade };
+---
+
+<AppLayout title={`${appointment.customer} · ${appointment.title}`} current="/appointments">
+  <a class="ui-back" href={`${localePath(locale, '/appointments')}?month=${appointment.starts_at.slice(0, 7)}`}>← {ap.back}</a>
+  <header class="ui-header">
+    <div>
+      <h1>{appointment.title}</h1>
+      <p class="ui-sub">
+        <a href={localePath(locale, `/customers/${appointment.customer_id}`)}>{appointment.customer}</a>
+        {' '}<Badge tone={tone[appointment.status]}>{ap.statuses[appointment.status]}</Badge>
+        {appointment.sale_id && (balance > 0 ? <Badge tone="warning">{fmt(ap.depositBadge, { amount: money(locale, balance) })}</Badge> : <Badge tone="success">{ap.charged}</Badge>)}
+        {appointment.reschedule_count > 0 && <Badge>{fmt(ap.rescheduledTimes, { n: appointment.reschedule_count })}</Badge>}
+      </p>
+    </div>
+    {(open || canCharge || canNote || needsSale) && (
+      <div class="ui-actions">
+        {canNote && (
+          <form method="post" action={localePath(locale, `/clinical/patients/${appointment.customer_id}`)}>
+            <input type="hidden" name="intent" value="note" /><input type="hidden" name="appointment_id" value={id} />
+            <Button type="submit" variant="secondary" icon="stethoscope">{t.clinical.fromAppointment}</Button>
+          </form>
+        )}
+        {canMakeSale && needsSale && (
+          <form method="post"><input type="hidden" name="intent" value="sale" /><Button type="submit" icon="receipt">{ap.makeSale}</Button></form>
+        )}
+        {canCharge && !needsSale && (quoteOpen
+          ? <Button icon="banknote" href={`${localePath(locale, '/sales/new')}?quote=${appointment.quote_id}`}>{ap.chargeQuote}</Button>
+          : <Button icon="banknote" href={`${localePath(locale, '/sales/new')}?appointment=${id}`}>{ap.charge}</Button>)}
+        {open && canUpdate && appointment.status === 'SCHEDULED' && (
+          <form method="post"><input type="hidden" name="intent" value="confirm" /><Button type="submit" variant="secondary" icon="check">{ap.confirm}</Button></form>
+        )}
+        {open && canUpdate && <Button variant="secondary" icon="calendar-clock" data-dialog="reschedule">{ap.reschedule}</Button>}
+        {open && canCancel && <Button variant="danger" icon="calendar-x" data-dialog="cancel">{ap.cancel}</Button>}
+      </div>
+    )}
+  </header>
+
+  <div class="ui-notices">
+    {flash.done && flash.done !== 'cancel' && <Notice tone={flash.done === 'cancel' || flash.done === 'no-show' ? 'warning' : 'success'}>{doneText[flash.done] ?? t.ui.saved}</Notice>}
+    {flash.created && <Notice>{ap.created}</Notice>}
+    {flash.paid && <Notice tone="success">{flash.paid}</Notice>}
+    {needsSale && flash.pending && <Notice tone="warning">{fmt(ap.salePending, { reason: ap.salePendingReasons[flash.pending] ?? '' })}</Notice>}
+    {flash.followup === 'has_payments' && appointment.sale_id && (
+      <Notice tone="warning">{ap.followupPayments} <a href={localePath(locale, `/sales/${appointment.sale_id}/return`)}>{ap.followupReturn}</a></Notice>
+    )}
+    {flash.followup && flash.followup !== 'has_payments' && <Notice tone="warning">{ap.followupRegister}</Notice>}
+    {Object.entries(errors).filter(([k]) => ['confirm', 'complete', 'no-show', 'quote', 'sale'].includes(k)).map(([, msg]) => <Notice tone="error">{msg}</Notice>)}
+    {appointment.status === 'CANCELLED' && appointment.cancel_reason && <Notice tone="warning">{fmt(ap.cancelledBecause, { reason: appointment.cancel_reason })}</Notice>}
+  </div>
+
+  <div class="layout">
+    <div class="main">
+      <Card title={ap.details}>
+        <dl class="ui-rows">
+          <div><dt>{ap.when}</dt><dd>{fullDay.format(new Date(appointment.starts_at))}, <span class="num">{hour.format(new Date(appointment.starts_at))}–{hour.format(new Date(appointment.ends_at))}</span></dd></div>
+          <div><dt>{ap.customer}</dt><dd><a href={localePath(locale, `/customers/${appointment.customer_id}`)}>{appointment.customer}</a>{appointment.customer_phone && <span class="ui-line2 num">{formatPhone(appointment.customer_phone)}</span>}</dd></div>
+          <div><dt>{ap.assignedTo}</dt><dd>{appointment.assigned_to ?? '—'}</dd></div>
+          <div><dt>{ap.scheduledBy}</dt><dd>{appointment.created_by}</dd></div>
+        </dl>
+        {appointment.notes && <p class="notes">{appointment.notes}</p>}
+        {filledExtra.length > 0 && (
+          <dl class="ui-rows extra">
+            {filledExtra.map((f) => <div><dt>{f.label}</dt><dd>{showExtra(f, appointment.extra?.[f.id], t.intl, t.ui.yes, 'No')}</dd></div>)}
+          </dl>
+        )}
+        {open && canUpdate && (
+          <div class="card-actions">
+            <form method="post"><input type="hidden" name="intent" value="complete" /><Button type="submit" icon="user-check">{ap.complete}</Button></form>
+            <form method="post" data-confirm={ap.noShowText} data-confirm-title={ap.noShowTitle} data-confirm-action={ap.noShow}>
+              <input type="hidden" name="intent" value="no-show" /><Button type="submit" variant="secondary" icon="user-x">{ap.noShow}</Button>
+            </form>
+            <Button variant="tertiary" icon="pencil" data-dialog="edit">{t.ui.edit}</Button>
+          </div>
+        )}
+      </Card>
+
+      <Card title={ap.services}>
+        {appointment.sale_id && (
+          <div class="payment">
+            <p class="ui-small"><a href={localePath(locale, `/sales/${appointment.sale_id}`)}>{fmt(ap.chargedIn, { folio: appointment.sale_folio ?? '' })}</a></p>
+            <dl class="ui-rows">
+              <div><dt>{ap.paid}</dt><dd class="num">{money(locale, saleTotal - balance)}</dd></div>
+              <div class:list={['total', { owed: balance > 0 }]}><dt>{balance > 0 ? ap.balance : ap.paidFull}</dt><dd class="num">{money(locale, balance)}</dd></div>
+            </dl>
+            {balance > 0 && (
+              <div class="card-actions">
+                {canPay && <Button variant="secondary" icon="hand-coins" data-dialog="abono">{ap.payBalance}</Button>}
+                {balanceLink && <Button variant="tertiary" icon="message-circle" href={balanceLink} target="_blank" rel="noopener">{ap.remindBalance}</Button>}
+              </div>
+            )}
+          </div>
+        )}
+        {services.length === 0 ? <p class="ui-muted ui-small">{ap.noServices}</p> : (
+          <dl class="ui-rows">
+            {services.map((sv) => (
+              <div><dt>{sv.product}{sv.duration_minutes && <span class="ui-line2">{fmt(t.products.minutes, { n: sv.duration_minutes })}</span>}</dt>
+                <dd class="num">{money(locale, Number(sv.price) * Number(sv.quantity))}</dd></div>
+            ))}
+            <div class="total"><dt>{ap.servicesTotal}</dt><dd class="num">{money(locale, servicesTotal)}</dd></div>
+          </dl>
+        )}
+        {appointment.quote_id && (
+          <p class="ui-small quote-line">
+            <a href={localePath(locale, `/quotes/${appointment.quote_id}`)}>{fmt(ap.quoteLine, { folio: appointment.quote_folio ?? '' })}</a>
+            {' · '}{money(locale, Number(appointment.quote_total))}{' '}
+            <Badge tone={quoteOpen ? 'success' : 'neutral'}>{t.quotes.statuses[appointment.quote_expired ? 'EXPIRED' : appointment.quote_status!]}</Badge>
+          </p>
+        )}
+        <div class="card-actions">
+          {offered.length > 0 && <Button variant="tertiary" icon="pencil" data-dialog="services">{ap.editServices}</Button>}
+          {canQuote && open && !appointment.quote_id && !appointment.sale_id && services.length > 0 && (
+            <form method="post"><input type="hidden" name="intent" value="quote" />
+              <Button type="submit" variant="secondary" icon="file-text">{ap.makeQuote}</Button></form>
+          )}
+        </div>
+      </Card>
+
+      <Card title={ap.followUp}>
+        {canUpdate && (
+          <form method="post" class="note-form">
+            <input type="hidden" name="intent" value="note" />
+            <Field label={ap.newNote} name="note" as="textarea" rows={3} value={note} maxlength={5000} error={errors.note} hint={errors.note ? undefined : ap.noteHint} />
+            <Button type="submit" variant="secondary" icon="message-square-plus">{ap.addNote}</Button>
+          </form>
+        )}
+        {(appointment.follow_up ?? []).length === 0 ? <p class="ui-muted">{ap.noNotes}</p> : (
+          <ol class="notes-list" role="list">
+            {appointment.follow_up!.map((n) => (
+              <li><p class="note-text">{n.note}</p><p class="ui-muted ui-small">{n.created_by ?? '—'}, {when.format(new Date(n.created_at))}</p></li>
+            ))}
+          </ol>
+        )}
+      </Card>
+    </div>
+
+    <Card title={t.ui.history}>
+      <Timeline items={timeline} />
+    </Card>
+  </div>
+
+  {open && canUpdate && (
+    <Dialog id="reschedule" title={ap.reschedule} closeLabel={t.ui.close} open={openDialog === 'reschedule'}>
+      <form method="post" class="ui-form" novalidate>
+        {errors.reschedule && <p class="ui-alert ui-full" role="alert">{errors.reschedule}</p>}
+        <input type="hidden" name="intent" value="reschedule" />
+        <p class="ui-full ui-muted ui-small">{fmt(ap.rescheduleHint, { when: when.format(new Date(appointment.starts_at)) })}</p>
+        <Field label={ap.newStart} name="start" type="datetime-local" value={move.start} required id="move-start" />
+        <Field label={ap.duration} name="duration" as="select" id="move-duration">
+          {[...new Set([...DURATIONS, minutes])].sort((a, b) => a - b).map((m) => <option value={m} selected={String(m) === move.duration}>{durationLabel(m)}</option>)}
+        </Field>
+        <div class="ui-full"><Field label={ap.rescheduleReason} name="reason" value={move.reason} maxlength={500} id="move-reason" /></div>
+        <div class="ui-form-actions">
+          <Button variant="tertiary" data-dialog-close>{t.ui.cancel}</Button>
+          <Button type="submit" icon="calendar-clock">{ap.reschedule}</Button>
+        </div>
+      </form>
+    </Dialog>
+  )}
+  {open && canCancel && (
+    <Dialog id="cancel" title={ap.cancelTitle} closeLabel={t.ui.close} open={openDialog === 'cancel'}>
+      <form method="post" class="ui-form" novalidate>
+        {errors.cancel && <p class="ui-alert ui-full" role="alert">{errors.cancel}</p>}
+        <input type="hidden" name="intent" value="cancel" />
+        <p class="ui-full ui-muted ui-small">{ap.cancelText}</p>
+        <div class="ui-full"><Field label={ap.cancelReason} name="reason" value={cancelReason} required maxlength={500} id="cancel-reason" /></div>
+        <div class="ui-form-actions">
+          <Button variant="tertiary" data-dialog-close>{ap.keep}</Button>
+          <Button type="submit" variant="danger" icon="calendar-x">{ap.cancel}</Button>
+        </div>
+      </form>
+    </Dialog>
+  )}
+  {open && canUpdate && (
+    <Dialog id="edit" title={t.ui.edit} closeLabel={t.ui.close} open={openDialog === 'edit'}>
+      <form method="post" class="ui-form" novalidate>
+        {errors.edit && <p class="ui-alert ui-full" role="alert">{errors.edit}</p>}
+        <input type="hidden" name="intent" value="edit" />
+        <div class="ui-full"><Field label={ap.reason} name="title" value={edit.title} required maxlength={200} id="ed-title" /></div>
+        <div class="ui-full">
+          <Field label={ap.assignedTo} name="assigned_to" as="select" id="ed-assigned">
+            <option value="">{ap.nobody}</option>
+            {staff.map((s) => <option value={s.id} selected={s.id === edit.assigned_to}>{s.name ?? s.email}</option>)}
+          </Field>
+        </div>
+        <ExtraFields fields={fields} values={edit.extra} errors={extraErrs} title={ap.extraTitle} idPrefix="ed-extra" />
+        <div class="ui-full"><Field label={ap.notes} name="notes" as="textarea" rows={3} value={edit.notes} maxlength={5000} id="ed-notes" /></div>
+        <p class="ui-full ui-muted ui-small">{ap.editHint}</p>
+        <div class="ui-form-actions">
+          <Button variant="tertiary" data-dialog-close>{t.ui.cancel}</Button>
+          <Button type="submit">{t.ui.saveChanges}</Button>
+        </div>
+      </form>
+    </Dialog>
+  )}
+  {offered.length > 0 && (
+    <Dialog id="services" title={ap.editServices} closeLabel={t.ui.close} open={openDialog === 'services'}>
+      <form method="post" class="ui-form">
+        <input type="hidden" name="intent" value="services" />
+        {errors.services && <p class="ui-alert ui-full" role="alert">{errors.services}</p>}
+        <div class="ui-full">
+          <ServicePicker locale={locale} id="edit-services" services={offered} selected={services.map((x) => x.product_id)} />
+        </div>
+        <div class="ui-form-actions">
+          <Button variant="tertiary" data-dialog-close>{t.ui.cancel}</Button>
+          <Button type="submit">{t.ui.saveChanges}</Button>
+        </div>
+      </form>
+    </Dialog>
+  )}
+  {payMethods.length > 0 && appointment.sale_id && (
+    <AbonoDialog locale={locale} saleId={appointment.sale_id} balance={balance} methods={payMethods} back={selfPath}
+      open={!!flash.created || !!flash.open_abono} error={flash.pay_error} />
+  )}
+</AppLayout>
+
+<style>
+  .layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 22rem);
+    align-items: start;
+    gap: var(--space-4);
+  }
+  .main {
+    display: grid;
+    gap: var(--space-4);
+  }
+  .notes {
+    margin-top: var(--space-3);
+    white-space: pre-line;
+  }
+  .card-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    margin-top: var(--space-4);
+  }
+  .note-form {
+    display: grid;
+    gap: var(--space-2);
+    justify-items: start;
+    margin-bottom: var(--space-4);
+  }
+  .note-form > :global(.field) {
+    width: 100%;
+  }
+  .notes-list {
+    display: grid;
+    gap: var(--space-3);
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .notes-list li {
+    padding: var(--space-3);
+    background: var(--bg-app);
+    border-inline-start: 3px solid var(--color-primary);
+    border-radius: var(--radius-control);
+  }
+  .note-text {
+    margin: 0 0 var(--space-1);
+    white-space: pre-line;
+  }
+  @media (max-width: 60rem) {
+    .layout {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+  .total {
+    font-weight: var(--weight-bold);
+  }
+  .owed dd {
+    color: var(--status-warning-text);
+  }
+  .extra {
+    margin-top: var(--space-3);
+    padding-top: var(--space-3);
+    border-top: 1px solid var(--border-subtle);
+  }
+  .payment {
+    display: grid;
+    gap: var(--space-2);
+    margin-bottom: var(--space-3);
+    padding-bottom: var(--space-3);
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .payment p {
+    margin: 0;
+  }
+  .card-actions:empty {
+    display: none;
+  }
+  .quote-line {
+    margin: var(--space-3) 0 0;
+  }
+</style>

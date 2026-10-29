@@ -1,0 +1,159 @@
+---
+// One price list: its name and percent, and its prices by product and quantity ("from 12 pieces, $85").
+import AppLayout from '@/layouts/AppLayout.astro';
+import Button from '@/components/ui/Button.astro';
+import Card from '@/components/ui/Card.astro';
+import Field from '@/components/ui/Field.astro';
+import Notice from '@/components/ui/Notice.astro';
+import SearchPicker from '@/components/ui/SearchPicker.astro';
+import { fmt, getLocale, localePath, money, useTranslations } from '@/i18n';
+import { ApiError } from '@/lib/api';
+import { getPriceList, setPriceListItems, updatePriceList, type PriceListDetail } from '@/lib/priceLists';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const pl = t.priceLists;
+const { session, accessToken } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'products')?.permissions ?? [];
+if (!perms.includes('read')) return Astro.rewrite('/404');
+const canManage = perms.includes('prices');
+const id = Astro.params.id!;
+const selfPath = localePath(locale, `/products/price-lists/${id}`);
+
+let plist: PriceListDetail;
+try {
+  plist = await getPriceList(accessToken, id);
+} catch (e) {
+  if (e instanceof ApiError && (e.status === 404 || e.status === 422)) return Astro.rewrite('/404');
+  throw e;
+}
+
+let error: string | undefined;
+if (Astro.request.method === 'POST' && canManage) {
+  const data = await Astro.request.formData();
+  try {
+    if (data.get('intent') === 'items') {
+      const products = data.getAll('item_product').map(String);
+      const mins = data.getAll('item_min').map(String);
+      const prices = data.getAll('item_price').map(String);
+      await setPriceListItems(accessToken, id, products.map((product_id, n) => ({ product_id, min_quantity: mins[n] || '1', price: prices[n] || '0' })));
+    } else {
+      await updatePriceList(accessToken, id, { name: String(data.get('name') ?? '').trim(), percent: String(data.get('percent') ?? '').trim() || '0' });
+    }
+    return Astro.redirect(`${selfPath}?saved=1`, 303);
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    const d = e.body?.detail;
+    error = e.status === 409 ? pl.nameTaken : d?.field === 'items' ? pl.itemsInvalid : e.status === 422 ? t.ui.formError : t.ui.failed;
+  }
+  Astro.response.status = 422;
+}
+---
+
+<AppLayout title={plist.name} current="/products">
+  <a class="ui-back" href={localePath(locale, '/products/price-lists')}>← {pl.title}</a>
+  <header class="ui-header"><div><h1>{plist.name}</h1><p class="ui-sub">{fmt(pl.usedBy, { n: plist.customers })}</p></div></header>
+  <div class="ui-notices" data-flash={Astro.url.searchParams.has('saved') ? '' : undefined}>
+    {Astro.url.searchParams.has('saved') && <Notice>{t.ui.saved}</Notice>}
+    {error && <Notice tone="error">{error}</Notice>}
+  </div>
+
+  <Card title={pl.general}>
+    <form method="post" class="ui-form" novalidate>
+      <Field label={pl.name} name="name" value={plist.name} maxlength={80} disabled={!canManage} />
+      <Field label={pl.percent} name="percent" type="number" step="0.01" min="-90" max="200" value={String(Number(plist.percent))} hint={pl.percentHint} disabled={!canManage} />
+      {canManage && <div class="ui-form-actions"><Button type="submit">{t.ui.saveChanges}</Button></div>}
+    </form>
+  </Card>
+
+  <Card title={pl.prices}>
+    <p class="ui-muted ui-small">{pl.pricesHint}</p>
+    <form method="post" data-items-form data-labels={JSON.stringify({ remove: t.ui.delete, from: pl.from })}>
+      <input type="hidden" name="intent" value="items" />
+      <div class="ui-table-wrap">
+        <table class="ui-table">
+          <thead><tr><th scope="col">{t.products.colProduct}</th><th scope="col" class="ui-end">{pl.general_price}</th>
+            <th scope="col" class="ui-end">{pl.minQuantity}</th><th scope="col" class="ui-end">{pl.price}</th><th scope="col"><span class="visually-hidden">{t.ui.delete}</span></th></tr></thead>
+          <tbody data-items>
+            {plist.items.map((i) => (
+              <tr>
+                <td data-label={t.products.colProduct}><input type="hidden" name="item_product" value={i.product_id} /><span class="ui-strong">{i.product}</span></td>
+                <td data-label={pl.general_price} class="ui-end num ui-muted">{money(locale, Number(i.general_price))}</td>
+                <td data-label={pl.minQuantity} class="ui-end"><input class="ui-input num small" type="number" name="item_min" min="0.001" step="any" value={Number(i.min_quantity)} disabled={!canManage} /></td>
+                <td data-label={pl.price} class="ui-end"><input class="ui-input num small" type="number" name="item_price" min="0" step="0.01" value={Number(i.price)} disabled={!canManage} /></td>
+                <td class="ui-row-action ui-end">{canManage && <button type="button" class="remove" data-remove aria-label={`${t.ui.delete}: ${i.product}`}>×</button>}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p class="ui-muted ui-small" data-empty hidden={plist.items.length > 0}>{pl.noPrices}</p>
+      {canManage && (
+        <div class="add-row">
+          <label class="ui-small" for="pl-product">{pl.addProduct}</label>
+          <SearchPicker id="pl-product" name="pick" endpoint={`/api/products?mode=sale&lang=${locale}`} placeholder={t.sales.cart.placeholder}
+            hint={pl.addHint} noResults={t.sales.cart.noResults} clearLabel={t.sales.cart.clear} />
+          <div class="ui-form-actions"><Button type="submit">{pl.savePrices}</Button></div>
+        </div>
+      )}
+    </form>
+  </Card>
+</AppLayout>
+
+<script>
+  // Prices editor: picking a product adds a row (the same product can repeat with another minimum quantity)
+  const form = document.querySelector<HTMLFormElement>('[data-items-form]');
+  if (form) {
+    const L = JSON.parse(form.dataset.labels!);
+    const body = form.querySelector<HTMLElement>('[data-items]')!;
+    const empty = form.querySelector<HTMLElement>('[data-empty]')!;
+    const fmt = new Intl.NumberFormat(document.documentElement.lang === 'en' ? 'en-US' : 'es-MX', { style: 'currency', currency: 'MXN' });
+    const wire = (tr: Element) => tr.querySelector('[data-remove]')?.addEventListener('click', () => { tr.remove(); empty.hidden = body.children.length > 0; });
+    body.querySelectorAll('tr').forEach(wire);
+    const picker = form.querySelector<HTMLElement>('[data-picker]');
+    picker?.addEventListener('picker:choose', (e) => {
+      const p = (e as CustomEvent).detail;
+      const tr = document.createElement('tr');
+      const cell = (cls = '') => { const td = document.createElement('td'); td.className = cls; return td; };
+      const name = cell(); const hidden = Object.assign(document.createElement('input'), { type: 'hidden', name: 'item_product', value: p.id });
+      const strong = Object.assign(document.createElement('span'), { className: 'ui-strong', textContent: p.title });
+      name.append(hidden, strong);
+      const general = cell('ui-end num ui-muted'); general.textContent = fmt.format(p.price);
+      const min = cell('ui-end'); min.append(Object.assign(document.createElement('input'), { className: 'ui-input num small', type: 'number', name: 'item_min', min: '0.001', step: 'any', value: '1' }));
+      const price = cell('ui-end'); price.append(Object.assign(document.createElement('input'), { className: 'ui-input num small', type: 'number', name: 'item_price', min: '0', step: '0.01', value: String(p.price) }));
+      const act = cell('ui-row-action ui-end');
+      act.append(Object.assign(document.createElement('button'), { type: 'button', className: 'remove', textContent: '×', ariaLabel: `${L.remove}: ${p.title}` }));
+      act.firstElementChild!.setAttribute('data-remove', '');
+      tr.append(name, general, min, price, act);
+      body.append(tr); wire(tr); empty.hidden = true;
+      picker.dispatchEvent(new CustomEvent('picker:set', { detail: null }));
+      (min.firstElementChild as HTMLInputElement).focus();
+    });
+  }
+  if (document.querySelector('[data-flash]')) {
+    const url = new URL(location.href);
+    url.searchParams.delete('saved');
+    history.replaceState(null, '', url);
+  }
+</script>
+
+<style>
+  .small {
+    width: 7rem;
+    text-align: end;
+  }
+  :global(.remove) {
+    width: 2rem;
+    height: 2rem;
+    background: none;
+    border: 0;
+    color: var(--text-muted);
+    font-size: 1.1rem;
+    cursor: pointer;
+  }
+  .add-row {
+    display: grid;
+    gap: var(--space-2);
+    margin-top: var(--space-3);
+  }
+</style>

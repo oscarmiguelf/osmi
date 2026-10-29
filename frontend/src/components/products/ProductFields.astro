@@ -1,0 +1,104 @@
+---
+// Product form fields, shared by "New product" and "Edit product".
+import ImagePicker from '@/components/products/ImagePicker.astro';
+import Field from '@/components/ui/Field.astro';
+import { fmt, useTranslations, type Locale } from '@/i18n';
+import type { CatalogItem } from '@/lib/products';
+
+interface Props {
+  locale: Locale;
+  values: Record<string, string>;
+  errors: Record<string, string>;
+  catalogs: { types: CatalogItem[]; units: CatalogItem[]; categories: CatalogItem[]; taxRates: CatalogItem[]; brands: CatalogItem[] };
+  /** products.prices: without it price, cost and tax are shown but can't be changed (and aren't sent) */
+  canPrice: boolean;
+  typeLocked?: boolean;
+  /** New product only, with inventory.create: name of the working branch the initial stock goes into */
+  initialStockBranch?: string;
+  /** How many images may still be added (the form must be multipart); undefined = no images field */
+  imageRoom?: number;
+}
+
+const { locale, values, errors, catalogs, canPrice, typeLocked = false, initialStockBranch, imageRoom } = Astro.props;
+const t = useTranslations(locale);
+const pr = t.products;
+const pct = (r?: number) => `${Math.round(Number(r ?? 0) * 10000) / 100}%`;
+// Business rule: a service is measured in the "Service" unit and has no brand or minimum stock
+const serviceType = catalogs.types.find((c) => c.name === 'Service')?.id;
+const serviceUnit = catalogs.units.find((c) => c.name === 'Service')?.id ?? '';
+const isService = !!serviceType && values.product_type_id === serviceType;
+// Services and kits carry no stock of their own
+const noStockTypes = catalogs.types.filter((c) => !c.tracks_stock || c.is_kit).map((c) => c.id);
+const noStock = noStockTypes.includes(values.product_type_id);
+---
+
+<div class="ui-full"><Field label={pr.name} name="name" value={values.name} error={errors.name} required maxlength={200} /></div>
+<Field label={pr.type} name="product_type_id" as="select" error={errors.product_type_id} disabled={typeLocked}
+  data-service-type={serviceType} data-no-stock-types={JSON.stringify(noStockTypes)}>
+  {catalogs.types.map((c) => <option value={c.id} selected={c.id === values.product_type_id}>{pr.typeNames[c.name] ?? c.name}</option>)}
+</Field>
+<Field label={pr.unit} name="unit_of_measure_id" as="select" error={errors.unit_of_measure_id} disabled={isService}
+  hint={pr.serviceHint} data-service-lock={serviceUnit}>
+  {catalogs.units.map((c) => <option value={c.id} selected={isService ? c.id === serviceUnit : c.id === values.unit_of_measure_id}>{pr.unitNames[c.name] ?? c.name}</option>)}
+</Field>
+<Field label={pr.category} name="category_id" as="select">
+  <option value="">{pr.noCategory}</option>
+  {catalogs.categories.map((c) => <option value={c.id} selected={c.id === values.category_id}>{c.name}</option>)}
+</Field>
+<Field label={pr.brand} name="brand_id" as="select" disabled={isService} data-service-lock="">
+  <option value="">{pr.noBrand}</option>
+  {catalogs.brands.map((c) => <option value={c.id} selected={!isService && c.id === values.brand_id}>{c.name}</option>)}
+</Field>
+<Field label={pr.barcode} name="barcode" value={values.barcode} error={errors.barcode} maxlength={50} autocomplete="off" />
+<Field label={pr.minStock} name="min_stock" type="number" step="0.001" min="0" inputmode="decimal" value={isService ? '0' : values.min_stock}
+  hint={errors.min_stock ? undefined : pr.minStockHint} error={errors.min_stock} disabled={isService} data-service-lock="0" />
+{/* A disabled control isn't posted, so these carry the forced values while the type is Service */}
+<input type="hidden" name="unit_of_measure_id" value={serviceUnit} disabled={!isService} data-service-carry />
+<input type="hidden" name="brand_id" value="" disabled={!isService} data-service-carry />
+<input type="hidden" name="min_stock" value="0" disabled={!isService} data-service-carry />
+{
+  initialStockBranch && (
+    <Field label={pr.initialStock} name="initial_stock" type="number" step="0.001" min="0" inputmode="decimal"
+      value={noStock ? '' : values.initial_stock} disabled={noStock} data-initial-stock
+      hint={errors.initial_stock ? undefined : fmt(pr.initialStockHint, { branch: initialStockBranch })} error={errors.initial_stock} />
+  )
+}
+<Field label={pr.price} name="price" type="number" step="0.01" min="0" inputmode="decimal" value={values.price} error={errors.price} disabled={!canPrice} />
+<Field label={pr.cost} name="cost" type="number" step="0.01" min="0" inputmode="decimal" value={values.cost} error={errors.cost} disabled={!canPrice} />
+<div class="ui-full">
+  <Field label={pr.taxRate} name="tax_rate_id" as="select" disabled={!canPrice} hint={canPrice ? undefined : pr.pricesLocked}>
+    {catalogs.taxRates.map((c) => <option value={c.id} selected={values.tax_rate_id ? c.id === values.tax_rate_id : c.is_default}>{c.name} ({pct(c.rate)})</option>)}
+  </Field>
+</div>
+<Field label={pr.duration} name="duration_minutes" type="number" min="5" max="720" step="5" inputmode="numeric" value={isService ? values.duration_minutes : ''}
+  disabled={!isService} hint={errors.duration_minutes ? undefined : pr.durationHint} error={errors.duration_minutes} data-service-only />
+<Field label={pr.description} name="description" as="textarea" rows={2} value={values.description} maxlength={5000} />
+{imageRoom !== undefined && imageRoom > 0 && <div class="ui-full"><ImagePicker locale={locale} room={imageRoom} /></div>}
+
+<script>
+  document.querySelectorAll<HTMLSelectElement>('[data-service-type]').forEach((type) => {
+    const form = type.form!;
+    const locked = [...form.querySelectorAll<HTMLInputElement | HTMLSelectElement>('[data-service-lock]')];
+    const carries = [...form.querySelectorAll<HTMLInputElement>('[data-service-carry]')];
+    const previous = new Map(locked.map((el) => [el, el.value]));
+    type.addEventListener('change', () => {
+      const service = type.value === type.dataset.serviceType;
+      for (const el of locked) {
+        if (service && !el.disabled) previous.set(el, el.value);
+        el.value = service ? el.dataset.serviceLock! : previous.get(el)!;
+        el.disabled = service;
+      }
+      carries.forEach((c) => (c.disabled = !service));
+      form.querySelectorAll<HTMLInputElement>('[data-service-only]').forEach((el) => {
+        el.disabled = !service; // only a service has a duration
+        if (!service) el.value = '';
+      });
+      const initial = form.querySelector<HTMLInputElement>('[data-initial-stock]');
+      if (initial) {
+        initial.disabled = (JSON.parse(type.dataset.noStockTypes!) as string[]).includes(type.value);
+        if (initial.disabled) initial.value = '';
+      }
+    });
+  });
+</script>
+

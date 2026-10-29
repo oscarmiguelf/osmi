@@ -1,0 +1,283 @@
+---
+// Owner-only: who has access to the calendar, change their permission, remove them, or add someone.
+import Button from '@/components/ui/Button.astro';
+import Dialog from '@/components/ui/Dialog.astro';
+import Icon from '@/components/ui/Icon.astro';
+import SearchPicker from '@/components/ui/SearchPicker.astro';
+import { fmt, useTranslations, type Locale } from '@/i18n';
+import type { Member } from '@/lib/calendar';
+import type { Session } from '@/lib/api';
+
+interface Props {
+  locale: Locale;
+  calendarName: string;
+  members: Member[];
+  owner: Session['user'];
+  error?: string;
+  open?: boolean;
+}
+
+const { locale, calendarName, members, owner, error, open = false } = Astro.props;
+const c = useTranslations(locale).calendar;
+const initials = (name: string) =>
+  name.split(/\s+/).slice(0, 2).map((w) => w.charAt(0).toUpperCase()).join('');
+const levels = ['edit', 'view'] as const;
+---
+
+<Dialog id="share-dialog" title={fmt(c.shareTitle, { name: calendarName })} closeLabel={c.close} open={open}>
+  {error && <p class="alert" role="alert">{error}</p>}
+
+  <form method="post" class="add">
+    <input type="hidden" name="intent" value="share" />
+    <label class="label" for="share-search">{c.addPerson}</label>
+    <div class="picker">
+      <SearchPicker
+        id="share-search"
+        name="user_id"
+        endpoint="/api/users"
+        placeholder={c.searchPlaceholder}
+        hint={c.searchHint}
+        noResults={c.noResults}
+        clearLabel={c.clearSelection}
+        requiredMessage={c.pickPerson}
+        exclude={[owner.id, ...members.map((m) => m.user_id)]}
+        focusAfter="select[name=access_level]"
+        autofocus
+      />
+      <select name="access_level" class="select" aria-label={c.accessLabel}>
+        {levels.map((level) => <option value={level}>{c.access[level]}</option>)}
+      </select>
+    </div>
+    <div class="add-actions">
+      <p class="help">{c.accessHelp}</p>
+      <Button type="submit" icon="user-plus">{c.shareAction}</Button>
+    </div>
+  </form>
+
+  <h3 class="people-title">{c.peopleWithAccess}</h3>
+  <ul class="people" role="list">
+    <li class="person">
+      <span class="avatar" aria-hidden="true">{initials(owner.name)}</span>
+      <span class="who">
+        <span class="name">{owner.name} ({c.you})</span>
+        <span class="email">{owner.email}</span>
+      </span>
+      <span class="role">{c.ownerRole}</span>
+    </li>
+    {
+      members.map((m) => (
+        <li class="person">
+          <span class="avatar" aria-hidden="true">{initials(m.name)}</span>
+          <span class="who">
+            <span class="name">{m.name}</span>
+            <span class="email">{m.email}</span>
+          </span>
+          <form method="post" data-autosubmit>
+            <input type="hidden" name="intent" value="member_level" />
+            <input type="hidden" name="user_id" value={m.user_id} />
+            <select name="access_level" class="select" aria-label={fmt(c.changeAccess, { name: m.name })}>
+              {levels.map((level) => (
+                <option value={level} selected={level === m.access_level}>
+                  {c.access[level]}
+                </option>
+              ))}
+            </select>
+          </form>
+          <form
+            method="post"
+            data-confirm={fmt(c.removeAccessText, { name: m.name })}
+            data-confirm-title={c.removeAccessTitle}
+            data-confirm-action={c.removeAccessAction}
+          >
+            <input type="hidden" name="intent" value="revoke" />
+            <input type="hidden" name="user_id" value={m.user_id} />
+            <button type="submit" class="remove" aria-label={`${c.removeAccess}: ${m.name}`}>
+              <Icon name="user-minus" size={18} />
+            </button>
+          </form>
+        </li>
+      ))
+    }
+  </ul>
+  {members.length === 0 && <p class="only-you">{c.onlyYou}</p>}
+</Dialog>
+
+<script>
+  // Permission selects save as soon as they change
+  document.querySelectorAll<HTMLFormElement>('form[data-autosubmit]').forEach((f) =>
+    f.querySelector('select')?.addEventListener('change', () => f.requestSubmit()),
+  );
+</script>
+
+<style>
+  .alert {
+    margin-bottom: var(--space-4);
+    padding: var(--space-3);
+    background: color-mix(in srgb, var(--status-error) 8%, var(--bg-app));
+    border: 1px solid var(--status-error);
+    border-radius: var(--radius-control);
+    color: var(--text-title);
+    font-size: var(--text-sm);
+  }
+
+  .add {
+    display: grid;
+    gap: var(--space-2);
+    padding-bottom: var(--space-5);
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .label {
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
+  }
+
+  .picker {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: start;
+    gap: var(--space-2);
+  }
+
+  .help {
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+  }
+
+
+
+
+
+
+
+
+
+
+
+  .select {
+    min-height: var(--control-height);
+    padding: 0 2.5rem 0 var(--space-3);
+    background-color: var(--bg-input);
+    border: 1px solid var(--border-input);
+    border-radius: var(--radius-control);
+    color: var(--text-body);
+    font-size: var(--text-sm);
+    cursor: pointer;
+  }
+
+  .select:focus-visible {
+    outline: none;
+    border-color: var(--color-primary);
+    box-shadow: 0 0 0 3px var(--focus-ring);
+  }
+
+
+
+
+
+
+
+
+
+  .add-actions {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: var(--space-4);
+    margin-top: var(--space-2);
+  }
+
+  .people-title {
+    margin: var(--space-5) 0 var(--space-3);
+    font-size: var(--text-md);
+  }
+
+  .people {
+    display: grid;
+    gap: var(--space-1);
+    padding: 0;
+    list-style: none;
+  }
+
+  .person {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    min-height: 3rem;
+  }
+
+  .avatar {
+    display: grid;
+    flex-shrink: 0;
+    place-items: center;
+    width: 2.25rem;
+    height: 2.25rem;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: 50%;
+    color: var(--color-primary);
+    font-size: var(--text-xs);
+    font-weight: var(--weight-bold);
+  }
+
+  .who {
+    display: grid;
+    flex: 1;
+    min-width: 0;
+  }
+
+  .name {
+    overflow: hidden;
+    color: var(--text-title);
+    font-weight: var(--weight-medium);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .email {
+    overflow: hidden;
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .role {
+    padding-inline: var(--space-3);
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+  }
+
+  .remove {
+    display: grid;
+    place-items: center;
+    width: var(--control-height);
+    height: var(--control-height);
+    background: none;
+    border: 0;
+    border-radius: var(--radius-control);
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+
+  .remove:hover {
+    background: color-mix(in srgb, var(--status-error) 8%, transparent);
+    color: var(--status-error-text);
+  }
+
+  .only-you {
+    margin-top: var(--space-2);
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+  }
+
+  @media (max-width: 30rem) {
+    .picker {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .add-actions {
+      flex-direction: column;
+      align-items: stretch;
+    }
+  }
+</style>

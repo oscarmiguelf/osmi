@@ -1,0 +1,277 @@
+---
+import AppLayout from '@/layouts/AppLayout.astro';
+import ProductFields from '@/components/products/ProductFields.astro';
+import Badge from '@/components/ui/Badge.astro';
+import Button from '@/components/ui/Button.astro';
+import Dialog from '@/components/ui/Dialog.astro';
+import EmptyState from '@/components/ui/EmptyState.astro';
+import Icon from '@/components/ui/Icon.astro';
+import Notice from '@/components/ui/Notice.astro';
+import { fmt, getLocale, localePath, money, useTranslations } from '@/i18n';
+import { ApiError, apiFieldErrors } from '@/lib/api';
+import {
+  createProduct, deleteProduct, imageFiles, imageUrl, listCatalog, MAX_IMAGES, productPayload, productValues, restoreProduct, searchProducts, uploadImages,
+} from '@/lib/products';
+import { setFlash } from '@/lib/session';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const pr = t.products;
+const { session, accessToken, branch } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'products')?.permissions ?? [];
+if (!perms.includes('read')) return Astro.rewrite('/404');
+const canCreate = perms.includes('create');
+const canDelete = perms.includes('delete');
+const canPrice = perms.includes('prices');
+const b = branch?.id;
+// Initial stock goes into the working branch, like any adjustment (inventory.create)
+const canInitialStock = !!b && !!session.modules.find((m) => m.code === 'inventory')?.permissions.includes('create');
+
+const params = Astro.url.searchParams;
+const filters = {
+  q: (params.get('q') ?? '').trim().slice(0, 100),
+  type_id: params.get('type_id') || undefined,
+  category_id: params.get('category_id') || undefined,
+  low_stock: params.get('low_stock') === 'on' || undefined,
+  include_deleted: params.get('deleted') === '1' || undefined,
+};
+const page = Math.max(1, Number.parseInt(params.get('page') ?? '1', 10) || 1);
+const basePath = localePath(locale, '/products');
+
+let values = productValues();
+let fieldErrors: Record<string, string> = {};
+let formError: string | undefined;
+let pageError: { text: string; items?: string[] } | undefined;
+
+const data = Astro.request.method === 'POST' ? await Astro.request.formData() : undefined;
+if (data?.get('intent') === 'delete' || data?.get('intent') === 'restore') {
+  const name = String(data.get('product_name') ?? '');
+  try {
+    if (data.get('intent') === 'delete') await deleteProduct(accessToken, String(data.get('product_id')));
+    else await restoreProduct(accessToken, String(data.get('product_id')));
+    return Astro.redirect(Astro.url.pathname + Astro.url.search, 303);
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    const blockers: Record<string, number> = e.body?.detail?.blockers ?? {};
+    pageError = e.body?.detail?.field === 'barcode' ? { text: pr.barcodeTaken }
+      : e.status === 409 ? { text: fmt(pr.blocked, { name }), items: Object.entries(blockers).map(([k, n]) => fmt(pr.blockers[k] ?? k, { n })) }
+      : { text: e.status === 403 ? t.ui.forbidden : t.ui.failed };
+  }
+} else if (data) {
+  values = { ...values, ...Object.fromEntries([...data.entries()].filter(([, v]) => typeof v === 'string').map(([k, v]) => [k, String(v)])) };
+  try {
+    const initialStock = String(data.get('initial_stock') ?? '').trim();
+    const created = await createProduct(accessToken, b, {
+      ...productPayload(data, canPrice), ...(canInitialStock && initialStock && { initial_stock: initialStock }),
+    });
+    // The product exists now: images that fail don't undo it, the detail page says which ones
+    const { uploaded, failed } = await uploadImages(accessToken, created.id, imageFiles(data), MAX_IMAGES);
+    setFlash(Astro.cookies, { created: '1', images: uploaded ? String(uploaded) : '', imagesFailed: failed.join(', ').slice(0, 300) });
+    return Astro.redirect(localePath(locale, `/products/${created.id}`), 303);
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    fieldErrors = e.status === 422 ? apiFieldErrors(e.body, pr.errors) : {};
+    if (e.body?.detail?.field === 'barcode') fieldErrors.barcode = pr.barcodeTaken;
+    if (e.body?.detail?.field === 'initial_stock') fieldErrors.initial_stock = String(e.body.detail.message).includes('whole') ? t.inventory.wholeUnits : pr.errors.initial_stock;
+    formError = Object.keys(fieldErrors).length ? t.ui.formError : e.status === 403 ? pr.pricesLocked : t.ui.failed;
+  }
+  Astro.response.status = 422;
+}
+
+const [result, types, units, categories, taxRates, brands] = await Promise.all([
+  searchProducts(accessToken, b, { ...filters, page }),
+  listCatalog(accessToken, 'product-types'),
+  listCatalog(accessToken, 'units'),
+  listCatalog(accessToken, 'categories'),
+  listCatalog(accessToken, 'tax-rates'),
+  listCatalog(accessToken, 'brands'),
+]);
+const catalogs = { types, units, categories, taxRates, brands };
+if (!values.product_type_id) values.product_type_id = types.find((x) => x.name === 'Product')?.id ?? '';
+if (!values.unit_of_measure_id) values.unit_of_measure_id = units.find((x) => x.name === 'Unit')?.id ?? '';
+const pageLink = (p: number) => {
+  const q = new URLSearchParams(params);
+  q.set('page', String(p));
+  return `${basePath}?${q}`;
+};
+const noFilters = !filters.q && !filters.type_id && !filters.category_id && !filters.low_stock;
+---
+
+<AppLayout title={pr.title} current="/products">
+  <header class="ui-header">
+    <div>
+      <h1>{pr.title}</h1>
+      <p class="ui-sub num">{result.total === 1 ? pr.countOne : fmt(pr.count, { n: result.total })}</p>
+    </div>
+    <div class="ui-actions">
+      <Button variant="secondary" icon="badge-dollar-sign" href={localePath(locale, '/products/price-lists')}>{t.priceLists.title}</Button>
+      <Button variant="secondary" icon="tags" href={localePath(locale, '/products/catalogs')}>{pr.catalogs}</Button>
+      {canCreate && <Button icon="plus" data-dialog="new-product">{pr.newProduct}</Button>}
+    </div>
+  </header>
+
+  <div class="ui-notices">
+    {pageError && (
+      <Notice tone="error">
+        {pageError.text}
+        {pageError.items && <ul class="list">{pageError.items.map((i) => <li>{i}</li>)}</ul>}
+      </Notice>
+    )}
+  </div>
+
+  <form method="get" class="ui-filters" role="search" data-filters>
+    <label class="ui-search">
+      <Icon name="search" size={18} />
+      <span class="visually-hidden">{t.ui.search}</span>
+      <input type="search" name="q" value={filters.q} placeholder={pr.searchPlaceholder} autocomplete="off" autofocus={!!filters.q} />
+    </label>
+    <select name="type_id" class="ui-select" aria-label={pr.type}>
+      <option value="">{pr.allTypes}</option>
+      {types.map((x) => <option value={x.id} selected={x.id === filters.type_id}>{pr.typeNames[x.name] ?? x.name}</option>)}
+    </select>
+    <select name="category_id" class="ui-select" aria-label={pr.category}>
+      <option value="">{pr.allCategories}</option>
+      {categories.map((x) => <option value={x.id} selected={x.id === filters.category_id}>{x.name}</option>)}
+    </select>
+    {b && <label class="ui-check"><input type="checkbox" name="low_stock" checked={!!filters.low_stock} />{pr.lowStockOnly}</label>}
+    {canDelete && <label class="ui-check"><input type="checkbox" name="deleted" value="1" checked={!!filters.include_deleted} />{t.ui.showDeleted}</label>}
+  </form>
+
+  {
+    result.items.length === 0 ? (
+      noFilters ? (
+        <EmptyState icon="package" title={pr.emptyTitle} text={pr.emptyText}>
+          {canCreate && <Button icon="plus" data-dialog="new-product">{pr.newProduct}</Button>}
+        </EmptyState>
+      ) : <p class="ui-muted">{pr.empty}</p>
+    ) : (
+      <div class="ui-table-wrap">
+        <table class="ui-table">
+          <thead>
+            <tr>
+              <th scope="col">{pr.colProduct}</th>
+              <th scope="col">{pr.colType}</th>
+              <th scope="col" class="ui-end">{pr.colPrice}</th>
+              {b && <th scope="col" class="ui-end">{pr.colStock}</th>}
+              {canDelete && <th scope="col"><span class="visually-hidden">{t.ui.delete}</span></th>}
+            </tr>
+          </thead>
+          <tbody>
+            {result.items.map((p) => (
+              <tr>
+                <td data-label={pr.colProduct}>
+                  <span class="product-cell">
+                    <span class="thumb" aria-hidden="true">
+                      {p.image_id ? <img src={imageUrl(p.id, p.image_id)} alt="" loading="lazy" /> : <Icon name="image" size={18} />}
+                    </span>
+                    <span>
+                      <a class="ui-strong" href={localePath(locale, `/products/${p.id}`)}>{p.name}</a>
+                      <span class="ui-line2">{[p.brand, p.barcode, p.category].filter(Boolean).join(', ')}</span>
+                    </span>
+                  </span>
+                </td>
+                <td data-label={pr.colType}>{p.deleted_at ? <Badge tone="error">{t.ui.deletedBadge}</Badge> : pr.typeNames[p.type] ?? p.type}</td>
+                <td data-label={pr.colPrice} class="ui-end num">{money(locale, Number(p.price))}</td>
+                {b && (
+                  <td data-label={pr.colStock} class="ui-end num">
+                    {/* Services and kits don't carry stock: the cell stays empty */}
+                    {p.tracks_stock && !p.is_kit && (
+                      <span class="stock">{Number(p.current_stock)} {pr.unitNames[p.unit] ?? p.unit}{p.is_low_stock && <Badge tone="warning">{pr.lowStock}</Badge>}</span>
+                    )}
+                  </td>
+                )}
+                {canDelete && (
+                  <td class="ui-row-action ui-end">
+                    <form method="post" data-confirm={p.deleted_at ? undefined : fmt(pr.deleteText, { name: p.name })} data-confirm-title={pr.deleteTitle} data-confirm-action={t.ui.delete}>
+                      <input type="hidden" name="intent" value={p.deleted_at ? 'restore' : 'delete'} />
+                      <input type="hidden" name="product_id" value={p.id} />
+                      <input type="hidden" name="product_name" value={p.name} />
+                      {p.deleted_at
+                        ? <Button type="submit" variant="tertiary" icon="rotate-ccw">{t.ui.restore}</Button>
+                        : <Button type="submit" variant="danger" icon="trash-2" aria-label={fmt(pr.deleteRow, { name: p.name })} />}
+                    </form>
+                  </td>
+                )}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    )
+  }
+  {
+    (page > 1 || page * 25 < result.total) && (
+      <nav class="ui-pager">
+        <span />
+        <span class="ui-actions">
+          {page > 1 && <Button variant="secondary" href={pageLink(page - 1)}>{t.ui.previous}</Button>}
+          {page * 25 < result.total && <Button variant="secondary" href={pageLink(page + 1)}>{t.ui.next}</Button>}
+        </span>
+      </nav>
+    )
+  }
+
+  {
+    canCreate && (
+      <Dialog id="new-product" title={pr.newProduct} closeLabel={t.ui.close} open={!!formError}>
+        <form method="post" class="ui-form" enctype="multipart/form-data" novalidate>
+          {formError && <p class="ui-alert" role="alert">{formError}</p>}
+          <ProductFields locale={locale} values={values} errors={fieldErrors} catalogs={catalogs} canPrice={canPrice}
+            initialStockBranch={canInitialStock ? branch?.name : undefined} imageRoom={MAX_IMAGES} />
+          <div class="ui-form-actions">
+            <Button variant="tertiary" data-dialog-close>{t.ui.cancel}</Button>
+            <Button type="submit">{pr.create}</Button>
+          </div>
+        </form>
+      </Dialog>
+    )
+  }
+</AppLayout>
+
+<script>
+  const form = document.querySelector<HTMLFormElement>('[data-filters]');
+  const input = form?.querySelector<HTMLInputElement>('input[name=q]');
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  input?.addEventListener('input', () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => form!.requestSubmit(), 350);
+  });
+  form?.querySelectorAll('select, input[type=checkbox]').forEach((el) => el.addEventListener('change', () => form.requestSubmit()));
+  if (input && document.activeElement === input) input.setSelectionRange(input.value.length, input.value.length);
+</script>
+
+<style>
+  .stock {
+    display: inline-flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    align-items: center;
+    gap: var(--space-2);
+  }
+  .list {
+    margin-top: var(--space-1);
+    padding-inline-start: var(--space-5);
+  }
+  .product-cell {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+  }
+  .thumb {
+    display: grid;
+    flex-shrink: 0;
+    place-items: center;
+    width: 2.75rem;
+    height: 2.75rem;
+    overflow: hidden;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-control);
+    color: var(--text-muted);
+  }
+  .thumb img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+</style>

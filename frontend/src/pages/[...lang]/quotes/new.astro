@@ -1,0 +1,95 @@
+---
+// New quote. ?from=<id> starts from another quote: that's how a quote is "edited" (a quote can't change once
+// saved), and the old one can be cancelled in the same step.
+import AppLayout from '@/layouts/AppLayout.astro';
+import Cart, { type CartState } from '@/components/sales/Cart.astro';
+import Button from '@/components/ui/Button.astro';
+import Notice from '@/components/ui/Notice.astro';
+import { fmt, getLocale, localePath, useTranslations } from '@/i18n';
+import { ApiError } from '@/lib/api';
+import { cancelQuote, createQuote, duplicateQuote, getQuote, saleErrorText } from '@/lib/sales';
+import { setFlash } from '@/lib/session';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const qt = t.quotes;
+const { session, accessToken, branch } = Astro.locals as Required<App.Locals>;
+const can = (module: string, p: string) => (session.modules.find((m) => m.code === module)?.permissions ?? []).includes(p);
+if (!can('quotes', 'create') || !branch) return Astro.rewrite('/404');
+const fromId = Astro.url.searchParams.get('from');
+
+let source: { id: string; folio: string; open: boolean } | undefined;
+let initial: CartState = { items: [], valid_days: 15 };
+if (fromId) {
+  try {
+    const [dup, old] = await Promise.all([duplicateQuote(accessToken, branch.id, fromId), getQuote(accessToken, branch.id, fromId)]);
+    source = { id: old.id, folio: old.folio, open: old.status === 'OPEN' && !old.is_expired };
+    initial = {
+      customer: dup.customer_id ? { id: dup.customer_id, title: dup.customer ?? '' } : null, customer_name: dup.customer_name,
+      discount: Number(dup.discount) || '', notes: dup.notes, valid_days: 15,
+      // Today's catalog prices: a new quote is a new commitment
+      items: dup.items.map((i) => ({ product_id: i.product_id, product: i.product, unit: t.products.unitNames[i.unit] ?? i.unit,
+        quantity: Number(i.quantity), unit_price: Number(i.current_price), discount: Number(i.discount) })),
+    };
+  } catch (e) {
+    if (!(e instanceof ApiError) || (e.status !== 404 && e.status !== 422)) throw e;
+  }
+}
+
+let formError: { text: string; items?: string[] } | undefined;
+if (Astro.request.method === 'POST') {
+  const data = await Astro.request.formData();
+  let body: any;
+  try {
+    body = JSON.parse(String(data.get('payload') ?? ''));
+  } catch {
+    body = undefined;
+  }
+  if (!body || !Array.isArray(body.items)) formError = { text: t.ui.failed };
+  else {
+    initial = { ...body, customer: body.customer_id ? { id: body.customer_id, title: body.customer_label ?? '' } : null };
+    try {
+      const quote = await createQuote(accessToken, branch.id, body);
+      const replaced = source?.open && data.get('replace') === 'on' && can('quotes', 'update');
+      if (replaced) await cancelQuote(accessToken, branch.id, source!.id).catch(() => undefined); // already not open: nothing to cancel
+      setFlash(Astro.cookies, { created: '1', ...(replaced && { replaced: source!.folio }), ...(quote.stock_warnings?.length && { stock: '1' }) });
+      return Astro.redirect(localePath(locale, `/quotes/${quote.id}`), 303);
+    } catch (e) {
+      if (!(e instanceof ApiError)) throw e;
+      formError = saleErrorText(e.status, e.body?.detail, t);
+    }
+  }
+  Astro.response.status = 422;
+}
+---
+
+<AppLayout title={qt.newQuote} current="/quotes">
+  <a class="ui-back" href={localePath(locale, source ? `/quotes/${source.id}` : '/quotes')}>← {source ? source.folio : qt.back}</a>
+  <header class="ui-header">
+    <div>
+      <h1>{qt.newQuote}</h1>
+      <p class="ui-sub">{source ? fmt(qt.fromQuote, { folio: source.folio }) : branch.name}</p>
+    </div>
+  </header>
+
+  <form method="post" class="page" novalidate>
+    {formError && <Notice tone="error">{formError.text}{formError.items && <ul>{formError.items.map((i) => <li>{i}</li>)}</ul>}</Notice>}
+    {source && <Notice tone="warning">{qt.currentPrices}</Notice>}
+    <Cart mode="quote" locale={locale} initial={initial}>
+      {source?.open && can('quotes', 'update') && (
+        <label class="ui-check"><input type="checkbox" name="replace" checked />{fmt(qt.replace, { folio: source.folio })}</label>
+      )}
+      <Button type="submit" icon="check" class="save">{qt.save}</Button>
+    </Cart>
+  </form>
+</AppLayout>
+
+<style>
+  .page {
+    display: grid;
+    gap: var(--space-3);
+  }
+  .page :global(.save) {
+    width: 100%;
+  }
+</style>

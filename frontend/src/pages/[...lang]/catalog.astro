@@ -1,0 +1,479 @@
+---
+// PUBLIC customer catalog (no sign-in): products with stock and services. The order is kept in the browser and sent
+// as a WhatsApp message to the number in Settings; nothing is recorded in the system.
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import Button from '@/components/ui/Button.astro';
+import Dialog from '@/components/ui/Dialog.astro';
+import Icon from '@/components/ui/Icon.astro';
+import Notice from '@/components/ui/Notice.astro';
+import { fmt, getLocale, localePath, money, useTranslations } from '@/i18n';
+import { catalogImageUrl, catalogInfo, catalogProducts } from '@/lib/publicCatalog';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const s = t.shop;
+const params = Astro.url.searchParams;
+const q = (params.get('q') ?? '').trim().slice(0, 100);
+const category = params.get('category') ?? '';
+const kind = ['products', 'services'].includes(params.get('kind') ?? '') ? params.get('kind')! : 'all';
+const page = Math.max(1, Number.parseInt(params.get('page') ?? '1', 10) || 1);
+const [info, result] = await Promise.all([
+  catalogInfo(),
+  catalogProducts({ q, category_id: /^[0-9a-f-]{36}$/i.test(category) ? category : undefined, kind, page }),
+]);
+const unit = (u: string) => t.products.unitNames[u] ?? u;
+const basePath = localePath(locale, '/catalog');
+const link = (extra: Record<string, string | number>) => {
+  const qp = new URLSearchParams(params);
+  for (const [k, v] of Object.entries(extra)) qp.set(k, String(v));
+  return `${basePath}?${qp}`;
+};
+const availabilityText = { one: s.lastOne, few: s.lastFew, plenty: s.inStock };
+---
+
+<BaseLayout title={s.title} app={false}>
+  <div class="shop" data-shop data-number={info.whatsapp_number ?? ''} data-intl={t.intl}
+    data-labels={JSON.stringify({ ...s.message, needName: s.needName, sentHint: s.sentHint, maxReached: s.maxReached, orderCount: s.orderCount,
+      less: s.less, plus: s.plus, remove: s.remove, added: s.added, add: s.add })}>
+    <header class="head">
+      <div>
+        <h1>{s.title}</h1>
+        <p class="ui-muted">{info.ordering ? s.intro : ''}</p>
+      </div>
+    </header>
+
+    {!info.ordering && <Notice tone="warning">{s.noOrdering}</Notice>}
+
+    <form method="get" class="filters" role="search">
+      <label class="search">
+        <Icon name="search" size={18} />
+        <span class="visually-hidden">{s.search}</span>
+        <input type="search" name="q" value={q} placeholder={s.search} maxlength={100} autocomplete="off" />
+      </label>
+      {info.categories.length > 0 && (
+        <select name="category" class="ui-select" aria-label={s.allCategories} data-autosubmit>
+          <option value="">{s.allCategories}</option>
+          {info.categories.map((c) => <option value={c.id} selected={c.id === category}>{c.name}</option>)}
+        </select>
+      )}
+      <select name="kind" class="ui-select" aria-label={s.kinds.all} data-autosubmit>
+        {Object.entries(s.kinds).map(([k, label]) => <option value={k} selected={k === kind}>{label}</option>)}
+      </select>
+      <Button type="submit" variant="secondary" icon="search">{t.ui.search}</Button>
+    </form>
+
+    {result.items.length === 0 ? <p class="ui-muted empty">{s.empty}</p> : (
+      <ul class="grid" role="list">
+        {result.items.map((p) => {
+          const max = p.max_order;
+          return (
+            <li class="card" data-product={JSON.stringify({ id: p.id, name: p.name, price: Number(p.price), max })}>
+              <button type="button" class="photo" disabled={p.image_ids.length === 0} aria-label={fmt(s.photosTitle, { name: p.name })}
+                data-photos={JSON.stringify(p.image_ids.map((i) => catalogImageUrl(p.id, i)))} data-photos-title={fmt(s.photosTitle, { name: p.name })}>
+                {p.image_ids.length > 0 ? <img src={catalogImageUrl(p.id, p.image_ids[0])} alt={p.name} loading="lazy" /> : <Icon name="image" size={36} />}
+                {p.image_ids.length > 1 && <span class="more-photos">{fmt(s.morePhotos, { n: p.image_ids.length - 1 })}</span>}
+              </button>
+              <div class="body">
+                <h2>{p.name}</h2>
+                {(p.brand || p.category) && <p class="meta">{[p.brand, p.category].filter(Boolean).join(' · ')}</p>}
+                {p.description && <p class="desc">{p.description}</p>}
+                <p class="price num">{money(locale, Number(p.price))} {!p.is_service && <span class="ui-muted ui-small">/ {unit(p.unit)}</span>}</p>
+                <p class:list={['ui-small', p.availability === 'plenty' || p.is_service ? 'ui-muted' : 'last']}>
+                  {p.is_service ? s.service : availabilityText[p.availability!]}
+                </p>
+                {info.ordering && <Button variant="secondary" icon="plus" class="add" data-add>{s.add}</Button>}
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+    )}
+
+    {(page > 1 || result.has_more) && (
+      <nav class="ui-pager">
+        <span />
+        <span class="ui-actions">
+          {page > 1 && <Button variant="secondary" href={link({ page: page - 1 })}>{t.ui.previous}</Button>}
+          {result.has_more && <Button variant="secondary" href={link({ page: page + 1 })}>{t.ui.next}</Button>}
+        </span>
+      </nav>
+    )}
+
+    {info.ordering && (
+      <>
+        <button type="button" class="cart-bar" data-dialog="order" data-cart-bar hidden>
+          <Icon name="shopping-bag" size={20} /><span data-cart-count></span><strong class="num" data-cart-total></strong>
+        </button>
+        <Dialog id="order" title={s.order} closeLabel={t.ui.close}>
+          <p class="ui-muted" data-empty>{s.orderEmpty}</p>
+          <ul class="lines" role="list" data-lines></ul>
+          <div class="sum" data-sum><span>{s.total}</span><strong class="num" data-total></strong></div>
+          <p class="ui-muted ui-small">{s.totalHint}</p>
+          <form class="ui-form send" data-send novalidate>
+            <label class="ui-full field-block"><span class="label">{s.name}</span><input class="ui-input" name="name" maxlength={80} autocomplete="name" /></label>
+            <label class="ui-full field-block"><span class="label">{s.note}</span><textarea class="ui-input" name="note" rows="2" maxlength={300} placeholder={s.notePlaceholder}></textarea></label>
+            <p class="ui-alert ui-full" data-send-error role="alert" hidden></p>
+            <p class="ok ui-full" data-sent role="status" hidden></p>
+            <div class="ui-form-actions">
+              <Button variant="tertiary" data-clear>{s.clear}</Button>
+              <Button type="submit" icon="send">{s.send}</Button>
+            </div>
+          </form>
+        </Dialog>
+      </>
+    )}
+    <Dialog id="photos" title="" closeLabel={t.ui.close}>
+      <div class="photos" data-photos-list></div>
+    </Dialog>
+  </div>
+</BaseLayout>
+
+<script>
+  type Line = { id: string; name: string; price: number; max: number | null; qty: number };
+  const shop = document.querySelector<HTMLElement>('[data-shop]')!;
+  const L = JSON.parse(shop.dataset.labels!);
+  const money = new Intl.NumberFormat(shop.dataset.intl, { style: 'currency', currency: 'MXN' });
+  const KEY = 'osmi-catalog-order';
+  // The order survives reloads and page changes; private windows may refuse storage (then it lasts the page)
+  let lines: Line[] = [];
+  try { lines = JSON.parse(localStorage.getItem(KEY) ?? '[]'); } catch { lines = []; }
+  const save = () => { try { localStorage.setItem(KEY, JSON.stringify(lines)); } catch { /* not kept */ } };
+  const total = () => lines.reduce((sum, l) => sum + l.price * l.qty, 0);
+  const el = <K extends keyof HTMLElementTagNameMap>(tag: K, attrs: Record<string, string> = {}, ...kids: (Node | string)[]) => {
+    const n = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, v);
+    n.append(...kids);
+    return n;
+  };
+
+  function render() {
+    const count = lines.reduce((n, l) => n + l.qty, 0);
+    const bar = shop.querySelector<HTMLElement>('[data-cart-bar]');
+    if (bar) {
+      bar.hidden = count === 0;
+      bar.querySelector('[data-cart-count]')!.textContent = L.orderCount.replace('{n}', String(count));
+      bar.querySelector('[data-cart-total]')!.textContent = money.format(total());
+    }
+    shop.querySelectorAll<HTMLElement>('[data-product]').forEach((card) => {
+      const line = lines.find((l) => l.id === JSON.parse(card.dataset.product!).id);
+      card.classList.toggle('in-order', !!line);
+      const label = card.querySelector('[data-add]')?.lastChild;
+      if (label) label.textContent = line ? `${L.added} · ${line.qty}` : L.add;
+    });
+    const list = shop.querySelector<HTMLElement>('[data-lines]');
+    if (!list) return;
+    shop.querySelector<HTMLElement>('[data-empty]')!.hidden = lines.length > 0;
+    shop.querySelector<HTMLElement>('[data-sum]')!.hidden = lines.length === 0;
+    shop.querySelector<HTMLElement>('[data-send]')!.hidden = lines.length === 0;
+    shop.querySelector('[data-total]')!.textContent = money.format(total());
+    list.replaceChildren(...lines.map((l) => {
+      const step = (d: number, label: string, text: string) => {
+        const b = el('button', { type: 'button', class: 'step', 'aria-label': `${label}: ${l.name}` }, text);
+        b.addEventListener('click', () => change(l.id, d));
+        return b;
+      };
+      const rm = el('button', { type: 'button', class: 'remove', 'aria-label': `${L.remove}: ${l.name}` }, '×');
+      rm.addEventListener('click', () => change(l.id, -l.qty));
+      return el('li', {},
+        el('span', { class: 'line-name' }, l.name, el('span', { class: 'ui-muted ui-small' }, money.format(l.price))),
+        el('span', { class: 'qty' }, step(-1, L.less, '−'), el('span', { class: 'num' }, String(l.qty)), step(1, L.plus, '+')),
+        el('strong', { class: 'num' }, money.format(l.price * l.qty)), rm);
+    }));
+  }
+
+  function change(id: string, d: number) {
+    const line = lines.find((l) => l.id === id);
+    if (!line) return;
+    if (d > 0 && line.max !== null && line.qty + d > line.max) {
+      alertIn(L.maxReached.replace('{n}', String(line.max)));
+      return;
+    }
+    line.qty += d;
+    lines = lines.filter((l) => l.qty > 0);
+    save();
+    render();
+  }
+  function alertIn(text: string) {
+    const box = shop.querySelector<HTMLElement>('[data-send-error]');
+    if (box) { box.textContent = text; box.hidden = false; }
+  }
+
+  shop.querySelectorAll<HTMLElement>('[data-add]').forEach((b) => b.addEventListener('click', () => {
+    const p = JSON.parse(b.closest<HTMLElement>('[data-product]')!.dataset.product!);
+    const line = lines.find((l) => l.id === p.id);
+    if (line) {
+      if (line.max === null || line.qty < line.max) line.qty += 1;
+    } else lines.push({ ...p, qty: 1 });
+    save();
+    render();
+  }));
+
+  shop.querySelector('[data-clear]')?.addEventListener('click', () => { lines = []; save(); render(); });
+  shop.querySelector('[data-send]')?.addEventListener('input', () => { shop.querySelector<HTMLElement>('[data-send-error]')!.hidden = true; });
+
+  shop.querySelector<HTMLFormElement>('[data-send]')?.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const form = e.currentTarget as HTMLFormElement;
+    const name = (form.elements.namedItem('name') as HTMLInputElement).value.trim();
+    const note = (form.elements.namedItem('note') as HTMLTextAreaElement).value.trim();
+    const error = shop.querySelector<HTMLElement>('[data-send-error]')!;
+    if (!name) {
+      error.textContent = L.needName;
+      error.hidden = false;
+      (form.elements.namedItem('name') as HTMLInputElement).focus();
+      return;
+    }
+    error.hidden = true;
+    const text = [
+      L.hello,
+      ...lines.map((l) => L.line.replace('{qty}', String(l.qty)).replace('{name}', l.name).replace('{price}', money.format(l.price))),
+      L.total.replace('{total}', money.format(total())),
+      L.name.replace('{name}', name),
+      ...(note ? [L.note.replace('{note}', note)] : []),
+    ].join('\n');
+    window.open(`https://wa.me/${shop.dataset.number}?text=${encodeURIComponent(text)}`, '_blank', 'noopener');
+    const sent = shop.querySelector<HTMLElement>('[data-sent]')!;
+    sent.textContent = L.sentHint;
+    sent.hidden = false;
+  });
+
+  // Photos of a product in a dialog
+  const photos = document.querySelector<HTMLDialogElement>('#photos');
+  shop.querySelectorAll<HTMLButtonElement>('[data-photos]').forEach((b) => b.addEventListener('click', () => {
+    const urls: string[] = JSON.parse(b.dataset.photos!);
+    if (!urls.length || !photos) return;
+    photos.querySelector('h2')!.textContent = b.dataset.photosTitle!;
+    photos.querySelector('[data-photos-list]')!.replaceChildren(...urls.map((u) => el('img', { src: u, alt: b.dataset.photosTitle! })));
+    photos.showModal();
+  }));
+
+  document.querySelectorAll<HTMLSelectElement>('[data-autosubmit]').forEach((s) => s.addEventListener('change', () => s.form?.requestSubmit()));
+  render();
+</script>
+
+<style>
+  .shop {
+    max-width: 72rem;
+    margin: 0 auto;
+    padding: var(--space-6) var(--space-4) 6rem;
+  }
+  .head {
+    margin-bottom: var(--space-4);
+  }
+  .filters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    margin: var(--space-4) 0;
+  }
+  .search {
+    display: flex;
+    flex: 1 1 18rem;
+    align-items: center;
+    gap: var(--space-2);
+    min-height: var(--control-height);
+    padding: 0 var(--space-3);
+    background: var(--bg-input);
+    border: 1px solid var(--border-input);
+    border-radius: var(--radius-control);
+    color: var(--text-muted);
+  }
+  .search:focus-within {
+    border-color: var(--color-primary);
+    box-shadow: 0 0 0 3px var(--focus-ring);
+  }
+  .search input {
+    flex: 1;
+    min-width: 0;
+    background: none;
+    border: 0;
+    outline: none;
+    color: var(--text-body);
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr));
+    gap: var(--space-4);
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .card {
+    display: grid;
+    grid-template-rows: auto 1fr;
+    overflow: hidden;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-container);
+  }
+  .card.in-order {
+    border-color: var(--color-primary);
+  }
+  .photo {
+    position: relative;
+    display: grid;
+    place-items: center;
+    aspect-ratio: 4 / 3;
+    padding: 0;
+    overflow: hidden;
+    background: var(--bg-app);
+    border: 0;
+    color: var(--text-muted);
+    cursor: zoom-in;
+  }
+  .photo:disabled {
+    cursor: default;
+  }
+  .photo img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+  .more-photos {
+    position: absolute;
+    inset-inline-end: var(--space-2);
+    bottom: var(--space-2);
+    padding: 0 var(--space-2);
+    background: color-mix(in srgb, var(--text-title) 75%, transparent);
+    border-radius: var(--radius-control);
+    color: var(--bg-app);
+    font-size: var(--text-sm);
+  }
+  .body {
+    display: grid;
+    align-content: start;
+    gap: var(--space-1);
+    padding: var(--space-3) var(--space-4) var(--space-4);
+  }
+  .body h2 {
+    margin: 0;
+    font-size: var(--text-md);
+  }
+  .meta,
+  .desc {
+    margin: 0;
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+  }
+  .desc {
+    display: -webkit-box;
+    overflow: hidden;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+  }
+  .price {
+    margin: var(--space-1) 0 0;
+    color: var(--text-title);
+    font-size: var(--text-lg);
+    font-weight: var(--weight-bold);
+  }
+  .body :global(.add) {
+    margin-top: var(--space-2);
+  }
+  .empty {
+    margin: var(--space-6) 0;
+  }
+  .last {
+    margin: 0;
+    color: var(--status-warning-text, #b45309);
+    font-weight: var(--weight-medium);
+  }
+  .cart-bar {
+    position: fixed;
+    inset-inline: var(--space-4);
+    bottom: var(--space-4);
+    z-index: 10;
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    max-width: 32rem;
+    margin: 0 auto;
+    padding: var(--space-3) var(--space-4);
+    background: var(--color-primary);
+    border: 0;
+    border-radius: var(--radius-container);
+    box-shadow: 0 8px 24px rgb(0 0 0 / 0.18);
+    color: var(--on-primary, #fff);
+    font: inherit;
+    cursor: pointer;
+  }
+  .cart-bar[hidden] {
+    display: none;
+  }
+  .cart-bar strong {
+    margin-inline-start: auto;
+  }
+  .lines {
+    display: grid;
+    gap: var(--space-3);
+    margin: 0 0 var(--space-3);
+    padding: 0;
+    list-style: none;
+  }
+  .lines :global(li) {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto auto auto;
+    align-items: center;
+    gap: var(--space-2);
+  }
+  .lines :global(.line-name) {
+    display: grid;
+  }
+  .lines :global(.qty) {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+  .lines :global(.step),
+  .lines :global(.remove) {
+    width: 2rem;
+    height: 2rem;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-control);
+    color: var(--text-body);
+    font-size: var(--text-md);
+    cursor: pointer;
+  }
+  .lines :global(.remove) {
+    border-color: transparent;
+    background: none;
+    color: var(--text-muted);
+  }
+  .sum {
+    display: flex;
+    justify-content: space-between;
+    font-size: var(--text-lg);
+  }
+  .sum[hidden],
+  .send[hidden] {
+    display: none;
+  }
+  .send {
+    margin-top: var(--space-3);
+  }
+  .field-block {
+    display: grid;
+    gap: var(--space-1);
+  }
+  .label {
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
+  }
+  .ok {
+    margin: 0;
+    color: var(--status-success-text, #15803d);
+    font-size: var(--text-sm);
+  }
+  .ok[hidden] {
+    display: none;
+  }
+  .photos {
+    display: grid;
+    gap: var(--space-3);
+  }
+  .photos :global(img) {
+    width: 100%;
+    border-radius: var(--radius-control);
+  }
+</style>

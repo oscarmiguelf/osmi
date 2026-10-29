@@ -1,0 +1,100 @@
+---
+// Clinical module home: find a patient's record, and the branch's consultations of the last 30 days (my drafts first).
+import AppLayout from '@/layouts/AppLayout.astro';
+import Badge from '@/components/ui/Badge.astro';
+import Button from '@/components/ui/Button.astro';
+import Field from '@/components/ui/Field.astro';
+import { getLocale, localePath, useTranslations } from '@/i18n';
+import { recentNotes } from '@/lib/clinical';
+import { formatPhone, searchCustomers } from '@/lib/customers';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const c = t.clinical;
+const { session, accessToken, branch } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'clinical')?.permissions ?? [];
+if (!perms.includes('read') || session.business_type !== 'health' || !branch) return Astro.rewrite('/404');
+const q = (Astro.url.searchParams.get('q') ?? '').trim().slice(0, 100);
+const [patients, recent] = await Promise.all([q ? searchCustomers(accessToken, q, 20) : Promise.resolve([]), recentNotes(accessToken, branch.id)]);
+const when = new Intl.DateTimeFormat(t.intl, { dateStyle: 'medium', timeStyle: 'short', timeZone: session.user.timezone });
+---
+
+<AppLayout title={c.title} current="/clinical">
+  <header class="ui-header"><div><h1>{c.title}</h1><p class="ui-sub">{branch.name}</p></div></header>
+
+  <form method="get" class="search">
+    <Field label={c.searchLabel} name="q" type="search" value={q} placeholder={c.searchPlaceholder} id="clinical-q" />
+    <Button type="submit" variant="secondary" icon="search">{t.ui.search}</Button>
+  </form>
+  {q && (patients.length === 0 ? <p class="ui-muted">{c.noPatients}</p> : (
+    <ul class="list" role="list">
+      {patients.map((p) => (
+        <li>
+          <a class="ui-strong" href={localePath(locale, `/clinical/patients/${p.id}`)}>{p.full_name}</a>
+          <span class="ui-muted ui-small num">{p.phone && formatPhone(p.phone)}</span>
+        </li>
+      ))}
+    </ul>
+  ))}
+
+  <h2 class="section">{c.recentTitle}</h2>
+  {recent.length === 0 ? <p class="ui-muted">{c.recentEmpty}</p> : (
+    <ul class="list" role="list">
+      {recent.map((n) => (
+        <li>
+          <a class="ui-strong" href={localePath(locale, `/clinical/notes/${n.id}`)}>{n.patient}</a>
+          <span class="ui-small">{n.reason || '—'}</span>
+          <span class="badges">
+            {n.kind === 'dental' && <Badge>{c.kinds.dental}</Badge>}
+            {n.signed_at ? <Badge tone="success">{c.signed}</Badge> : <Badge tone="warning">{c.draft}</Badge>}
+          </span>
+          <span class="ui-muted ui-small">{n.author} · {when.format(new Date(n.visit_at))}</span>
+        </li>
+      ))}
+    </ul>
+  )}
+  <p class="ui-muted ui-small legal">{c.legal}</p>
+</AppLayout>
+
+<style>
+  .search {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: var(--space-3);
+    margin-bottom: var(--space-4);
+  }
+  .section {
+    margin: var(--space-6, 2rem) 0 var(--space-3);
+    font-size: var(--text-lg, 1.125rem);
+  }
+  .list {
+    display: grid;
+    gap: var(--space-2);
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .list li {
+    display: grid;
+    grid-template-columns: minmax(10rem, 16rem) minmax(0, 1fr) auto auto;
+    align-items: center;
+    gap: var(--space-3);
+    padding: var(--space-3) var(--space-4);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-container);
+  }
+  .badges {
+    display: flex;
+    gap: var(--space-1);
+  }
+  .legal {
+    margin-top: var(--space-6, 2rem);
+  }
+  @media (max-width: 48rem) {
+    .list li {
+      grid-template-columns: minmax(0, 1fr) auto;
+    }
+  }
+</style>

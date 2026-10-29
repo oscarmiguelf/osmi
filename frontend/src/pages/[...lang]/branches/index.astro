@@ -1,0 +1,382 @@
+---
+import AppLayout from '@/layouts/AppLayout.astro';
+import BranchFields from '@/components/branches/BranchFields.astro';
+import Badge from '@/components/ui/Badge.astro';
+import Button from '@/components/ui/Button.astro';
+import Dialog from '@/components/ui/Dialog.astro';
+import EmptyState from '@/components/ui/EmptyState.astro';
+import Icon from '@/components/ui/Icon.astro';
+import Notice from '@/components/ui/Notice.astro';
+import { fmt, getLocale, localePath, useTranslations } from '@/i18n';
+import { ApiError } from '@/lib/api';
+import { branchFormErrors, createBranch, deleteBranch, listBranches, restoreBranch } from '@/lib/branches';
+import { formatPhone } from '@/lib/customers';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const br = t.branches;
+const { session, accessToken } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'branches')?.permissions ?? [];
+if (!perms.includes('read')) return Astro.rewrite('/404');
+const canCreate = perms.includes('create');
+const canDelete = perms.includes('delete');
+
+const params = Astro.url.searchParams;
+const showDeleted = params.get('show') === 'deleted';
+const basePath = localePath(locale, '/branches');
+
+// --- Create (then open it, the next step is assigning people), delete and restore ---
+const empty = { name: '', code: '', phone: '', address: '' };
+let values = { ...empty };
+let fieldErrors: Record<string, string> = {};
+let formError: string | undefined;
+let pageError: { text: string; items?: string[] } | undefined;
+
+const data = Astro.request.method === 'POST' ? await Astro.request.formData() : undefined;
+const intent = data?.get('intent');
+const back = (key: string, value: string) => {
+  const url = new URL(Astro.url);
+  url.searchParams.set(key, value);
+  return Astro.redirect(url.pathname + url.search, 303);
+};
+
+if (data && (intent === 'delete' || intent === 'restore')) {
+  const id = String(data.get('branch_id'));
+  const name = String(data.get('branch_name') ?? '');
+  try {
+    if (intent === 'delete') {
+      await deleteBranch(accessToken, id);
+      return back('deleted', name);
+    }
+    await restoreBranch(accessToken, id);
+    return back('restored', name);
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    const blockers: Record<string, number> = e.body?.detail?.blockers ?? {};
+    pageError =
+      e.status === 409 && intent === 'delete'
+        ? { text: fmt(br.blocked, { name }), items: Object.entries(blockers).map(([k, n]) => fmt(br.blockers[k] ?? k, { n })) }
+        : { text: e.status === 409 ? br.restoreTaken : br.failed };
+  }
+} else if (data) {
+  values = Object.fromEntries(Object.keys(empty).map((k) => [k, String(data.get(k) ?? '').trim()])) as typeof empty;
+  if (!values.name) fieldErrors.name = br.errors.name;
+  if (!values.code) fieldErrors.code = br.errors.code;
+  if (!canCreate) formError = t.calendar.forbidden;
+  else if (!Object.keys(fieldErrors).length) {
+    try {
+      const created = await createBranch(accessToken, {
+        name: values.name,
+        code: values.code,
+        phone: values.phone || null,
+        address: values.address || null,
+      });
+      return Astro.redirect(`${localePath(locale, `/branches/${created.id}`)}?created=1`, 303);
+    } catch (e) {
+      if (!(e instanceof ApiError)) throw e;
+      const errors = branchFormErrors(e, br);
+      fieldErrors = errors.fields;
+      formError = errors.form;
+    }
+  }
+  if (Object.keys(fieldErrors).length) formError ??= br.formError;
+  Astro.response.status = 422;
+}
+
+// Active branches first; deleted ones (only when shown) after them
+const branches = (await listBranches(accessToken, showDeleted)).sort((a, b) => Number(!!a.deleted_at) - Number(!!b.deleted_at));
+const active = branches.filter((b) => !b.deleted_at);
+const usersLabel = (n: number) => (n === 0 ? br.usersNone : n === 1 ? br.usersOne : fmt(br.users, { n }));
+const toggleLink = showDeleted ? basePath : `${basePath}?show=deleted`;
+---
+
+<AppLayout title={br.title} current="/branches">
+  <header class="page-header">
+    <div>
+      <h1>{br.title}</h1>
+      <p class="count num">{active.length === 1 ? br.countOne : fmt(br.count, { n: active.length })}</p>
+    </div>
+    <div class="header-actions">
+      {canDelete && <Button variant="tertiary" href={toggleLink}>{showDeleted ? br.hideDeleted : br.showDeleted}</Button>}
+      {canCreate && <Button icon="plus" data-dialog="new-branch">{br.newBranch}</Button>}
+    </div>
+  </header>
+
+  <div class="notices" data-flash>
+    {params.get('deleted') && <Notice>{fmt(br.deleted, { name: params.get('deleted')! })}</Notice>}
+    {params.get('restored') && <Notice>{br.restored}</Notice>}
+    {
+      pageError && (
+        <Notice tone="error">
+          {pageError.text}
+          {pageError.items && (
+            <ul class="blockers">
+              {pageError.items.map((item) => (
+                <li>{item}</li>
+              ))}
+            </ul>
+          )}
+        </Notice>
+      )
+    }
+  </div>
+
+  {
+    branches.length === 0 ? (
+      <EmptyState icon="building" title={br.emptyTitle} text={br.emptyText}>
+        {canCreate && <Button icon="plus" data-dialog="new-branch">{br.newBranch}</Button>}
+      </EmptyState>
+    ) : (
+      <ul class="grid" role="list">
+        {branches.map((b) => (
+          <li class:list={['item', { deleted: b.deleted_at }]}>
+            <a class="card" href={localePath(locale, `/branches/${b.id}`)}>
+              <span class="top">
+                <Badge>{b.code}</Badge>
+                {b.deleted_at && <Badge tone="error">{br.deletedBadge}</Badge>}
+              </span>
+              <span class="name">{b.name}</span>
+              {b.address && <span class="detail">{b.address}</span>}
+              {b.phone && <span class="detail num">{formatPhone(b.phone)}</span>}
+              <span class="meta">
+                <Icon name="users" size={16} />
+                {usersLabel(b.user_count)}
+              </span>
+            </a>
+            {canDelete && !b.deleted_at && (
+              // A sibling of the card link, not inside it: a button can't live in a link
+              <form
+                method="post"
+                class="corner"
+                data-confirm={fmt(br.deleteText, { name: b.name })}
+                data-confirm-title={br.deleteTitle}
+                data-confirm-action={br.deleteAction}
+              >
+                <input type="hidden" name="intent" value="delete" />
+                <input type="hidden" name="branch_id" value={b.id} />
+                <input type="hidden" name="branch_name" value={b.name} />
+                <button type="submit" class="delete" aria-label={fmt(br.deleteRow, { name: b.name })}>
+                  <Icon name="trash-2" size={18} />
+                </button>
+              </form>
+            )}
+            {canDelete && b.deleted_at && (
+              <form method="post" class="restore">
+                <input type="hidden" name="intent" value="restore" />
+                <input type="hidden" name="branch_id" value={b.id} />
+                <input type="hidden" name="branch_name" value={b.name} />
+                <Button type="submit" variant="secondary" icon="rotate-ccw">{br.restore}</Button>
+              </form>
+            )}
+          </li>
+        ))}
+      </ul>
+    )
+  }
+
+  {
+    canCreate && (
+      <Dialog id="new-branch" title={br.newBranch} closeLabel={br.close} open={!!formError}>
+        <form method="post" class="form" novalidate>
+          {formError && <p class="alert" role="alert">{formError}</p>}
+          <BranchFields locale={locale} values={values} errors={fieldErrors} />
+          <div class="actions">
+            <Button variant="tertiary" data-dialog-close>{br.cancel}</Button>
+            <Button type="submit">{br.save}</Button>
+          </div>
+        </form>
+      </Dialog>
+    )
+  }
+</AppLayout>
+
+<script>
+  // Notices show once: reloading or sharing the URL shouldn't repeat them
+  const url = new URL(location.href);
+  if (url.searchParams.has('deleted') || url.searchParams.has('restored')) {
+    url.searchParams.delete('deleted');
+    url.searchParams.delete('restored');
+    history.replaceState(null, '', url);
+  }
+</script>
+
+<style>
+  .page-header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: var(--space-4);
+    margin-bottom: var(--space-6);
+  }
+
+  .count {
+    margin-top: var(--space-1);
+    color: var(--text-muted);
+  }
+
+  .header-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+  }
+
+  .notices {
+    display: grid;
+    gap: var(--space-2);
+    margin-bottom: var(--space-4);
+  }
+
+  .notices:empty {
+    display: none;
+  }
+
+  .blockers {
+    margin-top: var(--space-1);
+    padding-inline-start: var(--space-5);
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 17rem), 1fr));
+    gap: var(--space-4);
+    padding: 0;
+    list-style: none;
+  }
+
+  .item {
+    position: relative;
+  }
+
+  .card {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    height: 100%;
+    padding: var(--space-5);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-container);
+    color: var(--text-body);
+    text-decoration: none;
+    transition: border-color var(--duration-fast) ease;
+  }
+
+  .card:hover {
+    border-color: var(--border-input);
+  }
+
+  .top {
+    display: flex;
+    gap: var(--space-2);
+    margin-bottom: var(--space-2);
+    padding-inline-end: var(--space-8);
+  }
+
+  .name {
+    color: var(--text-title);
+    font-size: var(--text-lg);
+    font-weight: var(--weight-bold);
+    line-height: var(--leading-tight);
+  }
+
+  .detail {
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+  }
+
+  .meta {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    margin-top: auto;
+    padding-top: var(--space-3);
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+  }
+
+  /* Deleted branches: kept visible for restoring, but clearly out of service */
+  .deleted .card {
+    padding-bottom: calc(var(--space-5) + var(--control-height) + var(--space-3));
+    background: var(--bg-app);
+    border-style: dashed;
+  }
+
+  .deleted .name {
+    color: var(--text-muted);
+  }
+
+  .restore {
+    position: absolute;
+    inset-inline: var(--space-5);
+    bottom: var(--space-5);
+  }
+
+  .corner {
+    position: absolute;
+    top: var(--space-3);
+    inset-inline-end: var(--space-3);
+  }
+
+  .delete {
+    display: grid;
+    place-items: center;
+    width: 2.25rem;
+    height: 2.25rem;
+    background: none;
+    border: 0;
+    border-radius: var(--radius-control);
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+
+  .delete:hover {
+    background: color-mix(in srgb, var(--status-error) 8%, transparent);
+    color: var(--status-error-text);
+  }
+
+  /* With a mouse it shows on the card you point at; touch and keyboard focus always see it */
+  @media (hover: hover) {
+    .delete {
+      opacity: 0;
+    }
+    .item:hover .delete,
+    .delete:focus-visible {
+      opacity: 1;
+    }
+  }
+
+  .form {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--space-4);
+  }
+
+  .alert,
+  .actions,
+  .form > :global(.field:first-of-type),
+  .form > :global(.field:has(textarea)) {
+    grid-column: 1 / -1;
+  }
+
+  .alert {
+    padding: var(--space-3);
+    background: color-mix(in srgb, var(--status-error) 8%, var(--bg-app));
+    border: 1px solid var(--status-error);
+    border-radius: var(--radius-control);
+    color: var(--text-title);
+    font-size: var(--text-sm);
+  }
+
+  .actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--space-2);
+  }
+
+  @media (max-width: 30rem) {
+    .form {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+</style>

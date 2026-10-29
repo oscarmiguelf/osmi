@@ -1,0 +1,264 @@
+---
+// Shown right after signing in when the user belongs to two or more branches (the middleware sends them here),
+// and from the sidebar to switch. With one branch the middleware skips it.
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import Button from '@/components/ui/Button.astro';
+import Icon from '@/components/ui/Icon.astro';
+import { getLocale, localePath, useTranslations } from '@/i18n';
+import { formatPhone } from '@/lib/customers';
+import { saveBranch } from '@/lib/session';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const b = t.branch;
+const session = Astro.locals.session!;
+const current = Astro.locals.branch;
+
+let error: string | undefined;
+if (Astro.request.method === 'POST') {
+  const chosen = String((await Astro.request.formData()).get('branch_id') ?? '');
+  if (session.branches.some((branch) => branch.id === chosen)) {
+    saveBranch(Astro.cookies, chosen);
+    return Astro.redirect(localePath(locale, '/'), 303);
+  }
+  error = b.pickOne;
+  Astro.response.status = 422;
+}
+---
+
+<BaseLayout title={b.title}>
+  <main class="page">
+    <p class="brand">
+      <span class="mark" aria-hidden="true"></span>
+      {t.app.name}
+    </p>
+
+    <!-- Rendered open, so it works before (and without) JavaScript -->
+    <dialog open class="dialog" aria-labelledby="branch-title">
+      <h1 id="branch-title">{b.title}</h1>
+      <p class="intro">{b.intro}</p>
+
+      <form method="post" class="form" id="branch-form">
+        {error && <p class="alert" role="alert">{error}</p>}
+        <fieldset>
+          <legend class="visually-hidden">{b.title}</legend>
+          <div class="options">
+            {
+              session.branches.map((branch, i) => (
+                <label class="option">
+                  <input
+                    type="radio"
+                    name="branch_id"
+                    value={branch.id}
+                    checked={current ? branch.id === current.id : i === 0}
+                    required
+                  />
+                  <span class="option-icon" aria-hidden="true">
+                    <Icon name="store" size={20} />
+                  </span>
+                  <span class="option-text">
+                    <span class="option-name">
+                      {branch.name}
+                      {current?.id === branch.id && <span class="current">{b.current}</span>}
+                    </span>
+                    {(branch.address || branch.phone) && (
+                      <span class="option-meta">
+                        {[branch.address, branch.phone && formatPhone(branch.phone)].filter(Boolean).join(', ')}
+                      </span>
+                    )}
+                  </span>
+                  <span class="check" aria-hidden="true">
+                    <Icon name="check" size={18} />
+                  </span>
+                </label>
+              ))
+            }
+          </div>
+        </fieldset>
+      </form>
+
+      <div class="actions">
+        <form method="post" action="/logout">
+          <input type="hidden" name="locale" value={locale} />
+          <Button type="submit" variant="tertiary" icon="log-out">{t.app.logout}</Button>
+        </form>
+        <Button type="submit" form="branch-form">{b.continue}</Button>
+      </div>
+    </dialog>
+  </main>
+</BaseLayout>
+
+<style>
+  .page {
+    display: grid;
+    align-content: center;
+    justify-items: center;
+    gap: var(--space-6);
+    min-height: 100dvh;
+    padding: var(--space-8) var(--space-4);
+    background: var(--bg-surface);
+  }
+
+  .brand {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    color: var(--text-title);
+    font-size: var(--text-xl);
+    font-weight: var(--weight-bold);
+  }
+
+  .mark {
+    width: 1.5rem;
+    height: 1.5rem;
+    border: 4px solid var(--color-primary);
+    border-radius: 5px;
+  }
+
+  .dialog {
+    position: static;
+    width: min(100%, 30rem);
+    padding: var(--space-8) var(--space-6) var(--space-6);
+    background: var(--bg-app);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-container);
+    box-shadow: var(--shadow-overlay);
+    color: var(--text-body);
+  }
+
+  h1 {
+    font-size: var(--text-xl);
+  }
+
+  .intro {
+    margin-top: var(--space-2);
+    color: var(--text-muted);
+  }
+
+  .form {
+    margin-top: var(--space-6);
+  }
+
+  fieldset {
+    padding: 0;
+    border: 0;
+  }
+
+  .alert {
+    margin-bottom: var(--space-4);
+    padding: var(--space-3);
+    background: color-mix(in srgb, var(--status-error) 8%, var(--bg-app));
+    border: 1px solid var(--status-error);
+    border-radius: var(--radius-control);
+    color: var(--text-title);
+    font-size: var(--text-sm);
+  }
+
+  .options {
+    display: grid;
+    gap: var(--space-2);
+    max-height: 22rem;
+    overflow-y: auto;
+  }
+
+  .option {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    padding: var(--space-3) var(--space-4);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-control);
+    cursor: pointer;
+    transition:
+      border-color var(--duration-fast) ease,
+      background-color var(--duration-fast) ease;
+  }
+
+  .option:hover {
+    border-color: var(--border-input);
+  }
+
+  .option input {
+    position: absolute;
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .option:has(:checked) {
+    background: color-mix(in srgb, var(--color-primary) 6%, var(--bg-app));
+    border-color: var(--color-primary);
+  }
+
+  .option:has(:focus-visible) {
+    outline: 2px solid var(--color-primary);
+    outline-offset: 2px;
+  }
+
+  .option-icon {
+    display: grid;
+    flex-shrink: 0;
+    place-items: center;
+    width: 2.5rem;
+    height: 2.5rem;
+    background: var(--bg-surface);
+    border-radius: var(--radius-control);
+    color: var(--color-primary);
+  }
+
+  .option-text {
+    display: grid;
+    flex: 1;
+    min-width: 0;
+  }
+
+  .option-name {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    color: var(--text-title);
+    font-weight: var(--weight-bold);
+  }
+
+  .current {
+    color: var(--text-muted);
+    font-size: var(--text-xs);
+    font-weight: var(--weight-medium);
+  }
+
+  .option-meta {
+    overflow: hidden;
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .check {
+    display: grid;
+    flex-shrink: 0;
+    place-items: center;
+    width: 1.5rem;
+    height: 1.5rem;
+    border-radius: 50%;
+    color: transparent;
+  }
+
+  .option:has(:checked) .check {
+    background: var(--color-primary);
+    color: var(--text-on-color);
+  }
+
+  .actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    margin-top: var(--space-6);
+  }
+
+  .actions form :global(.btn) {
+    margin-inline-start: calc(-1 * var(--space-2));
+  }
+</style>

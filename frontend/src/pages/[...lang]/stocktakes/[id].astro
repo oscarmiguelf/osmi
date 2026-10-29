@@ -1,0 +1,458 @@
+---
+// A physical count. OPEN: scan / search, type the quantity, Enter (saved without reloading). Counters don't see the
+// system quantities (blind count); the supervisor sees differences, what's left to count, and completes or cancels.
+// COMPLETED: what was adjusted. The physical count wins: stock ends equal to what was counted.
+import AppLayout from '@/layouts/AppLayout.astro';
+import Badge from '@/components/ui/Badge.astro';
+import Button from '@/components/ui/Button.astro';
+import Card from '@/components/ui/Card.astro';
+import Notice from '@/components/ui/Notice.astro';
+import SearchPicker from '@/components/ui/SearchPicker.astro';
+import Timeline from '@/components/ui/Timeline.astro';
+import { fmt, getLocale, localePath, money, useTranslations } from '@/i18n';
+import { ApiError } from '@/lib/api';
+import { setFlash, takeFlash } from '@/lib/session';
+import {
+  cancelStocktake, completeStocktake, getStocktake, removeCount, stocktakeHistory, stocktakeItems, stocktakeResult, uncountedProducts,
+  type CountItem,
+} from '@/lib/stocktakes';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const st = t.stocktakes;
+const { session, accessToken, branch } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'stocktakes')?.permissions ?? [];
+if (!perms.includes('read') || !branch) return Astro.rewrite('/404');
+const id = Astro.params.id!;
+const selfPath = localePath(locale, `/stocktakes/${id}`);
+const supervisor = perms.includes('update');
+
+let pageError: string | undefined;
+if (Astro.request.method === 'POST' && supervisor) {
+  const data = await Astro.request.formData();
+  const intent = data.get('intent');
+  try {
+    if (intent === 'remove') await removeCount(accessToken, branch.id, id, String(data.get('product_id')));
+    if (intent === 'complete') await completeStocktake(accessToken, branch.id, id);
+    if (intent === 'cancel') await cancelStocktake(accessToken, branch.id, id);
+    setFlash(Astro.cookies, { [String(intent)]: '1' });
+    return Astro.redirect(Astro.url.pathname + Astro.url.search, 303);
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    const code = e.body?.detail?.code;
+    pageError = code === 'nothing_counted' ? st.errors.nothingCounted : code === 'not_open' ? st.errors.notOpen : t.ui.failed;
+  }
+}
+
+let stocktake: Awaited<ReturnType<typeof getStocktake>>;
+try {
+  stocktake = await getStocktake(accessToken, branch.id, id);
+} catch (e) {
+  if (e instanceof ApiError && (e.status === 404 || e.status === 422)) return Astro.rewrite('/404');
+  throw e;
+}
+const open = stocktake.status === 'OPEN';
+const canCount = open && perms.includes('create');
+const seeSystem = stocktake.can_see_system;
+const params = Astro.url.searchParams;
+const TABS = seeSystem ? (['counted', 'differences', 'uncounted'] as const) : (['counted', 'uncounted'] as const);
+const tab = (TABS as readonly string[]).includes(params.get('tab') ?? '') ? params.get('tab')! : 'counted';
+const q = (params.get('q') ?? '').trim().slice(0, 100);
+
+const [list, uncounted, result, history] = await Promise.all([
+  tab !== 'uncounted' && !(stocktake.status === 'COMPLETED' && seeSystem)
+    ? stocktakeItems(accessToken, branch.id, id, { only_differences: tab === 'differences', q }) : Promise.resolve(undefined),
+  tab === 'uncounted' && open ? uncountedProducts(accessToken, branch.id, id, { q }) : Promise.resolve(undefined),
+  stocktake.status === 'COMPLETED' && seeSystem ? stocktakeResult(accessToken, branch.id, id) : Promise.resolve(undefined),
+  stocktakeHistory(accessToken, branch.id, id),
+]);
+const items: CountItem[] = result
+  ? result.items.filter((i) => tab !== 'differences' || Number(i.difference) !== 0 || Number(i.applied_adjustment) !== 0)
+  : list?.items ?? [];
+const flash = takeFlash(Astro.cookies);
+const tz = session.user.timezone;
+const when = new Intl.DateTimeFormat(t.intl, { dateStyle: 'medium', timeStyle: 'short', timeZone: tz });
+const unit = (u: string) => t.products.unitNames[u] ?? u;
+const qty = (n: number | null | undefined) => (n === null || n === undefined ? '—' : String(Number(n)));
+const signed = (n: number | null | undefined) => (n === null || n === undefined ? '—' : `${Number(n) > 0 ? '+' : ''}${Number(n)}`);
+const tone = { OPEN: 'warning', COMPLETED: 'success', CANCELLED: 'neutral' } as const;
+const totals = stocktake.totals;
+const timeline = history.items.map((h) => ({
+  title: h.entity_type === 'stocktake'
+    ? (h.action === 'INSERT' ? st.events.opened : h.status && h.status !== 'OPEN' ? st.events[h.status as 'COMPLETED' | 'CANCELLED'] : st.events.edited)
+    : h.action === 'DELETE' ? fmt(st.events.removed, { product: h.product ?? '—' })
+    : h.action === 'INSERT' ? fmt(st.events.counted, { product: h.product ?? '—', n: qty(Number(h.new_counted)) })
+    : h.changed_fields?.includes('counted_quantity') ? fmt(st.events.recounted, { product: h.product ?? '—', from: qty(Number(h.old_counted)), to: qty(Number(h.new_counted)) })
+    : null,
+  meta: `${h.changed_by ?? '—'}, ${when.format(new Date(h.changed_at))}`,
+})).filter((x): x is { title: string; meta: string } => !!x.title);
+const tabLink = (k: string) => (k === 'counted' ? selfPath : `${selfPath}?tab=${k}`);
+---
+
+<AppLayout title={fmt(st.detail, { folio: stocktake.folio })} current="/stocktakes">
+  <a class="ui-back" href={localePath(locale, '/stocktakes')}>← {st.back}</a>
+  <header class="ui-header">
+    <div>
+      <h1 class="num">{fmt(st.detail, { folio: stocktake.folio })}</h1>
+      <p class="ui-sub">{when.format(new Date(stocktake.created_at))} · {stocktake.created_by}{stocktake.notes && ` · ${stocktake.notes}`} <Badge tone={tone[stocktake.status]}>{st.statuses[stocktake.status]}</Badge></p>
+    </div>
+    <div class="ui-actions">
+      <Button variant="secondary" icon="download" href={`/api/stocktakes/export?id=${id}&lang=${locale}`}>{st.sheet}</Button>
+      {open && supervisor && (
+        <>
+          <form method="post" data-confirm={st.cancelText} data-confirm-title={st.cancelTitle} data-confirm-action={st.cancel}>
+            <input type="hidden" name="intent" value="cancel" />
+            <Button type="submit" variant="danger" icon="x">{st.cancel}</Button>
+          </form>
+          <form method="post" data-confirm={`${st.completeText}${stocktake.uncounted ? ` ${fmt(st.completeUncounted, { n: stocktake.uncounted })}` : ''}`}
+            data-confirm-title={st.completeTitle} data-confirm-action={st.complete}>
+            <input type="hidden" name="intent" value="complete" />
+            <Button type="submit" icon="check-check">{st.complete}</Button>
+          </form>
+        </>
+      )}
+    </div>
+  </header>
+
+  <div class="ui-notices">
+    {flash.complete && <Notice>{st.completedDone}</Notice>}
+    {flash.cancel && <Notice tone="warning">{st.cancelledDone}</Notice>}
+    {flash.remove && <Notice tone="warning">{st.removedDone}</Notice>}
+    {pageError && <Notice tone="error">{pageError}</Notice>}
+    {open && <Notice tone="warning">{st.salesWarning}</Notice>}
+  </div>
+
+  {canCount && (
+    <section class="counter" data-counter data-stocktake={id} data-lang={locale} data-see-system={seeSystem ? '' : undefined}
+      data-labels={JSON.stringify({ saved: st.saved, units: t.products.unitNames })}>
+      <div class="pick">
+        <label class="label" for="count-search">{st.product}</label>
+        <SearchPicker id="count-search" name="count_pick" endpoint={`/api/stocktakes/products?id=${id}&lang=${locale}`} placeholder={st.productPlaceholder}
+          hint={st.productHint} noResults={t.sales.cart.noResults} clearLabel={t.sales.cart.clear} focusAfter="[data-qty]" autofocus />
+      </div>
+      <label class="qty-field">
+        <span class="label">{st.quantity}</span>
+        <input class="ui-input num" type="number" min="0" step="0.001" inputmode="decimal" data-qty disabled />
+      </label>
+      <Button icon="check" data-save disabled>{st.save}</Button>
+      <p class="status" data-count-status role="status" aria-live="polite"></p>
+    </section>
+  )}
+
+  <div class="layout">
+    <div class="main">
+      {seeSystem && totals.counted_items > 0 && (
+        <dl class="summary">
+          <div><dt>{st.counted}</dt><dd class="num">{totals.counted_items}</dd></div>
+          <div><dt>{st.withDifference}</dt><dd class="num">{totals.items_with_difference}</dd></div>
+          <div><dt>{st.surplus}</dt><dd class="num">+{qty(totals.surplus_units)} <span class="ui-muted">{money(locale, Number(totals.surplus_value))}</span></dd></div>
+          <div><dt>{st.shortage}</dt><dd class="num">−{qty(totals.shortage_units)} <span class="ui-muted">{money(locale, Number(totals.shortage_value))}</span></dd></div>
+          <div><dt>{st.valueAtCost}</dt><dd class:list={['num ui-strong', Number(totals.difference_value_at_cost) < 0 && 'neg']}>{money(locale, Number(totals.difference_value_at_cost))}</dd></div>
+        </dl>
+      )}
+
+      <nav class="ui-tabs tabs" aria-label={st.detail}>
+        {TABS.filter((k) => k !== 'uncounted' || open).map((k) => (
+          <a href={tabLink(k)} aria-current={k === tab ? 'page' : undefined}>
+            {st.tabs[k]}{k === 'uncounted' && stocktake.uncounted !== null && ` (${stocktake.uncounted})`}
+          </a>
+        ))}
+      </nav>
+      <form method="get" class="search">
+        {tab !== 'counted' && <input type="hidden" name="tab" value={tab} />}
+        <input class="ui-input" type="search" name="q" value={q} maxlength="100" placeholder={st.search} aria-label={st.search} />
+        <Button type="submit" variant="secondary" icon="search">{t.ui.search}</Button>
+      </form>
+
+      {result && <p class="ui-muted ui-small">{st.resultHint}</p>}
+
+      {tab === 'uncounted' && uncounted ? (
+        uncounted.items.length === 0 ? <p class="ui-muted">{st.allCounted}</p> : (
+          <div class="ui-table-wrap">
+            <table class="ui-table">
+              <thead><tr><th scope="col">{st.product}</th>{seeSystem && <th scope="col" class="ui-end">{st.system}</th>}<th scope="col"><span class="visually-hidden">{st.countIt}</span></th></tr></thead>
+              <tbody>
+                {uncounted.items.map((u) => (
+                  <tr>
+                    <td data-label={st.product}><span class="ui-strong">{u.name}</span><span class="ui-line2">{[u.barcode, u.category, unit(u.unit)].filter(Boolean).join(' · ')}</span></td>
+                    {seeSystem && <td data-label={st.system} class="ui-end num">{qty(u.current_stock)}</td>}
+                    <td class="ui-row-action ui-end">
+                      {canCount && <Button variant="tertiary" icon="scan-barcode" data-count-this={JSON.stringify({ id: u.id, title: u.name, subtitle: [u.barcode, unit(u.unit)].filter(Boolean).join(' · ') })}>{st.countIt}</Button>}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )
+      ) : (
+        <div class="ui-table-wrap" data-items-wrap hidden={items.length === 0 && !canCount}>
+          <table class="ui-table">
+            <thead>
+              <tr>
+                <th scope="col">{st.product}</th>
+                <th scope="col" class="ui-end">{st.countedQty}</th>
+                {seeSystem && <th scope="col" class="ui-end">{result ? st.systemWhenCounted : st.system}</th>}
+                {seeSystem && <th scope="col" class="ui-end">{st.difference}</th>}
+                {result && <th scope="col" class="ui-end">{st.applied}</th>}
+                <th scope="col">{st.countedBy}</th>
+                {open && supervisor && <th scope="col"><span class="visually-hidden">{t.ui.delete}</span></th>}
+              </tr>
+            </thead>
+            <tbody data-items>
+              {items.map((i) => (
+                <tr data-product={i.product_id}>
+                  <td data-label={st.product}><a class="ui-strong" href={localePath(locale, `/products/${i.product_id}`)}>{i.product}</a><span class="ui-line2">{[i.barcode, unit(i.unit)].filter(Boolean).join(' · ')}</span></td>
+                  <td data-label={st.countedQty} class="ui-end num ui-strong" data-cell="counted">{qty(i.counted_quantity)}</td>
+                  {seeSystem && <td data-label={st.system} class="ui-end num" data-cell="system">{qty(i.system_quantity)}</td>}
+                  {seeSystem && <td data-label={st.difference} class:list={['ui-end num', Number(i.difference) < 0 ? 'neg' : Number(i.difference) > 0 ? 'pos' : '']} data-cell="difference">{signed(i.difference)}</td>}
+                  {result && <td data-label={st.applied} class="ui-end num">{signed(i.applied_adjustment)}</td>}
+                  <td data-label={st.countedBy} class="ui-muted" data-cell="by">{i.counted_by}</td>
+                  {open && supervisor && (
+                    <td class="ui-row-action ui-end">
+                      <form method="post" data-confirm={fmt(st.removeText, { product: i.product })} data-confirm-title={st.removeTitle} data-confirm-action={t.ui.delete}>
+                        <input type="hidden" name="intent" value="remove" /><input type="hidden" name="product_id" value={i.product_id} />
+                        <Button type="submit" variant="danger" icon="trash-2" aria-label={`${t.ui.delete}: ${i.product}`} />
+                      </form>
+                    </td>
+                  )}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {tab !== 'uncounted' && items.length === 0 && <p class="ui-muted" data-items-empty>{tab === 'differences' ? st.noDifferences : st.nothingYet}</p>}
+
+      {result && result.movements.length > 0 && (
+        <Card title={st.movements}>
+          <dl class="ui-rows">
+            {result.movements.map((m) => <div><dt>{m.product}<span class="ui-line2">{qty(m.stock_before)} → {qty(m.stock_after)}</span></dt><dd class:list={['num ui-strong', Number(m.quantity) < 0 ? 'neg' : 'pos']}>{signed(m.quantity)}</dd></div>)}
+          </dl>
+        </Card>
+      )}
+    </div>
+
+    <Card title={t.ui.history}>
+      <Timeline items={timeline} />
+    </Card>
+  </div>
+</AppLayout>
+
+<script>
+  const box = document.querySelector<HTMLElement>('[data-counter]');
+  if (box) {
+    const picker = box.querySelector<HTMLElement>('[data-picker]')!;
+    const search = box.querySelector<HTMLInputElement>('#count-search')!;
+    const qtyInput = box.querySelector<HTMLInputElement>('[data-qty]')!;
+    const save = box.querySelector<HTMLButtonElement>('[data-save]')!;
+    const status = box.querySelector<HTMLElement>('[data-count-status]')!; // not the picker's own [data-status]
+    const L = JSON.parse(box.dataset.labels!);
+    const lang = box.dataset.lang!;
+    let product: { id: string; title: string; subtitle?: string } | null = null;
+
+    const choose = (p: typeof product) => {
+      product = p;
+      qtyInput.disabled = save.disabled = !p;
+      if (p) {
+        // Recounting shows what was counted before
+        qtyInput.value = document.querySelector(`[data-items] tr[data-product="${p.id}"] [data-cell="counted"]`)?.textContent?.trim().replace('—', '') ?? '';
+        qtyInput.focus();
+        qtyInput.select();
+      }
+    };
+    picker.addEventListener('picker:choose', (e) => choose((e as CustomEvent).detail));
+    picker.querySelector('[data-clear]')?.addEventListener('click', () => choose(null));
+    // Scanner: code + Enter selects the product straight away when it's the only match
+    search.addEventListener('keydown', async (e) => {
+      if (e.key !== 'Enter') return;
+      e.preventDefault();
+      const q = search.value.trim();
+      if (q.length < 2) return;
+      const found = await (await fetch(`/api/stocktakes/products?id=${box!.dataset.stocktake}&lang=${lang}&q=${encodeURIComponent(q)}`)).json();
+      // An exact barcode comes first: take it even if the name matches others too
+      if (found.length === 1 || found[0]?.subtitle?.split(' · ')[0] === q) {
+        picker.dispatchEvent(new CustomEvent('picker:set', { detail: found[0] }));
+        choose(found[0]);
+      }
+    });
+    document.querySelectorAll<HTMLElement>('[data-count-this]').forEach((b) => b.addEventListener('click', () => {
+      const p = JSON.parse(b.dataset.countThis!);
+      picker.dispatchEvent(new CustomEvent('picker:set', { detail: p }));
+      choose(p);
+      box.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }));
+
+    async function submit() {
+      if (!product || qtyInput.value === '') return;
+      save.disabled = true;
+      const res = await fetch('/api/stocktakes/count', { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ stocktake_id: box!.dataset.stocktake, product_id: product.id, counted_quantity: qtyInput.value, lang }) });
+      const out = await res.json().catch(() => ({ error: '…' }));
+      save.disabled = false;
+      status.classList.toggle('error', !!out.error);
+      if (out.error) {
+        status.textContent = out.error;
+        qtyInput.focus();
+        return;
+      }
+      upsertRow(out.data);
+      status.textContent = L.saved.replace('{product}', out.data.product).replace('{n}', String(Number(out.data.counted_quantity)));
+      picker.dispatchEvent(new CustomEvent('picker:set', { detail: null }));
+      choose(null);
+      qtyInput.value = '';
+      search.focus();
+    }
+    save.addEventListener('click', submit);
+    qtyInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); submit(); }
+    });
+
+    function upsertRow(item: any) {
+      const body = document.querySelector<HTMLTableSectionElement>('[data-items]');
+      if (!body) return;
+      document.querySelector('[data-items-wrap]')?.removeAttribute('hidden');
+      document.querySelector('[data-items-empty]')?.remove();
+      const seeSystem = box!.hasAttribute('data-see-system');
+      const n = (v: unknown) => String(Number(v));
+      let row = body.querySelector<HTMLTableRowElement>(`tr[data-product="${item.product_id}"]`);
+      if (!row) {
+        // A new line on top, same cells as the server's rows
+        row = document.createElement('tr');
+        row.dataset.product = item.product_id;
+        const name = document.createElement('td');
+        name.innerHTML = '<span class="ui-strong"></span><span class="ui-line2"></span>';
+        name.firstElementChild!.textContent = item.product;
+        name.lastElementChild!.textContent = [item.barcode, L.units[item.unit] ?? item.unit].filter(Boolean).join(' · ');
+        const cell = (key: string, cls: string) => {
+          const td = document.createElement('td');
+          td.className = cls;
+          td.dataset.cell = key;
+          return td;
+        };
+        const cells = [name, cell('counted', 'ui-end num ui-strong')];
+        if (seeSystem) cells.push(cell('system', 'ui-end num'), cell('difference', 'ui-end num'));
+        cells.push(cell('by', 'ui-muted'));
+        const filler = body.closest('table')!.querySelectorAll('thead th').length - cells.length;
+        for (let k = 0; k < filler; k++) cells.push(document.createElement('td'));
+        row.append(...cells);
+        body.prepend(row);
+      }
+      const set = (key: string, v: string) => { const c = row!.querySelector<HTMLElement>(`[data-cell="${key}"]`); if (c) c.textContent = v; };
+      set('counted', n(item.counted_quantity));
+      if ('system_quantity' in item) {
+        set('system', n(item.system_quantity));
+        const d = Number(item.difference);
+        set('difference', `${d > 0 ? '+' : ''}${d}`);
+        row.querySelector('[data-cell="difference"]')?.classList.toggle('neg', d < 0);
+        row.querySelector('[data-cell="difference"]')?.classList.toggle('pos', d > 0);
+      }
+      set('by', item.counted_by);
+      row.classList.remove('flash');
+      void row.offsetWidth; // restart the highlight
+      row.classList.add('flash');
+    }
+  }
+</script>
+
+<style>
+  .counter {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 10rem auto;
+    align-items: start;
+    gap: var(--space-3);
+    margin-bottom: var(--space-4);
+    padding: var(--space-4);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-container);
+  }
+  .pick,
+  .qty-field {
+    display: grid;
+    gap: var(--space-1);
+  }
+  .qty-field input {
+    width: 100%; /* stay inside its column, not under the Save button */
+  }
+  .label {
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
+  }
+  .counter > :global(.btn) {
+    margin-top: calc(var(--text-sm) * 1.5 + var(--space-1));
+  }
+  .status {
+    grid-column: 1 / -1;
+    margin: 0;
+    color: var(--status-success-text, var(--text-body));
+    font-weight: var(--weight-medium);
+  }
+  .status:empty {
+    display: none;
+  }
+  .status.error {
+    color: var(--status-error-text);
+  }
+  .layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 20rem);
+    align-items: start;
+    gap: var(--space-4);
+  }
+  .main {
+    display: grid;
+    gap: var(--space-3);
+  }
+  .summary {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+    gap: var(--space-3);
+    margin: 0;
+  }
+  .summary div {
+    padding: var(--space-3);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-control);
+  }
+  .summary dt {
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+  }
+  .summary dd {
+    margin: 0;
+    font-size: var(--text-lg);
+  }
+  .search {
+    display: flex;
+    gap: var(--space-2);
+    max-width: 32rem;
+  }
+  .search input {
+    flex: 1;
+  }
+  :global(.neg) {
+    color: var(--status-error-text);
+  }
+  :global(.pos) {
+    color: var(--status-success-text, #15803d);
+  }
+  :global(tr.flash) {
+    animation: flash 1.2s ease-out;
+  }
+  @keyframes flash {
+    from {
+      background: var(--color-primary-tint);
+    }
+  }
+  @media (max-width: 60rem) {
+    .counter,
+    .layout {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .counter > :global(.btn) {
+      margin-top: 0;
+    }
+  }
+</style>

@@ -1,0 +1,9 @@
+from pathlib import Path
+from typing import Protocol
+
+
+class ImageStorage(Protocol):
+    """Where image files live (a local volume today; S3 or similar would implement the same three calls)."""
+    def save(self, name: str, data: bytes) -> None: ...
+    def path(self, name: str) -> Path: ...
+    def delete(self, name: str) -> None: ...

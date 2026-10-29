@@ -1,0 +1,426 @@
+/*
+ * Shared page patterns (admin screens): header, filters, data table, form grid, detail rows, pager.
+ * Prefixed ui- so they never collide with a page's own scoped classes.
+ */
+.ui-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--space-4);
+  margin-bottom: var(--space-6);
+}
+
+.ui-header .ui-sub {
+  margin-top: var(--space-1);
+  color: var(--text-muted);
+}
+
+.ui-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.ui-back {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-bold);
+  text-decoration: none;
+}
+
+.ui-back:hover {
+  color: var(--color-primary);
+}
+
+.ui-notices {
+  display: grid;
+  gap: var(--space-2);
+  margin-bottom: var(--space-4);
+}
+
+.ui-notices:empty {
+  display: none;
+}
+
+.ui-muted {
+  color: var(--text-muted);
+}
+
+.ui-small {
+  font-size: var(--text-sm);
+}
+
+.ui-end {
+  text-align: end;
+}
+
+/* --- Filters --- */
+.ui-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
+}
+
+.ui-search {
+  display: flex;
+  flex: 1 1 18rem;
+  align-items: center;
+  gap: var(--space-2);
+  max-width: 28rem;
+  min-height: var(--control-height);
+  padding: 0 var(--space-3);
+  background: var(--bg-input);
+  border: 1px solid var(--border-input);
+  border-radius: var(--radius-control);
+  color: var(--text-muted);
+}
+
+.ui-search:focus-within,
+.ui-select:focus-visible,
+.ui-input:focus-visible {
+  outline: none;
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 3px var(--focus-ring);
+}
+
+.ui-search input {
+  flex: 1;
+  min-width: 0;
+  padding: var(--space-2) 0;
+  background: none;
+  border: 0;
+  outline: none;
+  color: var(--text-body);
+}
+
+.ui-select,
+.ui-input {
+  min-height: var(--control-height);
+  padding: 0 var(--space-3);
+  background-color: var(--bg-input);
+  border: 1px solid var(--border-input);
+  border-radius: var(--radius-control);
+  color: var(--text-body);
+}
+
+.ui-select {
+  padding-inline-end: 2.5rem; /* room for the chevron */
+}
+
+.ui-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+
+.ui-tabs a {
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-pill);
+  color: var(--text-body);
+  font-size: var(--text-sm);
+  text-decoration: none;
+}
+
+.ui-tabs a:hover {
+  border-color: var(--border-input);
+}
+
+.ui-tabs a[aria-current] {
+  background: var(--color-primary);
+  border-color: var(--color-primary);
+  color: var(--text-on-color);
+}
+
+/* --- Data table (becomes one card per row on phones) --- */
+.ui-table-wrap {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-container);
+  overflow-x: auto;
+}
+
+.ui-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--text-sm);
+}
+
+.ui-table th {
+  padding: var(--space-3) var(--space-4);
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  font-weight: var(--weight-medium);
+  text-align: start;
+  white-space: nowrap;
+}
+
+.ui-table td {
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--border-subtle);
+  vertical-align: top;
+}
+
+.ui-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.ui-table .ui-end {
+  text-align: end;
+}
+
+.ui-table a.ui-strong,
+.ui-strong {
+  color: var(--text-title);
+  font-weight: var(--weight-bold);
+  text-decoration: none;
+}
+
+.ui-table a.ui-strong:hover {
+  color: var(--color-primary);
+  text-decoration: underline;
+}
+
+.ui-table .ui-line2,
+.ui-rows .ui-line2 {
+  display: block;
+  color: var(--text-muted);
+}
+
+.ui-table .ui-row-action {
+  width: 1%;
+  padding-block: var(--space-2);
+  white-space: nowrap;
+}
+
+@media (max-width: 48rem) {
+  .ui-table-wrap {
+    border: 0;
+  }
+
+  .ui-table thead {
+    display: none;
+  }
+
+  .ui-table,
+  .ui-table tbody,
+  .ui-table tr,
+  .ui-table td {
+    display: block;
+  }
+
+  .ui-table tbody {
+    display: grid;
+    gap: var(--space-2);
+  }
+
+  .ui-table tr {
+    padding: var(--space-3) var(--space-4);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-container);
+  }
+
+  .ui-table td {
+    display: flex;
+    justify-content: space-between;
+    gap: var(--space-3);
+    padding: var(--space-1) 0;
+    border: 0;
+    text-align: end;
+  }
+
+  .ui-table td:first-child {
+    display: block;
+    text-align: start;
+  }
+
+  .ui-table td:not(:first-child)::before {
+    content: attr(data-label);
+    color: var(--text-muted);
+    text-align: start;
+  }
+}
+
+/* --- Forms --- */
+.ui-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-4);
+}
+
+.ui-form > .ui-full,
+.ui-form > .ui-alert,
+.ui-form > .ui-form-actions,
+.ui-form > :has(textarea) {
+  grid-column: 1 / -1;
+}
+
+.ui-form-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+.ui-alert {
+  padding: var(--space-3);
+  background: color-mix(in srgb, var(--status-error) 8%, var(--bg-app));
+  border: 1px solid var(--status-error);
+  border-radius: var(--radius-control);
+  color: var(--text-title);
+  font-size: var(--text-sm);
+}
+
+.ui-checks {
+  display: grid;
+  gap: var(--space-1);
+  padding: 0;
+  border: 0;
+}
+
+.ui-check {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-height: 2.25rem;
+  cursor: pointer;
+}
+
+.ui-check input {
+  width: 1.1rem;
+  height: 1.1rem;
+  accent-color: var(--color-primary);
+}
+
+@media (max-width: 30rem) {
+  .ui-form {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* --- Detail screens --- */
+.ui-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 22rem), 1fr));
+  align-items: start;
+  gap: var(--space-4);
+}
+
+.ui-grid > .ui-wide {
+  grid-column: 1 / -1;
+}
+
+.ui-rows {
+  display: grid;
+}
+
+.ui-rows > div {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding-block: var(--space-2);
+  border-top: 1px solid var(--border-subtle);
+}
+
+.ui-rows > div:first-child {
+  border-top: 0;
+}
+
+.ui-rows dt {
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.ui-rows dd {
+  min-width: 0;
+  color: var(--text-title);
+  text-align: end;
+  overflow-wrap: anywhere;
+}
+
+.ui-pager {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-top: var(--space-4);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.ui-section {
+  margin-top: var(--space-8);
+}
+
+.ui-section > h2 {
+  margin-bottom: var(--space-4);
+  font-size: var(--text-lg);
+}
+
+/* Quantities in and out: success/error text colors pass contrast, and the sign is always shown */
+.ui-in {
+  color: var(--status-success-text);
+  font-weight: var(--weight-bold);
+}
+
+.ui-out {
+  color: var(--status-error-text);
+  font-weight: var(--weight-bold);
+}
+
+/* --- Skeletons: the shape of what's loading. Decorative (aria-hidden); the region gets aria-busy instead --- */
+.ui-skel {
+  display: block;
+  height: 1em;
+  border-radius: var(--radius-control);
+  background: linear-gradient(90deg,
+    color-mix(in srgb, var(--text-muted) 14%, transparent) 25%,
+    color-mix(in srgb, var(--text-muted) 24%, transparent) 50%,
+    color-mix(in srgb, var(--text-muted) 14%, transparent) 75%);
+  background-size: 300% 100%;
+  animation: ui-shimmer 1.4s ease-in-out infinite;
+}
+
+.ui-skel-title {
+  width: min(18rem, 60%);
+  height: 2rem;
+}
+
+.ui-skel-text {
+  width: min(28rem, 80%);
+}
+
+.ui-skel-block {
+  height: 6rem;
+  border-radius: var(--radius-container);
+}
+
+.ui-skel-control {
+  height: var(--control-height);
+}
+
+@keyframes ui-shimmer {
+  from {
+    background-position: 100% 0;
+  }
+  to {
+    background-position: 0 0;
+  }
+}
+
+/* No movement for people who asked for less: a still placeholder says "loading" just as well */
+@media (prefers-reduced-motion: reduce) {
+  .ui-skel {
+    animation: none;
+    background: color-mix(in srgb, var(--text-muted) 18%, transparent);
+  }
+}

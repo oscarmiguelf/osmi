@@ -1,0 +1,16 @@
+---
+import AppLayout from '@/layouts/AppLayout.astro';
+import Button from '@/components/ui/Button.astro';
+import EmptyState from '@/components/ui/EmptyState.astro';
+import { getLocale, localePath, useTranslations } from '@/i18n';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+Astro.response.status = 404;
+---
+
+<AppLayout title={t.notFound.title} current="">
+  <EmptyState icon="map" title={t.notFound.title} text={t.notFound.text} level={1}>
+    <Button href={localePath(locale, '/')}>{t.notFound.action}</Button>
+  </EmptyState>
+</AppLayout>

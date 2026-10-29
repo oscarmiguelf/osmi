@@ -1,0 +1,536 @@
+---
+import AppLayout from '@/layouts/AppLayout.astro';
+import ProductFields from '@/components/products/ProductFields.astro';
+import Badge from '@/components/ui/Badge.astro';
+import Button from '@/components/ui/Button.astro';
+import Card from '@/components/ui/Card.astro';
+import Icon from '@/components/ui/Icon.astro';
+import Dialog from '@/components/ui/Dialog.astro';
+import Field from '@/components/ui/Field.astro';
+import ItemsEditor from '@/components/ui/ItemsEditor.astro';
+import Notice from '@/components/ui/Notice.astro';
+import Timeline from '@/components/ui/Timeline.astro';
+import { bookableServices } from '@/lib/appointments';
+import { clearBenefit, setBenefit } from '@/lib/benefits';
+import { listPriceLists } from '@/lib/priceLists';
+import { fmt, getLocale, localePath, money, useTranslations } from '@/i18n';
+import { ApiError, apiFieldErrors } from '@/lib/api';
+import {
+  adjustStock, deleteProductImage, getProduct, imageFiles, imageUrl, MAX_IMAGES, uploadImages, kardex, lastPurchasePrice, listCatalog, orderProductImages, productPurchases, productHistory,
+  productPayload, productStockByBranch, productValues, readItems, setKitComponents, setProductSuppliers, updateProduct, type Product,
+} from '@/lib/products';
+import { setFlash, takeFlash } from '@/lib/session';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const pr = t.products;
+const inv = t.inventory;
+const { session, accessToken, branch } = Astro.locals as Required<App.Locals>;
+const can = (module: string, p: string) => (session.modules.find((m) => m.code === module)?.permissions ?? []).includes(p);
+if (!can('products', 'read')) return Astro.rewrite('/404');
+const canUpdate = can('products', 'update');
+const canPrice = can('products', 'prices');
+const canStock = can('inventory', 'read');
+const canAdjust = can('inventory', 'create') && !!branch;
+const canPurchases = can('purchases', 'read');
+const b = branch?.id;
+const id = Astro.params.id!;
+const selfPath = localePath(locale, `/products/${id}`);
+
+let product: Product;
+try {
+  product = await getProduct(accessToken, b, id);
+} catch (e) {
+  if (e instanceof ApiError && (e.status === 404 || e.status === 422)) return Astro.rewrite('/404');
+  throw e;
+}
+const stockable = product.tracks_stock && !product.is_kit;
+const images = product.images ?? [];
+
+let values = productValues(product);
+let fieldErrors: Record<string, string> = {};
+let formError: string | undefined;
+let adjustErrors: Record<string, string> = {};
+let adjust = { quantity: '', notes: '' };
+let components = (product.components ?? []).map((c) => ({ product_id: c.product_id, name: c.name, quantity: String(Number(c.quantity)) }));
+let pageError: string | undefined;
+
+if (Astro.request.method === 'POST') {
+  const data = await Astro.request.formData();
+  const intent = String(data.get('intent'));
+  try {
+    if (intent === 'edit') {
+      values = { ...values, ...Object.fromEntries([...data.entries()].filter(([, v]) => typeof v === 'string').map(([k, v]) => [k, String(v)])) };
+      await updateProduct(accessToken, b, id, productPayload(data, canPrice));
+      const { uploaded, failed } = await uploadImages(accessToken, id, imageFiles(data), MAX_IMAGES - images.length);
+      setFlash(Astro.cookies, { saved: '1', images: uploaded ? String(uploaded) : '', imagesFailed: failed.join(', ').slice(0, 300) });
+      return Astro.redirect(selfPath, 303);
+    } else if (intent === 'image-upload') {
+      // Several at once; those that don't go (type, size, no room) are named in a notice
+      const files = imageFiles(data);
+      if (!files.length) throw new ApiError(422, { detail: { code: 'no_file' } });
+      const { uploaded, failed } = await uploadImages(accessToken, id, files, MAX_IMAGES - images.length);
+      setFlash(Astro.cookies, { images: uploaded ? String(uploaded) : '', imagesFailed: failed.join(', ').slice(0, 300) });
+      return Astro.redirect(selfPath, 303);
+    } else if (intent === 'image-main') {
+      const main = String(data.get('image_id'));
+      await orderProductImages(accessToken, id, [main, ...(product.images ?? []).map((i) => i.id).filter((i) => i !== main)]);
+    } else if (intent === 'image-delete') {
+      await deleteProductImage(accessToken, id, String(data.get('image_id')));
+    } else if (intent === 'benefit') {
+      const kind = String(data.get('kind') ?? '');
+      const num = (k: string) => (String(data.get(k) ?? '').trim() ? Number(data.get(k)) : null);
+      if (!kind) await clearBenefit(accessToken, id);
+      else await setBenefit(accessToken, id, { kind, service_product_id: String(data.get('service_product_id') ?? '') || null,
+        sessions: num('sessions'), valid_days: num('valid_days'), price_list_id: String(data.get('price_list_id') ?? '') || null });
+    } else if (intent === 'suppliers') {
+      await setProductSuppliers(accessToken, id, data.getAll('supplier').map(String));
+    } else if (intent === 'components') {
+      components = readItems(data);
+      await setKitComponents(accessToken, id, components.map((c) => ({ product_id: c.product_id, quantity: c.quantity })));
+    } else if (intent === 'adjust' && b) {
+      adjust = { quantity: String(data.get('quantity') ?? '').trim(), notes: String(data.get('notes') ?? '').trim() };
+      if (!adjust.quantity || Number(adjust.quantity) === 0) adjustErrors.quantity = inv.quantityRequired;
+      if (!adjust.notes) adjustErrors.notes = inv.notesRequired;
+      if (Object.keys(adjustErrors).length) throw new ApiError(400);
+      await adjustStock(accessToken, b, { product_id: id, ...adjust });
+      setFlash(Astro.cookies, { adjusted: '1' });
+      return Astro.redirect(selfPath, 303);
+    }
+    setFlash(Astro.cookies, { saved: '1' });
+    return Astro.redirect(selfPath, 303);
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    const detail = e.body?.detail;
+    if (intent === 'edit') {
+      fieldErrors = e.status === 422 ? apiFieldErrors(e.body, pr.errors) : {};
+      if (detail?.field === 'barcode') fieldErrors.barcode = pr.barcodeTaken;
+      if (detail?.field === 'product_type_id') fieldErrors.product_type_id = pr.typeLocked;
+      formError = Object.keys(fieldErrors).length ? t.ui.formError : e.status === 403 ? pr.pricesLocked : t.ui.failed;
+    } else if (intent === 'adjust') {
+      if (detail?.available !== undefined) adjustErrors.quantity = fmt(inv.notEnough, { n: Number(detail.available) });
+      else if (detail?.field === 'quantity') adjustErrors.quantity = inv.wholeUnits;
+      else if (e.status !== 400) adjustErrors.form = e.status === 403 ? t.ui.forbidden : t.ui.failed;
+    } else if (intent.startsWith('image')) {
+      pageError = { too_big: pr.imageTooBig, bad_type: pr.imageBadType, too_many: pr.imageTooMany, no_file: pr.imageNone }[detail?.code as string]
+        ?? (e.status === 403 ? t.ui.forbidden : t.ui.failed);
+    } else pageError = typeof detail?.message === 'string' ? detail.message : e.status === 403 ? t.ui.forbidden : t.ui.failed;
+  }
+  Astro.response.status = 422;
+}
+
+const flash = takeFlash(Astro.cookies);
+const bn = t.benefits;
+const [services, priceLists] = canPrice && !stockable && !product.is_kit
+  ? await Promise.all([bookableServices(accessToken), listPriceLists(accessToken)]) : [[], []];
+const [types, units, categories, taxRates, brands, suppliers, byBranch, moves, history, lastPrice, bought] = await Promise.all([
+  listCatalog(accessToken, 'product-types'),
+  listCatalog(accessToken, 'units'),
+  listCatalog(accessToken, 'categories'),
+  listCatalog(accessToken, 'tax-rates'),
+  listCatalog(accessToken, 'brands'),
+  listCatalog(accessToken, 'suppliers'),
+  canStock && stockable ? productStockByBranch(accessToken, id) : Promise.resolve([]),
+  canStock && stockable && b ? kardex(accessToken, b, id) : Promise.resolve({ items: [], has_more: false }),
+  productHistory(accessToken, id),
+  canPurchases && stockable ? lastPurchasePrice(accessToken, id) : Promise.resolve(null),
+  canPurchases && stockable && b ? productPurchases(accessToken, b, id) : Promise.resolve({ items: [], has_more: false }),
+]);
+const pu = t.purchases;
+const linked = new Set((product.suppliers ?? []).map((s) => s.id));
+const when = new Intl.DateTimeFormat(t.intl, { dateStyle: 'medium', timeStyle: 'short', timeZone: session.user.timezone });
+const unit = pr.unitNames[product.unit] ?? product.unit;
+const pct = (r: number) => `${Math.round(Number(r) * 10000) / 100}%`;
+const show = (f: string, v: unknown) => (v === null || v === undefined || v === '' ? '—' : ['price', 'cost'].includes(f) ? money(locale, Number(v)) : String(v));
+const timeline = history.items.map((h) => ({
+  title: `${pr.actions[h.action] ?? h.action} ${pr.entities[h.entity_type] ?? h.entity_type}`,
+  meta: `${h.changed_by_email ?? '—'}, ${when.format(new Date(h.changed_at))}`,
+  changes: h.action === 'UPDATE'
+    ? (h.changed_fields ?? []).filter((f) => f in pr.fields).map((f) => ({ label: pr.fields[f], from: show(f, h.old_data?.[f]), to: show(f, h.new_data?.[f]) }))
+    : [],
+}));
+const manage = canUpdate && !product.deleted_at;
+const seeSuppliers = can('suppliers', 'read');
+---
+
+<AppLayout title={product.name} current="/products">
+  <a class="ui-back" href={localePath(locale, '/products')}>← {pr.back}</a>
+  <header class="ui-header">
+    <div>
+      <h1>{product.name}</h1>
+      <p class="badges">
+        <Badge>{pr.typeNames[product.type] ?? product.type}</Badge>
+        {product.deleted_at && <Badge tone="error">{t.ui.deletedBadge}</Badge>}
+        {product.is_low_stock && stockable && <Badge tone="warning">{pr.lowStock}</Badge>}
+      </p>
+    </div>
+    <div class="ui-actions">
+      {canAdjust && stockable && !product.deleted_at && <Button variant="secondary" icon="scale" data-dialog="adjust">{pr.adjust}</Button>}
+      {manage && <Button icon="pencil" data-dialog="edit-product">{t.ui.edit}</Button>}
+    </div>
+  </header>
+
+  <div class="ui-notices">
+    {flash.saved && <Notice>{t.ui.saved}</Notice>}
+    {flash.adjusted && <Notice>{inv.adjusted}</Notice>}
+    {flash.images && <Notice>{Number(flash.images) === 1 ? pr.imageAdded : fmt(pr.imagesAdded, { n: flash.images })}</Notice>}
+    {flash.created && <Notice>{pr.created}</Notice>}
+    {flash.imagesFailed && <Notice tone="warning">{fmt(pr.imagesFailed, { names: flash.imagesFailed })}</Notice>}
+    {pageError && <Notice tone="error">{pageError}</Notice>}
+  </div>
+
+  <div class="ui-grid">
+    <Card title={pr.info}>
+      <dl class="ui-rows">
+        <div><dt>{pr.price}</dt><dd class="num strong">{money(locale, Number(product.price))}</dd></div>
+        <div><dt>{pr.cost}</dt><dd class="num">{money(locale, Number(product.cost))}</dd></div>
+        <div><dt>{pr.taxRate}</dt><dd>{product.tax_rate_name} ({pct(product.tax_rate)})</dd></div>
+        <div><dt>{pr.unit}</dt><dd>{unit}</dd></div>
+        <div><dt>{pr.category}</dt><dd>{product.category ?? '—'}</dd></div>
+        <div><dt>{pr.brand}</dt><dd>{product.brand ?? '—'}</dd></div>
+        <div><dt>{pr.barcode}</dt><dd class="num">{product.barcode ?? '—'}</dd></div>
+        {stockable && <div><dt>{pr.minStock}</dt><dd class="num">{Number(product.min_stock)} {unit}</dd></div>}
+        {product.duration_minutes && <div><dt>{pr.duration}</dt><dd class="num">{fmt(pr.minutes, { n: product.duration_minutes })}</dd></div>}
+      </dl>
+      {product.description && <p class="ui-muted ui-small">{product.description}</p>}
+    </Card>
+
+    <Card title={fmt(pr.images, { n: images.length, max: MAX_IMAGES })} class="ui-wide">
+      {images.length === 0 && !manage && <p class="ui-muted ui-small">{pr.noImages}</p>}
+      <ul class="gallery" role="list">
+        {images.map((img, n) => (
+          <li>
+            <a href={imageUrl(id, img.id)} target="_blank" rel="noopener" class="shot">
+              <img src={imageUrl(id, img.id)} alt={fmt(pr.imageAlt, { name: product.name, n: n + 1 })} loading="lazy" />
+            </a>
+            <span class="img-actions">
+              {n === 0 ? <Badge tone="accent">{pr.mainImage}</Badge> : manage && (
+                <form method="post"><input type="hidden" name="intent" value="image-main" /><input type="hidden" name="image_id" value={img.id} />
+                  <Button type="submit" variant="tertiary" icon="star" aria-label={fmt(pr.makeMainLabel, { n: n + 1 })} title={pr.makeMain} /></form>
+              )}
+              {manage && (
+                <form method="post" data-confirm={pr.deleteImageText} data-confirm-title={pr.deleteImageTitle} data-confirm-action={t.ui.delete}>
+                  <input type="hidden" name="intent" value="image-delete" /><input type="hidden" name="image_id" value={img.id} />
+                  <Button type="submit" variant="danger" icon="trash-2" aria-label={fmt(pr.deleteImageLabel, { n: n + 1 })} title={t.ui.delete} />
+                </form>
+              )}
+            </span>
+          </li>
+        ))}
+        {manage && images.length < MAX_IMAGES && (
+          <li>
+            <form method="post" enctype="multipart/form-data" class="add-shot" data-upload data-room={MAX_IMAGES - images.length}
+              data-too-many={fmt(pr.imagePickTooMany, { n: MAX_IMAGES - images.length })}>
+              <input type="hidden" name="intent" value="image-upload" />
+              <label class="shot add-label">
+                <Icon name="plus" size={32} />
+                <span class="ui-small">{pr.addImage}</span>
+                <input type="file" name="images" accept="image/jpeg,image/png,image/webp" multiple />
+              </label>
+              <noscript><Button type="submit" variant="secondary">{pr.addImages}</Button></noscript>
+            </form>
+          </li>
+        )}
+      </ul>
+      {manage && images.length < MAX_IMAGES && <p class="ui-muted ui-small">{fmt(pr.imagesHint, { n: MAX_IMAGES - images.length })}</p>}
+      <p class="ui-alert" data-upload-error role="alert" hidden></p>
+    </Card>
+
+    {canStock && stockable && (
+      <Card title={pr.stockByBranch}>
+        <dl class="ui-rows">
+          {byBranch.map((s) => <div><dt>{s.branch}</dt><dd class="num strong">{Number(s.current_stock)} {unit}</dd></div>)}
+        </dl>
+      </Card>
+    )}
+
+    {canPurchases && stockable && (
+      <Card title={pu.lastPrice}>
+        <p class:list={['ui-small', !lastPrice && 'ui-muted']}>
+          {lastPrice ? (
+            <a href={localePath(locale, `/purchases/${lastPrice.purchase_id}`)}>{fmt(pu.lastPriceText, {
+              cost: money(locale, Number(lastPrice.unit_cost)), date: when.format(new Date(lastPrice.purchased_at)),
+              supplier: lastPrice.supplier ?? pu.noSupplier, branch: lastPrice.branch,
+            })}</a>
+          ) : pu.neverBought}
+        </p>
+        {bought.items.length > 0 && (
+          <>
+            <h3 class="ui-small ui-muted sub">{pu.recent}</h3>
+            <dl class="ui-rows">
+              {bought.items.map((l) => (
+                <div>
+                  <dt><a href={localePath(locale, `/purchases/${l.purchase_id}`)}>{when.format(new Date(l.purchased_at))}</a>
+                    <span class="ui-line2">{l.supplier ?? pu.noSupplier}, {Number(l.quantity)} × {money(locale, Number(l.unit_cost))}</span></dt>
+                  <dd class="num">{money(locale, Number(l.line_total))}</dd>
+                </div>
+              ))}
+            </dl>
+          </>
+        )}
+      </Card>
+    )}
+
+    {canPrice && !stockable && !product.is_kit && (
+      <Card title={bn.title}>
+        <p class="ui-muted ui-small">{bn.intro}</p>
+        <form method="post" class="ui-form benefit-form" data-benefit-form>
+          <input type="hidden" name="intent" value="benefit" />
+          <fieldset class="ui-full kinds">
+            <legend class="visually-hidden">{bn.title}</legend>
+            {(['', 'package', 'membership'] as const).map((k) => (
+              <label class="ui-check"><input type="radio" name="kind" value={k} checked={(product.benefit?.kind ?? '') === k} />{bn.kinds[k || 'none']}</label>
+            ))}
+          </fieldset>
+          <div class="ui-full" data-for="package">
+            <Field label={bn.service} name="service_product_id" as="select">
+              <option value="">—</option>
+              {services.filter((sv) => sv.id !== id).map((sv) => <option value={sv.id} selected={sv.id === product.benefit?.service_product_id}>{sv.name}</option>)}
+            </Field>
+          </div>
+          <div data-for="package"><Field label={bn.sessions} name="sessions" type="number" min="1" max="500" step="1" value={String(product.benefit?.sessions ?? '')} /></div>
+          <div data-for="package membership"><Field label={bn.validDays} name="valid_days" type="number" min="1" max="3660" step="1"
+            value={String(product.benefit?.valid_days ?? '')} hint={bn.validDaysHint} /></div>
+          <div class="ui-full" data-for="membership">
+            <Field label={bn.priceList} name="price_list_id" as="select" hint={bn.priceListHint}>
+              <option value="">—</option>
+              {priceLists.map((l) => <option value={l.id} selected={l.id === product.benefit?.price_list_id}>{l.name}</option>)}
+            </Field>
+          </div>
+          <div class="ui-form-actions"><Button type="submit" variant="secondary">{t.ui.saveChanges}</Button></div>
+        </form>
+      </Card>
+    )}
+
+    <Card title={pr.suppliers}>
+      {suppliers.length === 0 ? (
+        <p class="ui-muted ui-small">{pr.noSuppliers} {seeSuppliers && <a href={localePath(locale, '/suppliers')}>{t.suppliers.title}</a>}</p>
+      ) : (
+        <form method="post" class="stack">
+          <input type="hidden" name="intent" value="suppliers" />
+          <fieldset class="ui-checks" disabled={!manage}>
+            <legend class="visually-hidden">{pr.suppliers}</legend>
+            {suppliers.map((s) => (
+              <span class="sup-row">
+                <label class="ui-check"><input type="checkbox" name="supplier" value={s.id} checked={linked.has(s.id)} />{s.name}</label>
+                {seeSuppliers && <a class="sup-link" href={localePath(locale, `/suppliers/${s.id}`)} aria-label={`${t.suppliers.seeSupplier}: ${s.name}`}><Icon name="arrow-up-right" size={16} /></a>}
+              </span>
+            ))}
+          </fieldset>
+          {manage && <Button type="submit" variant="secondary">{t.ui.saveChanges}</Button>}
+        </form>
+      )}
+    </Card>
+
+    {product.is_kit && (
+      <Card title={pr.components} class="ui-wide">
+        <p class="ui-muted ui-small">{pr.componentsHint}</p>
+        <form method="post" class="stack">
+          <input type="hidden" name="intent" value="components" />
+          <ItemsEditor id="components" items={components} intl={t.intl} labels={{
+            product: t.purchases.product, placeholder: t.purchases.productPlaceholder, hint: t.purchases.productHint,
+            noResults: t.purchases.noProducts, clear: t.calendar.clearSelection, quantity: pr.quantity, unitCost: '', lineTotal: '',
+            add: pr.addComponent, remove: t.purchases.remove, total: '', empty: t.purchases.noItems,
+          }} />
+          {manage && <Button type="submit" variant="secondary">{t.ui.saveChanges}</Button>}
+        </form>
+      </Card>
+    )}
+
+    {canStock && stockable && b && (
+      <Card title={pr.kardex} class="ui-wide">
+        {moves.items.length === 0 ? <p class="ui-muted">{pr.noMovements}</p> : (
+          <div class="ui-table-wrap">
+            <table class="ui-table">
+              <thead><tr><th scope="col">{inv.colDate}</th><th scope="col">{inv.colType}</th><th scope="col" class="ui-end">{inv.colQty}</th><th scope="col" class="ui-end">{inv.colAfter}</th><th scope="col">{inv.colBy}</th></tr></thead>
+              <tbody>
+                {moves.items.map((m) => (
+                  <tr>
+                    <td data-label={inv.colDate} class="num">{when.format(new Date(m.created_at))}</td>
+                    <td data-label={inv.colType}>{inv.types[m.movement_type] ?? m.movement_type}{m.notes && <span class="ui-line2">{m.notes}</span>}</td>
+                    <td data-label={inv.colQty} class:list={['ui-end num', Number(m.quantity) > 0 ? 'ui-in' : 'ui-out']}>{Number(m.quantity) > 0 ? '+' : ''}{Number(m.quantity)}</td>
+                    <td data-label={inv.colAfter} class="ui-end num">{Number(m.stock_after)}</td>
+                    <td data-label={inv.colBy} class="ui-muted">{m.created_by_email}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Card>
+    )}
+
+    <Card title={t.ui.history} class="ui-wide">
+      <Timeline items={timeline} />
+    </Card>
+  </div>
+
+  {
+    manage && (
+      <Dialog id="edit-product" title={pr.editTitle} closeLabel={t.ui.close} open={!!formError}>
+        <form method="post" class="ui-form" enctype="multipart/form-data" novalidate>
+          {formError && <p class="ui-alert" role="alert">{formError}</p>}
+          <input type="hidden" name="intent" value="edit" />
+          <ProductFields locale={locale} values={values} errors={fieldErrors} catalogs={{ types, units, categories, taxRates, brands }} canPrice={canPrice}
+            imageRoom={MAX_IMAGES - images.length} />
+          <div class="ui-form-actions">
+            <Button variant="tertiary" data-dialog-close>{t.ui.cancel}</Button>
+            <Button type="submit">{t.ui.saveChanges}</Button>
+          </div>
+        </form>
+      </Dialog>
+    )
+  }
+  {
+    canAdjust && stockable && (
+      <Dialog id="adjust" title={fmt(inv.adjustTitle, { name: product.name })} closeLabel={t.ui.close} open={Object.keys(adjustErrors).length > 0}>
+        <form method="post" class="ui-form" novalidate>
+          {adjustErrors.form && <p class="ui-alert" role="alert">{adjustErrors.form}</p>}
+          <input type="hidden" name="intent" value="adjust" />
+          <p class="ui-full ui-muted ui-small">{inv.adjustHint}</p>
+          <div class="ui-full"><Field label={`${inv.quantity} (${unit})`} name="quantity" type="number" step="0.001" inputmode="decimal" value={adjust.quantity} error={adjustErrors.quantity} required /></div>
+          <div class="ui-full"><Field label={inv.notes} name="notes" value={adjust.notes} placeholder={inv.notesPlaceholder} error={adjustErrors.notes} required maxlength={1000} /></div>
+          <div class="ui-form-actions">
+            <Button variant="tertiary" data-dialog-close>{t.ui.cancel}</Button>
+            <Button type="submit">{inv.adjust}</Button>
+          </div>
+        </form>
+      </Dialog>
+    )
+  }
+</AppLayout>
+
+<script>
+  // Package / membership: only the fields of the chosen kind
+  const benefit = document.querySelector<HTMLFormElement>('[data-benefit-form]');
+  const showKind = () => {
+    const kind = benefit!.querySelector<HTMLInputElement>('input[name=kind]:checked')?.value ?? '';
+    benefit!.querySelectorAll<HTMLElement>('[data-for]').forEach((el) => {
+      const on = !!kind && el.dataset.for!.split(' ').includes(kind);
+      el.hidden = !on;
+      el.querySelectorAll<HTMLInputElement | HTMLSelectElement>('input, select').forEach((c) => (c.disabled = !on));
+    });
+  };
+  if (benefit) { benefit.addEventListener('change', showKind); showKind(); }
+
+  // Choosing files uploads them right away (no more than the room left)
+  const upload = document.querySelector<HTMLFormElement>('[data-upload]');
+  const input = upload?.querySelector<HTMLInputElement>('input[type=file]');
+  input?.addEventListener('change', () => {
+    const error = document.querySelector<HTMLElement>('[data-upload-error]')!;
+    const room = Number(upload!.dataset.room);
+    if ((input.files?.length ?? 0) > room) {
+      error.textContent = upload!.dataset.tooMany!;
+      error.hidden = false;
+      input.value = '';
+      return;
+    }
+    if (!input.files?.length) return;
+    dispatchEvent(new Event('app:navigating')); // submit() fires no submit event: show the page skeleton anyway
+    upload!.submit();
+  });
+</script>
+
+<style>
+  .gallery {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(9rem, 1fr));
+    gap: var(--space-3);
+    margin: 0 0 var(--space-4);
+    padding: 0;
+    list-style: none;
+  }
+  .gallery li {
+    display: grid;
+    gap: var(--space-2);
+  }
+  .img-actions {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-1);
+    min-height: var(--control-height);
+  }
+  .shot {
+    display: block;
+    aspect-ratio: 1;
+    overflow: hidden;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-control);
+  }
+  .shot img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+  .add-shot {
+    margin: 0;
+  }
+  .add-label {
+    position: relative;
+    display: grid;
+    place-content: center;
+    justify-items: center;
+    gap: var(--space-1);
+    background: none;
+    border: 2px dashed var(--border-input);
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+  .add-label:hover,
+  .add-label:focus-within {
+    border-color: var(--color-primary);
+    color: var(--color-primary);
+  }
+  .add-label input {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    opacity: 0;
+  }
+  .sub {
+    margin: var(--space-4) 0 var(--space-2);
+  }
+  .badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-1);
+    margin-top: var(--space-2);
+  }
+  .stack {
+    display: grid;
+    gap: var(--space-3);
+    justify-items: start;
+  }
+  .stack > :global(.items) {
+    width: 100%;
+  }
+  .strong {
+    font-weight: var(--weight-bold);
+  }
+  .sup-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+  .sup-link {
+    display: inline-grid;
+    place-items: center;
+    color: var(--text-muted);
+  }
+  .sup-link:hover {
+    color: var(--color-primary);
+  }
+  .kinds {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-3);
+    margin: 0;
+    padding: 0;
+    border: 0;
+  }
+  .benefit-form [hidden] {
+    display: none;
+  }
+</style>

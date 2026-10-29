@@ -1,0 +1,339 @@
+---
+// Sales of the working branch: list, what's still to deliver, what customers owe, returns and a report.
+import AppLayout from '@/layouts/AppLayout.astro';
+import Badge from '@/components/ui/Badge.astro';
+import Button from '@/components/ui/Button.astro';
+import Card from '@/components/ui/Card.astro';
+import Dialog from '@/components/ui/Dialog.astro';
+import EmptyState from '@/components/ui/EmptyState.astro';
+import Field from '@/components/ui/Field.astro';
+import Notice from '@/components/ui/Notice.astro';
+import { fmt, getLocale, localePath, money, useTranslations } from '@/i18n';
+import { ApiError } from '@/lib/api';
+import { listPaymentMethods } from '@/lib/cash';
+import { customerAbono, listReturns, listSales, offlineIssues, pendingCredit, pendingDeliveries, saleErrorText, salesReport } from '@/lib/sales';
+import { setFlash, takeFlash } from '@/lib/session';
+import { startOfDay } from '@/lib/time';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const s = t.sales;
+const { session, accessToken, branch } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'sales')?.permissions ?? [];
+if (!perms.includes('read')) return Astro.rewrite('/404');
+const tz = session.user.timezone;
+const basePath = localePath(locale, '/sales');
+const TABS = ['list', 'deliveries', 'credit', 'returns', 'report'] as const;
+const params = Astro.url.searchParams;
+const tab = (TABS as readonly string[]).includes(params.get('tab') ?? '') ? (params.get('tab') as (typeof TABS)[number]) : 'list';
+const page = Math.max(1, Number.parseInt(params.get('page') ?? '1', 10) || 1);
+
+let abonoError: string | undefined;
+let abonoValues = { customer_id: '', customer: '', owed: '', payment_method_id: '', amount: '', amount_tendered: '', reference: '' };
+if (branch && Astro.request.method === 'POST' && perms.includes('update')) {
+  const data = await Astro.request.formData();
+  abonoValues = Object.fromEntries(Object.keys(abonoValues).map((k) => [k, String(data.get(k) ?? '').trim()])) as typeof abonoValues;
+  try {
+    const r = await customerAbono(accessToken, branch.id, {
+      customer_id: abonoValues.customer_id, payment_method_id: abonoValues.payment_method_id, amount: abonoValues.amount || '0',
+      amount_tendered: abonoValues.amount_tendered || null, reference: abonoValues.reference || null,
+    });
+    setFlash(Astro.cookies, { abono: abonoValues.amount, customer: abonoValues.customer, change: String(r.change ?? 0), folios: r.applied.map((a) => a.folio).join(', ') });
+    return Astro.redirect(`${basePath}?tab=credit`, 303);
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    const detail = e.body?.detail;
+    abonoError = detail?.outstanding !== undefined ? fmt(s.detail.tooMuch, { amount: money(locale, Number(detail.outstanding)) }) : saleErrorText(e.status, detail, t).text;
+  }
+  Astro.response.status = 422;
+}
+
+const date = (v: string | null) => { try { return v ? Temporal.PlainDate.from(v) : undefined; } catch { return undefined; } };
+const today = Temporal.Now.plainDateISO(tz);
+const from = date(params.get('from')) ?? (tab === 'report' ? today : undefined);
+const to = date(params.get('to')) ?? (tab === 'report' ? today : undefined);
+const range = { from: from && startOfDay(from, tz), to: to && startOfDay(to.add({ days: 1 }), tz) };
+const status = ['PAID', 'PENDING', 'RETURNED'].includes(params.get('status') ?? '') ? params.get('status')! : undefined;
+const q = (params.get('q') ?? '').trim().slice(0, 30);
+// From a customer's page: only their sales
+const customerId = /^[0-9a-f-]{36}$/i.test(params.get('customer_id') ?? '') ? params.get('customer_id')! : undefined;
+
+let pageError: string | undefined;
+const b = branch?.id;
+const toReview = b ? (await offlineIssues(accessToken, b).catch(() => [])).length : 0;
+const data = b ? await (async () => {
+  try {
+    if (tab === 'list') return { sales: await listSales(accessToken, b, { ...range, status, q, page, customer_id: customerId }) };
+    if (tab === 'deliveries') return { deliveries: await pendingDeliveries(accessToken, b) };
+    if (tab === 'credit') return { credit: await pendingCredit(accessToken, b), methods: (await listPaymentMethods(accessToken)).filter((m) => !m.is_credit) };
+    if (tab === 'returns') return { returns: await listReturns(accessToken, b, { ...range, page }) };
+    return { report: await salesReport(accessToken, b, range.from!, range.to!) };
+  } catch (e) {
+    if (!(e instanceof ApiError) || e.status !== 422) throw e;
+    pageError = t.purchases.badRange;
+    return {};
+  }
+})() : {};
+const flash = takeFlash(Astro.cookies);
+const when = new Intl.DateTimeFormat(t.intl, { dateStyle: 'medium', timeStyle: 'short', timeZone: tz });
+const tone = { PAID: 'success', PENDING: 'warning', RETURNED: 'neutral' } as const;
+const link = (extra: Record<string, string | number>) => {
+  const qp = new URLSearchParams(params);
+  for (const [k, v] of Object.entries(extra)) qp.set(k, String(v));
+  return `${basePath}?${qp}`;
+};
+// What each customer owes in this branch (the abono is spread over their sales, oldest first)
+type Pending = NonNullable<typeof data.credit>;
+const debtors = Object.values((data.credit ?? []).reduce((acc, r) => {
+  const d = (acc[r.customer_id] ??= { customer_id: r.customer_id, customer: r.customer, owed: 0, sales: [] });
+  d.owed += Number(r.credit_outstanding);
+  d.sales.push(r);
+  return acc;
+}, {} as Record<string, { customer_id: string; customer: string; owed: number; sales: Pending }>));
+const method = (d: string) => t.cash.methodNames[d] ?? d;
+---
+
+<AppLayout title={s.title} current="/sales">
+  <header class="ui-header">
+    <div>
+      <h1>{s.title}</h1>
+      {branch && <p class="ui-sub">{branch.name}</p>}
+    </div>
+    {perms.includes('create') && branch && <Button icon="shopping-cart" href={localePath(locale, '/sales/new')}>{s.newSale}</Button>}
+  </header>
+
+  <nav class="ui-tabs tabs" aria-label={s.title}>
+    {TABS.map((k) => <a href={k === 'list' ? basePath : `${basePath}?tab=${k}`} aria-current={k === tab ? 'page' : undefined}>{s.tabs[k]}</a>)}
+  </nav>
+
+  <div class="ui-notices">
+    {toReview > 0 && <Notice tone="warning">{fmt(t.offline.issuesBanner, { n: toReview })} · <a href={localePath(locale, '/sales/offline')}>{t.reports.see}</a></Notice>}
+    {flash.abono && <Notice>{fmt(s.credit.done, { amount: money(locale, Number(flash.abono)), customer: flash.customer, folios: flash.folios })}{Number(flash.change) > 0 && ` ${fmt(s.credit.change, { change: money(locale, Number(flash.change)) })}`}</Notice>}
+    {pageError && <Notice tone="error">{pageError}</Notice>}
+    {customerId && tab === 'list' && (
+      <Notice>
+        {fmt(s.customerFilter, { customer: data.sales?.items[0]?.customer ?? '' })} · <a href={localePath(locale, `/customers/${customerId}`)}>{s.customerFilterBack}</a> · <a href={basePath}>{s.customerFilterClear}</a>
+      </Notice>
+    )}
+  </div>
+
+  {
+    !branch ? <Notice tone="warning">{t.ui.noBranch}</Notice> : (
+      <>
+        {(tab === 'list' || tab === 'returns' || tab === 'report') && (
+          <form method="get" class="filters">
+            {tab !== 'list' && <input type="hidden" name="tab" value={tab} />}
+            {customerId && <input type="hidden" name="customer_id" value={customerId} />}
+            <Field label={t.purchases.from} name="from" type="date" value={from?.toString()} max={today.toString()} />
+            <Field label={t.purchases.to} name="to" type="date" value={to?.toString()} max={today.toString()} />
+            {tab === 'list' && (
+              <>
+                <Field label={s.colStatus} name="status" as="select">
+                  <option value="">{t.ui.all}</option>
+                  {(['PAID', 'PENDING', 'RETURNED'] as const).map((k) => <option value={k} selected={k === status}>{s.status[k]}</option>)}
+                </Field>
+                <Field label={s.folio} name="q" type="search" value={q} maxlength={30} />
+              </>
+            )}
+            <Button type="submit" variant="secondary" icon="filter">{t.purchases.filter}</Button>
+          </form>
+        )}
+
+        {tab === 'list' && data.sales && (data.sales.items.length === 0 && page === 1 ? (
+          from || to || status || q ? <p class="ui-muted">{s.noResults}</p> : (
+            <EmptyState icon="shopping-cart" title={s.empty} text={s.emptyText}>
+              {perms.includes('create') && <Button icon="shopping-cart" href={localePath(locale, '/sales/new')}>{s.newSale}</Button>}
+            </EmptyState>
+          )
+        ) : (
+          <div class="ui-table-wrap">
+            <table class="ui-table">
+              <thead><tr><th scope="col">{s.folio}</th><th scope="col">{s.colCustomer}</th><th scope="col">{s.colStatus}</th><th scope="col" class="ui-end">{s.cart.total}</th></tr></thead>
+              <tbody>
+                {data.sales.items.map((x) => (
+                  <tr>
+                    <td data-label={s.folio}><a class="ui-strong num" href={localePath(locale, `/sales/${x.id}`)}>{x.folio}</a><span class="ui-line2">{when.format(new Date(x.sold_at))} · {x.seller}</span></td>
+                    <td data-label={s.colCustomer}>{x.customer ?? <span class="ui-muted">{s.noCustomer}</span>}</td>
+                    <td data-label={s.colStatus}><Badge tone={tone[x.status]}>{s.status[x.status]}</Badge>{Number(x.reserved_items) > 0 && <Badge tone="accent">{s.toDeliverBadge}</Badge>}</td>
+                    <td data-label={s.cart.total} class="ui-end num ui-strong">{money(locale, Number(x.total))}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ))}
+
+        {tab === 'deliveries' && data.deliveries && (data.deliveries.length === 0 ? <p class="ui-muted">{s.deliveries.empty}</p> : (
+          <div class="ui-table-wrap">
+            <table class="ui-table">
+              <thead><tr><th scope="col">{s.folio}</th><th scope="col">{s.cart.product}</th><th scope="col">{s.colCustomer}</th><th scope="col" class="ui-end">{s.cart.quantity}</th></tr></thead>
+              <tbody>
+                {data.deliveries.map((d) => (
+                  <tr>
+                    <td data-label={s.folio}><a class="ui-strong num" href={localePath(locale, `/sales/${d.sale_id}`)}>{d.folio}</a><span class="ui-line2">{when.format(new Date(d.sold_at))}</span></td>
+                    <td data-label={s.cart.product}>{d.product}</td>
+                    <td data-label={s.colCustomer}>{d.customer ?? <span class="ui-muted">{s.noCustomer}</span>}</td>
+                    <td data-label={s.cart.quantity} class="ui-end num">{Number(d.quantity)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ))}
+
+        {tab === 'credit' && data.credit && (debtors.length === 0 ? <p class="ui-muted">{s.credit.empty}</p> : (
+          <div class="debtors">
+            {debtors.map((d) => (
+              <Card title={d.customer}>
+                <p class="owed num">{money(locale, d.owed)}</p>
+                <dl class="ui-rows">
+                  {d.sales.map((x) => <div><dt><a class="num" href={localePath(locale, `/sales/${x.sale_id}`)}>{x.folio}</a><span class="ui-line2">{when.format(new Date(x.sold_at))}</span></dt><dd class="num">{money(locale, Number(x.credit_outstanding))}</dd></div>)}
+                </dl>
+                {perms.includes('update') && (
+                  <Button variant="secondary" icon="hand-coins" data-dialog="customer-abono" data-abono-customer={d.customer_id} data-abono-name={d.customer} data-abono-owed={d.owed.toFixed(2)}>
+                    {s.credit.collect}
+                  </Button>
+                )}
+              </Card>
+            ))}
+          </div>
+        ))}
+
+        {tab === 'returns' && data.returns && (data.returns.items.length === 0 ? <p class="ui-muted">{s.returns.empty}</p> : (
+          <div class="ui-table-wrap">
+            <table class="ui-table">
+              <thead><tr><th scope="col">{s.returns.folio}</th><th scope="col">{s.folio}</th><th scope="col">{s.returns.reason}</th><th scope="col" class="ui-end">{s.returns.refundTotal}</th></tr></thead>
+              <tbody>
+                {data.returns.items.map((x) => (
+                  <tr>
+                    <td data-label={s.returns.folio}><span class="ui-strong num">{x.folio}</span><span class="ui-line2">{when.format(new Date(x.created_at))} · {x.processed_by}</span></td>
+                    <td data-label={s.folio}><a class="num" href={localePath(locale, `/sales/${x.sale_id}`)}>{x.sale_folio}</a>{x.customer && <span class="ui-line2">{x.customer}</span>}</td>
+                    <td data-label={s.returns.reason}>{x.reason ?? '—'}</td>
+                    <td data-label={s.returns.refundTotal} class="ui-end num">−{money(locale, Number(x.refund_total))}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ))}
+
+        {tab === 'report' && data.report && (
+          <div class="ui-grid">
+            <Card title={s.report.totals}>
+              <dl class="ui-rows">
+                <div><dt>{s.report.sales}</dt><dd class="num">{data.report.totals.sales}</dd></div>
+                <div><dt>{s.report.sold}</dt><dd class="num">{money(locale, Number(data.report.totals.total))}</dd></div>
+                <div><dt>{s.report.returns}</dt><dd class="num">−{money(locale, Number(data.report.totals.returns))}</dd></div>
+                <div><dt class="ui-strong">{s.report.net}</dt><dd class="num ui-strong">{money(locale, Number(data.report.totals.net))}</dd></div>
+                <div><dt>{s.report.tax}</dt><dd class="num">{money(locale, Number(data.report.totals.tax))}</dd></div>
+                <div><dt>{s.report.discounts}</dt><dd class="num">{money(locale, Number(data.report.totals.sale_discounts))}</dd></div>
+              </dl>
+            </Card>
+            <Card title={s.report.byMethod}>
+              {data.report.by_method.length === 0 ? <p class="ui-muted">—</p> : <dl class="ui-rows">{data.report.by_method.map((r) => <div><dt>{method(r.method)}<span class="ui-line2">{r.payments}</span></dt><dd class="num">{money(locale, Number(r.amount))}</dd></div>)}</dl>}
+            </Card>
+            <Card title={s.report.bySeller}>
+              {data.report.by_seller.length === 0 ? <p class="ui-muted">—</p> : <dl class="ui-rows">{data.report.by_seller.map((r) => <div><dt>{r.seller}<span class="ui-line2">{fmt(s.report.salesCount, { n: r.sales })}</span></dt><dd class="num">{money(locale, Number(r.total))}</dd></div>)}</dl>}
+            </Card>
+            <Card title={s.report.top} class="ui-wide">
+              {data.report.top_products.length === 0 ? <p class="ui-muted">—</p> : (
+                <div class="ui-table-wrap">
+                  <table class="ui-table">
+                    <thead><tr><th scope="col">{s.cart.product}</th><th scope="col" class="ui-end">{s.cart.quantity}</th><th scope="col" class="ui-end">{s.report.sold}</th><th scope="col" class="ui-end">{s.report.margin}</th></tr></thead>
+                    <tbody>
+                      {data.report.top_products.map((r) => (
+                        <tr>
+                          <td data-label={s.cart.product}><a href={localePath(locale, `/products/${r.product_id}`)}>{r.product}</a></td>
+                          <td data-label={s.cart.quantity} class="ui-end num">{Number(r.quantity)}</td>
+                          <td data-label={s.report.sold} class="ui-end num">{money(locale, Number(r.total))}</td>
+                          <td data-label={s.report.margin} class="ui-end num">{money(locale, Number(r.margin))}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </Card>
+            {data.report.promotions.length > 0 && (
+              <Card title={s.report.promotions}>
+                <dl class="ui-rows">{data.report.promotions.map((r) => <div><dt>{r.name}<span class="ui-line2">{fmt(s.report.lines, { n: r.lines })}</span></dt><dd class="num">−{money(locale, Number(r.discount_given))}</dd></div>)}</dl>
+              </Card>
+            )}
+          </div>
+        )}
+
+        {(tab === 'list' && data.sales?.has_more || tab === 'returns' && data.returns?.has_more || page > 1) && (
+          <nav class="ui-pager">
+            <span />
+            <span class="ui-actions">
+              {page > 1 && <Button variant="secondary" href={link({ page: page - 1 })}>{t.ui.previous}</Button>}
+              {(data.sales?.has_more || data.returns?.has_more) && <Button variant="secondary" href={link({ page: page + 1 })}>{t.ui.next}</Button>}
+            </span>
+          </nav>
+        )}
+      </>
+    )
+  }
+
+  {tab === 'credit' && perms.includes('update') && data.methods && (
+    <Dialog id="customer-abono" title={s.credit.collect} closeLabel={t.ui.close} open={!!abonoError}>
+      <form method="post" class="ui-form" novalidate>
+        {abonoError && <p class="ui-alert" role="alert">{abonoError}</p>}
+        <input type="hidden" name="customer_id" value={abonoValues.customer_id} data-f="customer_id" />
+        <input type="hidden" name="customer" value={abonoValues.customer} data-f="customer" />
+        <input type="hidden" name="owed" value={abonoValues.owed} data-f="owed" />
+        <p class="ui-full"><strong data-show="customer">{abonoValues.customer}</strong> <span class="ui-muted" data-show="owed">{abonoValues.owed && money(locale, Number(abonoValues.owed))}</span></p>
+        <p class="ui-full ui-muted ui-small">{s.credit.spread}</p>
+        <Field label={s.cart.method} name="payment_method_id" as="select">
+          {data.methods.map((m) => <option value={m.id} selected={m.id === abonoValues.payment_method_id}>{method(m.description)}</option>)}
+        </Field>
+        <Field label={s.cart.amount} name="amount" type="number" step="0.01" min="0.01" inputmode="decimal" value={abonoValues.amount} required data-f="amount" />
+        <Field label={s.cart.tendered} name="amount_tendered" type="number" step="0.01" min="0" inputmode="decimal" value={abonoValues.amount_tendered} hint={s.detail.tenderedHint} />
+        <Field label={s.cart.reference} name="reference" maxlength={100} value={abonoValues.reference} />
+        <div class="ui-form-actions">
+          <Button variant="tertiary" data-dialog-close>{t.ui.cancel}</Button>
+          <Button type="submit">{s.detail.abonoSave}</Button>
+        </div>
+      </form>
+    </Dialog>
+  )}
+</AppLayout>
+
+<script>
+  // "Collect" fills the dialog with the customer and what they owe
+  const dialog = document.querySelector<HTMLDialogElement>('#customer-abono');
+  document.querySelectorAll<HTMLElement>('[data-abono-customer]').forEach((b) => b.addEventListener('click', () => {
+    const set = (k: string, v: string) => { const i = dialog?.querySelector<HTMLInputElement>(`[data-f="${k}"]`); if (i) i.value = v; };
+    set('customer_id', b.dataset.abonoCustomer!);
+    set('customer', b.dataset.abonoName!);
+    set('owed', b.dataset.abonoOwed!);
+    set('amount', b.dataset.abonoOwed!);
+    dialog!.querySelector('[data-show="customer"]')!.textContent = b.dataset.abonoName!;
+    dialog!.querySelector('[data-show="owed"]')!.textContent = `$${b.dataset.abonoOwed}`;
+  }));
+</script>
+
+<style>
+  .tabs {
+    margin-bottom: var(--space-4);
+  }
+  .filters {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: var(--space-3);
+    margin-bottom: var(--space-5);
+  }
+  .filters > :global(.field) {
+    flex: 1 1 10rem;
+  }
+  .debtors {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(18rem, 1fr));
+    gap: var(--space-4);
+  }
+  .owed {
+    font-size: var(--text-xl, 1.5rem);
+    font-weight: var(--weight-bold);
+  }
+</style>

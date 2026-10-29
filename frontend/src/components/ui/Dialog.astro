@@ -1,0 +1,94 @@
+---
+// Modal on the native <dialog>: focus trap, Escape and top layer for free.
+// Open it with any element that has data-dialog="<id>", or render it with `open` to show it on load (e.g. after a server error).
+import Icon from './Icon.astro';
+
+interface Props {
+  id: string;
+  title: string;
+  closeLabel: string;
+  open?: boolean;
+}
+
+const { id, title, closeLabel, open = false } = Astro.props;
+---
+
+<dialog id={id} class="dialog" aria-labelledby={`${id}-title`} data-open-on-load={open ? '' : undefined}>
+  <header>
+    <h2 id={`${id}-title`} data-dialog-title>{title}</h2>
+    <button type="button" class="close" data-dialog-close aria-label={closeLabel}>
+      <Icon name="x" />
+    </button>
+  </header>
+  <slot />
+</dialog>
+
+<script>
+  document.querySelectorAll<HTMLDialogElement>('dialog.dialog').forEach((dialog) => {
+    dialog.querySelectorAll('[data-dialog-close]').forEach((el) => el.addEventListener('click', () => dialog.close()));
+    // Click on the backdrop closes it
+    dialog.addEventListener('click', (e) => e.target === dialog && dialog.close());
+    if (dialog.hasAttribute('data-open-on-load')) dialog.showModal();
+  });
+  document.querySelectorAll<HTMLElement>('[data-dialog]').forEach((el) =>
+    el.addEventListener('click', () => document.querySelector<HTMLDialogElement>(`#${el.dataset.dialog}`)?.showModal()),
+  );
+</script>
+
+<style>
+  .dialog {
+    width: min(100% - 2 * var(--space-4), 32rem);
+    max-height: min(100% - 2 * var(--space-4), 48rem);
+    padding: var(--space-6);
+    background: var(--bg-app);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-container);
+    box-shadow: var(--shadow-overlay);
+    color: var(--text-body);
+  }
+
+  .dialog::backdrop {
+    background: var(--overlay-scrim);
+  }
+
+  .dialog[open] {
+    animation: rise var(--duration-fast) ease-out;
+  }
+
+  @keyframes rise {
+    from {
+      opacity: 0;
+      transform: translateY(0.5rem);
+    }
+  }
+
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    margin-bottom: var(--space-5);
+  }
+
+  h2 {
+    font-size: var(--text-lg);
+  }
+
+  .close {
+    display: grid;
+    place-items: center;
+    width: 2.25rem;
+    height: 2.25rem;
+    margin: calc(-1 * var(--space-2));
+    background: none;
+    border: 0;
+    border-radius: var(--radius-control);
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+
+  .close:hover {
+    background: var(--color-primary-tint);
+    color: var(--color-primary);
+  }
+</style>

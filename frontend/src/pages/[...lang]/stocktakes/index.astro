@@ -1,0 +1,134 @@
+---
+// Physical counts of the working branch. Only one can be open at a time: it's shown on top to keep counting.
+import AppLayout from '@/layouts/AppLayout.astro';
+import Badge from '@/components/ui/Badge.astro';
+import Button from '@/components/ui/Button.astro';
+import Dialog from '@/components/ui/Dialog.astro';
+import EmptyState from '@/components/ui/EmptyState.astro';
+import Field from '@/components/ui/Field.astro';
+import Notice from '@/components/ui/Notice.astro';
+import { fmt, getLocale, localePath, useTranslations } from '@/i18n';
+import { ApiError } from '@/lib/api';
+import { currentStocktake, listStocktakes, openStocktake } from '@/lib/stocktakes';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const st = t.stocktakes;
+const { session, accessToken, branch } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'stocktakes')?.permissions ?? [];
+if (!perms.includes('read')) return Astro.rewrite('/404');
+const canOpen = perms.includes('create') && !!branch;
+const basePath = localePath(locale, '/stocktakes');
+const params = Astro.url.searchParams;
+const status = ['OPEN', 'COMPLETED', 'CANCELLED'].includes(params.get('status') ?? '') ? params.get('status')! : undefined;
+const page = Math.max(1, Number.parseInt(params.get('page') ?? '1', 10) || 1);
+
+let openError: string | undefined;
+let notes = '';
+if (branch && Astro.request.method === 'POST' && canOpen) {
+  notes = String((await Astro.request.formData()).get('notes') ?? '').trim();
+  try {
+    const created = await openStocktake(accessToken, branch.id, notes || null);
+    return Astro.redirect(localePath(locale, `/stocktakes/${created.id}`), 303);
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    const other = e.body?.detail?.stocktake;
+    if (other) return Astro.redirect(localePath(locale, `/stocktakes/${other.id}`), 303); // already open: go count there
+    openError = t.ui.failed;
+  }
+  Astro.response.status = 422;
+}
+
+const [open, result] = branch
+  ? await Promise.all([currentStocktake(accessToken, branch.id), listStocktakes(accessToken, branch.id, { status, page })])
+  : [undefined, { items: [], has_more: false }];
+const when = new Intl.DateTimeFormat(t.intl, { dateStyle: 'medium', timeStyle: 'short', timeZone: session.user.timezone });
+const tone = { OPEN: 'warning', COMPLETED: 'success', CANCELLED: 'neutral' } as const;
+const link = (extra: Record<string, string | number>) => {
+  const q = new URLSearchParams(params);
+  for (const [k, v] of Object.entries(extra)) q.set(k, String(v));
+  return `${basePath}?${q}`;
+};
+---
+
+<AppLayout title={st.title} current="/stocktakes">
+  <header class="ui-header">
+    <div>
+      <h1>{st.title}</h1>
+      {branch && <p class="ui-sub">{branch.name}</p>}
+    </div>
+    {canOpen && !open && <Button icon="clipboard-check" data-dialog="open-stocktake">{st.start}</Button>}
+  </header>
+
+  {
+    !branch ? <Notice tone="warning">{t.ui.noBranch}</Notice> : (
+      <>
+        {open && (
+          <Notice tone="warning">
+            {fmt(st.inProgress, { folio: open.folio, by: open.created_by, date: when.format(new Date(open.created_at)) })}
+            <Button slot="action" icon="scan-barcode" href={localePath(locale, `/stocktakes/${open.id}`)}>{st.keepCounting}</Button>
+          </Notice>
+        )}
+        <nav class="ui-tabs tabs" aria-label={st.title}>
+          <a href={basePath} aria-current={!status ? 'page' : undefined}>{t.ui.all}</a>
+          {(['OPEN', 'COMPLETED', 'CANCELLED'] as const).map((k) => <a href={`${basePath}?status=${k}`} aria-current={k === status ? 'page' : undefined}>{st.statuses[k]}</a>)}
+        </nav>
+        {result.items.length === 0 && page === 1 ? (
+          !status ? (
+            <EmptyState icon="clipboard-check" title={st.empty} text={st.emptyText}>
+              {canOpen && <Button icon="clipboard-check" data-dialog="open-stocktake">{st.start}</Button>}
+            </EmptyState>
+          ) : <p class="ui-muted">{st.noResults}</p>
+        ) : (
+          <div class="ui-table-wrap">
+            <table class="ui-table">
+              <thead><tr><th scope="col">{st.folio}</th><th scope="col">{st.status}</th><th scope="col" class="ui-end">{st.counted}</th><th scope="col">{st.closed}</th></tr></thead>
+              <tbody>
+                {result.items.map((x) => (
+                  <tr>
+                    <td data-label={st.folio}>
+                      <a class="ui-strong num" href={localePath(locale, `/stocktakes/${x.id}`)}>{x.folio}</a>
+                      <span class="ui-line2">{when.format(new Date(x.created_at))} · {x.created_by}{x.notes && ` · ${x.notes}`}</span>
+                    </td>
+                    <td data-label={st.status}><Badge tone={tone[x.status]}>{st.statuses[x.status]}</Badge></td>
+                    <td data-label={st.counted} class="ui-end num">{x.counted_items}</td>
+                    <td data-label={st.closed}>{x.closed_at ? <>{when.format(new Date(x.closed_at))}<span class="ui-line2">{x.closed_by}</span></> : '—'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        {(page > 1 || result.has_more) && (
+          <nav class="ui-pager">
+            <span />
+            <span class="ui-actions">
+              {page > 1 && <Button variant="secondary" href={link({ page: page - 1 })}>{t.ui.previous}</Button>}
+              {result.has_more && <Button variant="secondary" href={link({ page: page + 1 })}>{t.ui.next}</Button>}
+            </span>
+          </nav>
+        )}
+      </>
+    )
+  }
+
+  {canOpen && !open && (
+    <Dialog id="open-stocktake" title={st.start} closeLabel={t.ui.close} open={!!openError}>
+      <form method="post" class="ui-form" novalidate>
+        {openError && <p class="ui-alert ui-full" role="alert">{openError}</p>}
+        <p class="ui-full ui-muted ui-small">{st.startHint}</p>
+        <div class="ui-full"><Field label={st.notes} name="notes" value={notes} maxlength={2000} hint={st.notesHint} /></div>
+        <div class="ui-form-actions">
+          <Button variant="tertiary" data-dialog-close>{t.ui.cancel}</Button>
+          <Button type="submit" icon="clipboard-check">{st.start}</Button>
+        </div>
+      </form>
+    </Dialog>
+  )}
+</AppLayout>
+
+<style>
+  .tabs {
+    margin: var(--space-4) 0;
+  }
+</style>

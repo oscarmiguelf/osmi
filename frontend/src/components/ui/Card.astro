@@ -1,0 +1,54 @@
+---
+interface Props {
+  title?: string;
+  /** Heading level of the title, so cards fit the page outline. */
+  level?: 2 | 3;
+  class?: string;
+}
+
+const { title, level = 2, class: className } = Astro.props;
+const Heading = `h${level}` as const;
+---
+
+<section class:list={['card', className]}>
+  {
+    (title || Astro.slots.has('action')) && (
+      <header>
+        {title && <Heading class="title">{title}</Heading>}
+        <slot name="action" />
+      </header>
+    )
+  }
+  <slot />
+  {Astro.slots.has('footer') && <footer><slot name="footer" /></footer>}
+</section>
+
+<style>
+  .card {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+    padding: var(--space-5);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-container);
+  }
+
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+  }
+
+  .title {
+    font-size: var(--text-md);
+  }
+
+  footer {
+    display: flex;
+    gap: var(--space-2);
+    margin-top: auto;
+    padding-top: var(--space-2);
+  }
+</style>

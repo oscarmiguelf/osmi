@@ -1,0 +1,101 @@
+---
+import AppLayout from '@/layouts/AppLayout.astro';
+import Badge from '@/components/ui/Badge.astro';
+import Button from '@/components/ui/Button.astro';
+import Notice from '@/components/ui/Notice.astro';
+import { fmt, getLocale, localePath, useTranslations } from '@/i18n';
+import { listTransfers } from '@/lib/transfers';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const tr = t.transfers;
+const { session, accessToken, branch } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'transfers')?.permissions ?? [];
+if (!perms.includes('read')) return Astro.rewrite('/404');
+
+const params = Astro.url.searchParams;
+const direction = ['outgoing', 'incoming'].includes(params.get('direction') ?? '') ? params.get('direction')! : undefined;
+const status = ['IN_TRANSIT', 'RECEIVED', 'CANCELLED'].includes(params.get('status') ?? '') ? params.get('status')! : undefined;
+const page = Math.max(1, Number.parseInt(params.get('page') ?? '1', 10) || 1);
+const basePath = localePath(locale, '/transfers');
+const [result, incoming] = branch
+  ? await Promise.all([
+      listTransfers(accessToken, branch.id, { direction, status, page }),
+      listTransfers(accessToken, branch.id, { direction: 'incoming', status: 'IN_TRANSIT', page: 1 }),
+    ])
+  : [{ items: [], has_more: false }, { items: [], has_more: false }];
+const when = new Intl.DateTimeFormat(t.intl, { dateStyle: 'medium', timeStyle: 'short', timeZone: session.user.timezone });
+const link = (p: Record<string, string | undefined>) =>
+  `${basePath}?${new URLSearchParams(Object.entries({ direction, status, ...p }).filter(([, v]) => v) as [string, string][])}`;
+const tone = { IN_TRANSIT: 'warning', RECEIVED: 'success', CANCELLED: 'neutral' } as const;
+---
+
+<AppLayout title={tr.title} current="/transfers">
+  <header class="ui-header">
+    <div>
+      <h1>{tr.title}</h1>
+      {branch && <p class="ui-sub">{branch.name}</p>}
+    </div>
+    {perms.includes('create') && branch && <Button icon="send" href={localePath(locale, '/transfers/new')}>{tr.newTransfer}</Button>}
+  </header>
+
+  {
+    !branch ? <Notice tone="warning">{t.ui.noBranch}</Notice> : (
+      <>
+        <div class="ui-notices">
+          {incoming.items.length > 0 && (
+            <Notice tone="warning">
+              {fmt(tr.incomingTitle, { n: incoming.items.length })}
+              <ul class="list">{incoming.items.map((x) => <li><a href={localePath(locale, `/transfers/${x.id}`)}>{x.folio}</a>, {x.from_branch}</li>)}</ul>
+            </Notice>
+          )}
+        </div>
+        <div class="ui-filters">
+          <nav class="ui-tabs" aria-label={tr.colRoute}>
+            {['all', 'outgoing', 'incoming'].map((d) => (
+              <a href={link({ direction: d === 'all' ? undefined : d, page: undefined })} aria-current={(direction ?? 'all') === d ? 'true' : undefined}>{tr.direction[d]}</a>
+            ))}
+          </nav>
+          <nav class="ui-tabs" aria-label={tr.colStatus}>
+            <a href={link({ status: undefined })} aria-current={!status ? 'true' : undefined}>{t.ui.all}</a>
+            {['IN_TRANSIT', 'RECEIVED', 'CANCELLED'].map((s) => <a href={link({ status: s })} aria-current={status === s ? 'true' : undefined}>{tr.status[s]}</a>)}
+          </nav>
+        </div>
+        {result.items.length === 0 ? <p class="ui-muted">{tr.empty}</p> : (
+          <div class="ui-table-wrap">
+            <table class="ui-table">
+              <thead><tr><th scope="col">{tr.colFolio}</th><th scope="col">{tr.colRoute}</th><th scope="col">{tr.colStatus}</th><th scope="col">{tr.colDate}</th><th scope="col" class="ui-end">{tr.colItems}</th></tr></thead>
+              <tbody>
+                {result.items.map((x) => (
+                  <tr>
+                    <td data-label={tr.colFolio}><a class="ui-strong num" href={localePath(locale, `/transfers/${x.id}`)}>{x.folio}</a><span class="ui-line2">{tr.direction[x.direction ?? 'all']}</span></td>
+                    <td data-label={tr.colRoute}>{fmt(tr.route, { from: x.from_branch, to: x.to_branch })}</td>
+                    <td data-label={tr.colStatus}><Badge tone={tone[x.status]}>{tr.status[x.status]}</Badge></td>
+                    <td data-label={tr.colDate} class="num">{when.format(new Date(x.created_at))}</td>
+                    <td data-label={tr.colItems} class="ui-end num">{x.item_count}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        {(page > 1 || result.has_more) && (
+          <nav class="ui-pager">
+            <span />
+            <span class="ui-actions">
+              {page > 1 && <Button variant="secondary" href={link({ page: String(page - 1) })}>{t.ui.previous}</Button>}
+              {result.has_more && <Button variant="secondary" href={link({ page: String(page + 1) })}>{t.ui.next}</Button>}
+            </span>
+          </nav>
+        )}
+      </>
+    )
+  }
+</AppLayout>
+
+<style>
+  .list {
+    margin-top: var(--space-1);
+    padding-inline-start: var(--space-5);
+  }
+</style>

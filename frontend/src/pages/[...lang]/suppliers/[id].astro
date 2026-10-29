@@ -1,0 +1,352 @@
+---
+// One supplier: contact, purchase totals (branches the person belongs to), the products it supplies (link / unlink,
+// cost history per product), latest purchases and the change history. Edit in a dialog; restore from the banner.
+import AppLayout from '@/layouts/AppLayout.astro';
+import SupplierFields from '@/components/suppliers/SupplierFields.astro';
+import Badge from '@/components/ui/Badge.astro';
+import Button from '@/components/ui/Button.astro';
+import Card from '@/components/ui/Card.astro';
+import Dialog from '@/components/ui/Dialog.astro';
+import Notice from '@/components/ui/Notice.astro';
+import SearchPicker from '@/components/ui/SearchPicker.astro';
+import Timeline from '@/components/ui/Timeline.astro';
+import { fmt, getLocale, localePath, money, useTranslations } from '@/i18n';
+import { ApiError } from '@/lib/api';
+import {
+  getSupplier, linkProduct, priceHistory, restoreSupplier, supplierHistory, supplierProducts, supplierPurchases, supplierSaveError,
+  supplierSummary, unlinkProduct, updateSupplier, type Supplier, type SupplierHistoryEntry,
+} from '@/lib/suppliers';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const s = t.suppliers;
+const { session, accessToken, branch } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'suppliers')?.permissions ?? [];
+if (!perms.includes('read')) return Astro.rewrite('/404');
+const canUpdate = perms.includes('update');
+const canDelete = perms.includes('delete');
+const id = Astro.params.id!;
+const selfPath = localePath(locale, `/suppliers/${id}`);
+
+let supplier: Supplier;
+try {
+  supplier = await getSupplier(accessToken, id);
+} catch (e) {
+  if (e instanceof ApiError && (e.status === 404 || e.status === 422)) return Astro.rewrite('/404');
+  throw e;
+}
+const deleted = supplier.deleted_at !== null;
+
+let values = { name: supplier.name, phone: supplier.phone ?? '', email: supplier.email ?? '' };
+let fieldErrors: Record<string, string> = {};
+let duplicate: { id: string; name: string }[] = [];
+let formError: string | undefined;
+let pageError: string | undefined;
+
+if (Astro.request.method === 'POST') {
+  const data = await Astro.request.formData();
+  const intent = data.get('intent');
+  const back = (k: string, v = '1') => Astro.redirect(`${selfPath}?${new URLSearchParams({ [k]: v })}`, 303);
+  try {
+    if (intent === 'restore' && canDelete) {
+      await restoreSupplier(accessToken, id);
+      return back('restored');
+    }
+    if (intent === 'link' && canUpdate) {
+      const done = await linkProduct(accessToken, id, String(data.get('product')));
+      return back(done.created ? 'linked' : 'already', String(data.get('product_label') ?? ''));
+    }
+    if (intent === 'unlink' && canUpdate) {
+      await unlinkProduct(accessToken, id, String(data.get('product_id')));
+      return back('unlinked', String(data.get('product_name') ?? ''));
+    }
+    if (intent === 'update' && canUpdate) {
+      values = { name: String(data.get('name') ?? '').trim(), phone: String(data.get('phone') ?? '').trim(), email: String(data.get('email') ?? '').trim() };
+      if (!values.name) fieldErrors.name = s.errors.name;
+      else {
+        await updateSupplier(accessToken, id, { name: values.name, phone: values.phone || null, email: values.email || null }, data.has('force'));
+        return back('saved');
+      }
+      formError = t.ui.formError;
+    } else if (intent !== 'update') pageError = t.ui.forbidden;
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    if (intent === 'update') {
+      const err = supplierSaveError(e.status, e.body?.detail, s.errors);
+      fieldErrors = err.fields ?? {};
+      duplicate = err.duplicate ?? [];
+      formError = duplicate.length ? fmt(s.duplicate, { names: duplicate.map((d) => d.name).join(', ') }) : Object.keys(fieldErrors).length ? t.ui.formError : t.ui.failed;
+    } else pageError = e.status === 403 ? t.ui.forbidden : t.ui.failed;
+  }
+  Astro.response.status = 422;
+}
+
+const params = Astro.url.searchParams;
+const historyPage = Math.max(1, Number.parseInt(params.get('history') ?? '1', 10) || 1);
+const productsPage = Math.max(1, Number.parseInt(params.get('products') ?? '1', 10) || 1);
+const costsOf = params.get('costs');
+const [summary, products, purchases, history, costs] = await Promise.all([
+  supplierSummary(accessToken, id),
+  supplierProducts(accessToken, id, productsPage),
+  supplierPurchases(accessToken, id, 1),
+  supplierHistory(accessToken, id, historyPage),
+  costsOf ? priceHistory(accessToken, id, costsOf).catch(() => []) : Promise.resolve(undefined),
+]);
+const costsName = products.items.find((p) => p.id === costsOf)?.name ?? '';
+
+const tz = session.user.timezone;
+const when = new Intl.DateTimeFormat(t.intl, { dateStyle: 'medium', timeStyle: 'short', timeZone: tz });
+const day = new Intl.DateTimeFormat(t.intl, { dateStyle: 'medium', timeZone: tz });
+const show = (v: unknown) => (v === null || v === undefined || v === '' ? '—' : String(v));
+const timeline = history.items.map((h: SupplierHistoryEntry) => ({
+  title: h.entity_type === 'product_supplier' ? fmt(s.linkActions[h.action], { product: h.product ?? '—' }) : s.actions[h.action],
+  meta: `${h.changed_by_email ?? s.unknownUser}, ${when.format(new Date(h.changed_at))}`,
+  changes: h.entity_type === 'supplier' && h.action === 'UPDATE'
+    ? (h.changed_fields ?? []).filter((f) => f in s.fields).map((f) => ({ label: s.fields[f], from: show(h.old_data?.[f]), to: show(h.new_data?.[f]) }))
+    : [],
+}));
+const pageLink = (k: string, v: number) => `${selfPath}?${k}=${v}`;
+const notice = (['created', 'saved', 'restored', 'linked', 'already', 'unlinked'] as const).find((k) => params.has(k));
+const noticeText = notice && {
+  created: fmt(s.created, { name: supplier.name }), saved: t.ui.saved, restored: s.restored,
+  linked: fmt(s.linkedOk, { name: params.get('linked') ?? '' }), already: fmt(s.alreadyLinked, { name: params.get('already') ?? '' }),
+  unlinked: fmt(t.suppliers.linkActions.DELETE, { product: params.get('unlinked') ?? '' }),
+}[notice];
+---
+
+<AppLayout title={supplier.name} current="/suppliers">
+  <a class="ui-back" href={localePath(locale, '/suppliers')}>← {s.title}</a>
+  <header class="ui-header">
+    <div>
+      <h1>{supplier.name} {deleted && <Badge tone="error">{t.ui.deletedBadge}</Badge>}</h1>
+    </div>
+    {canUpdate && !deleted && <Button variant="secondary" icon="pencil" data-dialog="edit-supplier">{t.ui.edit}</Button>}
+  </header>
+
+  <div class="ui-notices" data-flash={notice ? '' : undefined}>
+    {noticeText && <Notice tone={notice === 'already' ? 'warning' : 'success'}>{noticeText}</Notice>}
+    {pageError && <Notice tone="error">{pageError}</Notice>}
+    {deleted && (
+      <Notice tone="error">
+        {fmt(s.deletedBanner, { date: day.format(new Date(supplier.deleted_at!)) })}
+        {canDelete && (
+          <form method="post" slot="action">
+            <input type="hidden" name="intent" value="restore" />
+            <Button type="submit" variant="secondary" icon="rotate-ccw">{t.ui.restore}</Button>
+          </form>
+        )}
+      </Notice>
+    )}
+  </div>
+
+  <section class="kpis" aria-label={s.summary}>
+    <div class="kpi"><span class="kpi-label">{s.purchasesN}</span><strong class="kpi-value num">{summary.purchases}</strong></div>
+    <div class="kpi"><span class="kpi-label">{s.totalSpent}</span><strong class="kpi-value num">{money(locale, Number(summary.total_spent))}</strong></div>
+    <div class="kpi"><span class="kpi-label">{s.avgPurchase}</span><strong class="kpi-value num">{money(locale, Number(summary.avg_purchase))}</strong></div>
+    <div class="kpi">
+      <span class="kpi-label">{s.lastPurchase}</span>
+      <strong class="kpi-value num">{summary.last_purchase_at ? day.format(new Date(summary.last_purchase_at)) : '—'}</strong>
+    </div>
+  </section>
+  <p class="ui-muted ui-small hint">{s.summaryHint}</p>
+
+  <div class="layout">
+    <Card title={s.contact}>
+      <dl class="ui-rows">
+        <div><dt>{s.phone}</dt><dd class="num">{supplier.phone ? <a href={`tel:${supplier.phone.replace(/[^\d+]/g, '')}`}>{supplier.phone}</a> : '—'}</dd></div>
+        <div><dt>{s.email}</dt><dd>{supplier.email ? <a href={`mailto:${supplier.email}`}>{supplier.email}</a> : '—'}</dd></div>
+      </dl>
+    </Card>
+
+    <Card title={s.linked} class="products">
+      {canUpdate && !deleted && (
+        <form method="post" class="link-form" data-link-form>
+          <input type="hidden" name="intent" value="link" />
+          <label class="ui-small" for="sup-product">{s.addProduct}</label>
+          <SearchPicker id="sup-product" name="product" endpoint="/api/products" placeholder={s.productPlaceholder} hint={s.productHint}
+            noResults={s.noProductsFound} clearLabel={t.sales.cart.clear} />
+        </form>
+      )}
+      {products.items.length === 0 ? <p class="ui-muted ui-small">{s.noProducts}</p> : (
+        <div class="ui-table-wrap">
+          <table class="ui-table">
+            <thead><tr><th scope="col">{s.name}</th><th scope="col" class="ui-end">{s.cost}</th><th scope="col" class="ui-end">{s.price}</th><th scope="col"><span class="visually-hidden">{s.costHistory}</span></th></tr></thead>
+            <tbody>
+              {products.items.map((p) => (
+                <tr>
+                  <td data-label={s.name}><a class="ui-strong" href={localePath(locale, `/products/${p.id}`)}>{p.name}</a>{p.barcode && <span class="ui-line2 num">{p.barcode}</span>}</td>
+                  <td data-label={s.cost} class="ui-end num">{money(locale, Number(p.cost))}</td>
+                  <td data-label={s.price} class="ui-end num">{money(locale, Number(p.price))}</td>
+                  <td class="ui-row-action ui-end">
+                    <span class="row-buttons">
+                      <Button variant="tertiary" icon="chart-line" href={`${selfPath}?costs=${p.id}${productsPage > 1 ? `&products=${productsPage}` : ''}`}>{s.costHistory}</Button>
+                      {canUpdate && !deleted && (
+                        <form method="post">
+                          <input type="hidden" name="intent" value="unlink" />
+                          <input type="hidden" name="product_id" value={p.id} />
+                          <input type="hidden" name="product_name" value={p.name} />
+                          <Button type="submit" variant="tertiary" icon="unlink" aria-label={fmt(s.unlinkLabel, { name: p.name })}>{s.unlink}</Button>
+                        </form>
+                      )}
+                    </span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {(productsPage > 1 || products.has_more) && (
+        <div class="pager">
+          {productsPage > 1 && <Button variant="tertiary" href={pageLink('products', productsPage - 1)}>{t.ui.previous}</Button>}
+          {products.has_more && <Button variant="tertiary" href={pageLink('products', productsPage + 1)}>{t.ui.next}</Button>}
+        </div>
+      )}
+    </Card>
+
+    <Card title={s.purchases} class="purchases">
+      {purchases.items.length === 0 ? <p class="ui-muted ui-small">{s.noPurchases}</p> : (
+        <div class="ui-table-wrap">
+          <table class="ui-table">
+            <thead><tr><th scope="col">{s.date}</th><th scope="col">{s.branch}</th><th scope="col">{s.reference}</th><th scope="col" class="ui-end">{s.total}</th></tr></thead>
+            <tbody>
+              {purchases.items.map((p) => (
+                <tr>
+                  <td data-label={s.date} class="num">
+                    {p.branch_id === branch?.id
+                      ? <a href={localePath(locale, `/purchases/${p.id}`)}>{when.format(new Date(p.purchased_at))}</a>
+                      : <span title={s.otherBranch}>{when.format(new Date(p.purchased_at))}</span>}
+                    <span class="ui-line2">{Number(p.items) === 1 ? s.itemsOne : fmt(s.itemsN, { n: Number(p.items) })}</span>
+                  </td>
+                  <td data-label={s.branch}>{p.branch}</td>
+                  <td data-label={s.reference}>{p.reference ?? '—'}</td>
+                  <td data-label={s.total} class="ui-end num">{money(locale, Number(p.total))}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </Card>
+
+    <Card title={t.ui.history} class="history">
+      <Timeline items={timeline} />
+      {(historyPage > 1 || history.has_more) && (
+        <div class="pager">
+          {historyPage > 1 && <Button variant="tertiary" href={pageLink('history', historyPage - 1)}>{s.newerHistory}</Button>}
+          {history.has_more && <Button variant="tertiary" href={pageLink('history', historyPage + 1)}>{s.olderHistory}</Button>}
+        </div>
+      )}
+    </Card>
+  </div>
+
+  {costs && (
+    <Dialog id="costs" title={fmt(s.costHistoryTitle, { name: costsName })} closeLabel={t.ui.close} open>
+      {costs.length === 0 ? <p class="ui-muted">{s.noCostHistory}</p> : (
+        <dl class="ui-rows">
+          {costs.map((c) => (
+            <div><dt>{when.format(new Date(c.purchased_at))}<span class="ui-line2">{c.branch} · {Number(c.quantity)}</span></dt><dd class="num">{money(locale, Number(c.unit_cost))}</dd></div>
+          ))}
+        </dl>
+      )}
+    </Dialog>
+  )}
+
+  {canUpdate && !deleted && (
+    <Dialog id="edit-supplier" title={s.editTitle} closeLabel={t.ui.close} open={!!formError}>
+      <form method="post" class="ui-form" novalidate>
+        <input type="hidden" name="intent" value="update" />
+        {formError && <p class="ui-alert ui-full" role="alert">{formError}</p>}
+        <SupplierFields locale={locale} values={values} errors={fieldErrors} duplicate={duplicate.length > 0} />
+        <div class="ui-form-actions">
+          <Button variant="tertiary" data-dialog-close>{t.ui.cancel}</Button>
+          <Button type="submit">{t.ui.saveChanges}</Button>
+        </div>
+      </form>
+    </Dialog>
+  )}
+</AppLayout>
+
+<script>
+  // Choosing a product links it right away
+  const form = document.querySelector<HTMLFormElement>('[data-link-form]');
+  form?.querySelector('[data-picker]')?.addEventListener('picker:choose', () => {
+    dispatchEvent(new Event('app:navigating'));
+    form.submit();
+  });
+  // Closing the cost history drops ?costs from the URL, so a reload doesn't reopen it
+  document.querySelector('#costs')?.addEventListener('close', () => {
+    const url = new URL(location.href);
+    url.searchParams.delete('costs');
+    history.replaceState(null, '', url);
+  });
+  if (document.querySelector('[data-flash]')) {
+    const url = new URL(location.href);
+    for (const k of ['created', 'saved', 'restored', 'linked', 'already', 'unlinked']) url.searchParams.delete(k);
+    history.replaceState(null, '', url);
+  }
+</script>
+
+<style>
+  .kpis {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+    gap: var(--space-3);
+  }
+  .kpi {
+    display: grid;
+    gap: var(--space-1);
+    padding: var(--space-4);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-container);
+  }
+  .kpi-label {
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+  }
+  .kpi-value {
+    color: var(--text-title);
+    font-size: var(--text-xl, 1.5rem);
+  }
+  .hint {
+    margin: var(--space-2) 0 var(--space-4);
+  }
+  .layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 2fr);
+    align-items: start;
+    gap: var(--space-4);
+  }
+  .layout > :global(.products),
+  .layout > :global(.purchases) {
+    grid-column: 2;
+  }
+  .layout > :global(.history) {
+    grid-column: 1;
+    grid-row: 2 / span 2;
+  }
+  .link-form {
+    display: grid;
+    gap: var(--space-1);
+    margin-bottom: var(--space-3);
+  }
+  .row-buttons {
+    display: inline-flex;
+    gap: var(--space-1);
+  }
+  .pager {
+    display: flex;
+    justify-content: space-between;
+    margin-top: var(--space-3);
+  }
+  @media (max-width: 60rem) {
+    .layout {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .layout > :global(*) {
+      grid-column: 1 !important;
+      grid-row: auto !important;
+    }
+  }
+</style>

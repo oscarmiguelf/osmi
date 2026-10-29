@@ -1,0 +1,169 @@
+---
+// A printable prescription (letter size): the doctor's header from Settings, patient, date, diagnosis and medicines.
+// Opening it is logged by the API as a print.
+import AppLayout from '@/layouts/AppLayout.astro';
+import Button from '@/components/ui/Button.astro';
+import Notice from '@/components/ui/Notice.astro';
+import WhatsAppShare from '@/components/ui/WhatsAppShare.astro';
+import { fmt, getLocale, localePath, useTranslations } from '@/i18n';
+import { ApiError } from '@/lib/api';
+import { getPrescription, type Prescription } from '@/lib/clinical';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const c = t.clinical;
+const { session, accessToken } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'clinical')?.permissions ?? [];
+if (!perms.includes('read') || session.business_type !== 'health') return Astro.rewrite('/404');
+
+let rx: Prescription;
+try {
+  rx = await getPrescription(accessToken, Astro.params.id!);
+} catch (e) {
+  if (e instanceof ApiError && (e.status === 404 || e.status === 422)) return Astro.rewrite('/404');
+  throw e;
+}
+const day = new Intl.DateTimeFormat(t.intl, { dateStyle: 'long', timeZone: session.user.timezone });
+const date = day.format(new Date(rx.created_at));
+---
+
+<AppLayout title={fmt(c.rxOf, { date: day.format(new Date(rx.created_at)) })} current="/clinical">
+  <a class="ui-back no-print" href={localePath(locale, `/clinical/notes/${rx.note_id}`)}>← {c.title}</a>
+  <div class="ui-notices no-print">
+    {!rx.doctor_header && <Notice tone="warning">{c.rxHeaderMissing}</Notice>}
+  </div>
+  <div class="ui-actions no-print bar">
+    <Button icon="printer" data-print>{c.rxPrint}</Button>
+    <WhatsAppShare pdf={`/api/clinical/prescription-pdf?id=${rx.id}&lang=${locale}`} fileName={`receta-${rx.created_at.slice(0, 10)}.pdf`}
+      text={fmt(t.share.rxText, { name: rx.patient.split(' ')[0], date })} phone={rx.patient_phone} labels={t.share} />
+  </div>
+
+  <article class="sheet">
+    <header class="head">
+      {session.logo && <img class="logo" src={`/api/catalog/logo?v=${session.logo}`} alt="" />}
+      <p class="doctor">{rx.doctor_header || rx.author}</p>
+      <p class="place">{[rx.branch, rx.branch_address, rx.branch_phone].filter(Boolean).join(' · ')}</p>
+    </header>
+    <dl class="meta">
+      <div><dt>{c.rxPatient}</dt><dd>{rx.patient}</dd></div>
+      <div><dt>{c.rxDate}</dt><dd>{day.format(new Date(rx.created_at))}</dd></div>
+      {rx.diagnosis && <div class="wide"><dt>{c.rxDiagnosis}</dt><dd>{rx.diagnosis}</dd></div>}
+    </dl>
+    <p class="rx-mark" aria-hidden="true">Rx</p>
+    <ol class="meds">
+      {rx.items.map((m) => (
+        <li><span class="name">{m.name}</span>{m.dose && <span> — {m.dose}</span>}{m.instructions && <p class="instr">{m.instructions}</p>}</li>
+      ))}
+    </ol>
+    <footer class="sign"><span>{c.rxSignature}</span></footer>
+  </article>
+</AppLayout>
+
+<script>
+  document.querySelector('[data-print]')?.addEventListener('click', () => window.print());
+</script>
+
+<style>
+  .bar {
+    margin-bottom: var(--space-4);
+  }
+  .sheet {
+    max-width: 48rem;
+    min-height: 60rem;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+    padding: var(--space-8, 2.5rem);
+    color: #111;
+    background: #fff;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-container);
+  }
+  .logo {
+    float: left;
+    max-width: 9rem;
+    max-height: 4.5rem;
+    margin-inline-end: var(--space-4);
+    object-fit: contain;
+  }
+  .head {
+    display: flow-root;
+    padding-bottom: var(--space-3);
+    border-bottom: 2px solid #111;
+  }
+  .doctor {
+    margin: 0;
+    font-weight: 700;
+    white-space: pre-line;
+  }
+  .place {
+    margin: var(--space-1) 0 0;
+    font-size: 0.85rem;
+  }
+  .meta {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: var(--space-2) var(--space-6, 2rem);
+    margin: 0;
+  }
+  .meta .wide {
+    grid-column: 1 / -1;
+  }
+  .meta dt {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #555;
+  }
+  .meta dd {
+    margin: 0;
+  }
+  .rx-mark {
+    margin: 0;
+    font: italic 700 1.75rem/1 serif;
+  }
+  .meds {
+    flex: 1;
+    display: grid;
+    align-content: start;
+    gap: var(--space-4);
+    margin: 0;
+    padding-inline-start: 1.25rem;
+  }
+  .name {
+    font-weight: 700;
+  }
+  .instr {
+    margin: var(--space-1) 0 0;
+    white-space: pre-line;
+  }
+  .sign {
+    display: flex;
+    justify-content: flex-end;
+    padding-top: 4rem;
+  }
+  .sign span {
+    min-width: 16rem;
+    padding-top: var(--space-1);
+    text-align: center;
+    font-size: 0.85rem;
+    border-top: 1px solid #111;
+  }
+  @media print {
+    :global(#sidebar),
+    :global(.no-print),
+    .no-print,
+    :global(header.topbar) {
+      display: none !important;
+    }
+    :global(.shell) {
+      display: block !important; /* the layout's sidebar column would squeeze the sheet */
+    }
+    .sheet {
+      max-width: none;
+      min-height: 24cm;
+      padding: 0;
+      border: 0;
+    }
+  }
+</style>

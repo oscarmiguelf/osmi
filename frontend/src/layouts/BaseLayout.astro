@@ -1,0 +1,42 @@
+---
+import '@fontsource-variable/atkinson-hyperlegible-next';
+import '@/styles/tokens.css';
+import '@/styles/base.css';
+import '@/styles/ui.css';
+import { getLocale, useTranslations } from '@/i18n';
+
+interface Props {
+  title: string;
+  /** The installable app (manifest). Off on the public customer catalog: customers shouldn't be offered the staff app. */
+  app?: boolean;
+}
+
+const { title, app = true } = Astro.props;
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+---
+
+<!doctype html>
+<html lang={locale}>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="theme-color" content="#284b63" />
+    {app && (
+      <>
+        <link rel="manifest" href="/manifest.webmanifest" />
+        <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
+        <meta name="apple-mobile-web-app-title" content={t.app.name} />
+      </>
+    )}
+    <title>{title} · {t.app.name}</title>
+  </head>
+  <body>
+    <slot />
+    <script>
+      // Installable app + offline page (public/sw.js). Needs HTTPS, or localhost
+      if ('serviceWorker' in navigator) addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {}));
+    </script>
+  </body>
+</html>

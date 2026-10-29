@@ -1,0 +1,222 @@
+---
+// Expenses of the working branch: period, status (owed / paid), totals, and void from the list.
+import AppLayout from '@/layouts/AppLayout.astro';
+import Badge from '@/components/ui/Badge.astro';
+import Button from '@/components/ui/Button.astro';
+import EmptyState from '@/components/ui/EmptyState.astro';
+import Field from '@/components/ui/Field.astro';
+import Notice from '@/components/ui/Notice.astro';
+import { fmt, getLocale, localePath, money, useTranslations } from '@/i18n';
+import { ApiError } from '@/lib/api';
+import { expensesSummary, listExpenses, voidExpense } from '@/lib/expenses';
+import { startOfDay } from '@/lib/time';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const ex = t.expenses;
+const o = t.outgoing;
+const { session, accessToken, branch } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'expenses')?.permissions ?? [];
+if (!perms.includes('read')) return Astro.rewrite('/404');
+const canDelete = perms.includes('delete');
+const basePath = localePath(locale, '/expenses');
+const tz = session.user.timezone;
+const params = Astro.url.searchParams;
+const STATUSES = ['all', 'owed', 'paid'] as const;
+const status = (STATUSES as readonly string[]).includes(params.get('status') ?? '') ? params.get('status')! : 'all';
+const q = (params.get('q') ?? '').trim().slice(0, 100);
+const page = Math.max(1, Number.parseInt(params.get('page') ?? '1', 10) || 1);
+const showVoided = params.get('voided') === '1';
+// The period is in the person's days: this month by default
+const today = Temporal.Now.plainDateISO(tz);
+const date = (k: string, fallback: Temporal.PlainDate) => {
+  try { return Temporal.PlainDate.from(params.get(k) ?? ''); } catch { return fallback; }
+};
+const fromDay = date('from', today.with({ day: 1 }));
+const toDay = date('to', today);
+
+let pageError: string | undefined;
+if (Astro.request.method === 'POST' && branch) {
+  const data = await Astro.request.formData();
+  try {
+    if (!canDelete) throw new ApiError(403, null);
+    await voidExpense(accessToken, branch.id, String(data.get('id')), null);
+    const back = new URL(Astro.url);
+    back.searchParams.set('voided_ok', '1');
+    return Astro.redirect(back.pathname + back.search, 303);
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    pageError = e.status === 403 ? t.ui.forbidden : t.ui.failed;
+  }
+}
+
+const from = startOfDay(fromDay, tz);
+const to = startOfDay(toDay.add({ days: 1 }), tz);
+const [result, summary] = branch
+  ? await Promise.all([
+      listExpenses(accessToken, branch.id, { from, to, q, status, include_voided: showVoided, page }),
+      expensesSummary(accessToken, branch.id, from, to),
+    ])
+  : [{ items: [], has_more: false }, undefined];
+const when = new Intl.DateTimeFormat(t.intl, { dateStyle: 'medium', timeStyle: 'short', timeZone: tz });
+const link = (extra: Record<string, string | number>) => {
+  const qp = new URLSearchParams(params);
+  qp.delete('voided_ok');
+  for (const [k, v] of Object.entries(extra)) qp.set(k, String(v));
+  return `${basePath}?${qp}`;
+};
+const filtered = !!q || status !== 'all' || params.has('from') || params.has('to');
+---
+
+<AppLayout title={ex.title} current="/expenses">
+  <header class="ui-header">
+    <div>
+      <h1>{ex.title}</h1>
+      {branch && <p class="ui-sub">{branch.name}</p>}
+    </div>
+    <div class="ui-actions">
+      <Button variant="tertiary" href={link({ voided: showVoided ? '0' : '1', page: 1 })}>{showVoided ? t.ui.hideDeleted : t.ui.showDeleted}</Button>
+      {perms.includes('create') && branch && <Button icon="plus" href={localePath(locale, '/expenses/new')}>{ex.newExpense}</Button>}
+    </div>
+  </header>
+
+  <div class="ui-notices" data-flash={params.has('voided_ok') ? '' : undefined}>
+    {!branch && <Notice tone="warning">{t.ui.noBranch}</Notice>}
+    {params.has('voided_ok') && <Notice tone="success">{ex.voided}</Notice>}
+    {pageError && <Notice tone="error">{pageError}</Notice>}
+  </div>
+
+  {branch && (
+    <>
+      <nav class="ui-tabs tabs" aria-label={ex.title}>
+        {STATUSES.map((k) => (
+          <a href={link({ status: k, page: 1 })} aria-current={k === status ? 'page' : undefined}>
+            {{ all: o.statusAll, owed: o.statusOwed, paid: o.statusPaid }[k]}
+          </a>
+        ))}
+      </nav>
+
+      <form method="get" class="filters">
+        {status !== 'all' && <input type="hidden" name="status" value={status} />}
+        {showVoided && <input type="hidden" name="voided" value="1" />}
+        <Field label={ex.search} name="q" type="search" value={q} maxlength={100} />
+        <Field label={ex.from} name="from" type="date" value={fromDay.toString()} />
+        <Field label={ex.to} name="to" type="date" value={toDay.toString()} />
+        <Button type="submit" variant="secondary" icon="search">{t.ui.search}</Button>
+      </form>
+
+      {summary && (
+        <section class="kpis" aria-label={ex.totalPeriod}>
+          <div class="kpi"><span class="kpi-label">{ex.totalPeriod}</span><strong class="num">{money(locale, Number(summary.total))}</strong></div>
+          <div class="kpi"><span class="kpi-label">{ex.paidPeriod}</span><strong class="num">{money(locale, Number(summary.paid))}</strong></div>
+          <div class:list={['kpi', { due: Number(summary.owed) > 0 }]}><span class="kpi-label">{ex.owedPeriod}</span><strong class="num">{money(locale, Number(summary.owed))}</strong></div>
+        </section>
+      )}
+
+      {result.items.length === 0 && page === 1 ? (
+        filtered || showVoided ? <p class="ui-muted">{ex.noResults}</p> : (
+          <EmptyState icon="receipt" title={ex.empty} text={ex.emptyText}>
+            {perms.includes('create') && <Button icon="plus" href={localePath(locale, '/expenses/new')}>{ex.newExpense}</Button>}
+          </EmptyState>
+        )
+      ) : (
+        <div class="ui-table-wrap">
+          <table class="ui-table">
+            <thead>
+              <tr>
+                <th scope="col">{ex.description}</th><th scope="col">{ex.spentAt}</th><th scope="col" class="ui-end">{ex.total}</th>
+                <th scope="col" class="ui-end">{o.paidCash}</th><th scope="col" class="ui-end">{o.owed}</th>
+                {canDelete && <th scope="col"><span class="visually-hidden">{ex.voidAction}</span></th>}
+              </tr>
+            </thead>
+            <tbody>
+              {result.items.map((e) => (
+                <tr>
+                  <td data-label={ex.description}>
+                    <a class="ui-strong" href={localePath(locale, `/expenses/${e.id}`)}>{e.description}</a>
+                    {e.deleted_at && <Badge tone="error">{ex.voidedBadge}</Badge>}
+                    {(e.supplier || e.reference) && <span class="ui-line2">{[e.supplier, e.reference].filter(Boolean).join(' · ')}</span>}
+                  </td>
+                  <td data-label={ex.spentAt} class="num">{when.format(new Date(e.spent_at))}</td>
+                  <td data-label={ex.total} class="ui-end num">{money(locale, Number(e.amount))}</td>
+                  <td data-label={o.paidCash} class="ui-end num">{Number(e.paid_cash) ? money(locale, Number(e.paid_cash)) : <span class="ui-muted">—</span>}</td>
+                  <td data-label={o.owed} class="ui-end num">{Number(e.owed) > 0 && !e.deleted_at ? <span class="owes">{money(locale, Number(e.owed))}</span> : <span class="ui-muted">—</span>}</td>
+                  {canDelete && (
+                    <td class="ui-row-action ui-end">
+                      {!e.deleted_at && (
+                        <form method="post" data-confirm={ex.voidText} data-confirm-title={fmt(ex.voidTitle, { name: e.description })} data-confirm-action={ex.voidAction}>
+                          <input type="hidden" name="id" value={e.id} />
+                          <Button type="submit" variant="danger" icon="ban" aria-label={`${ex.voidAction}: ${e.description}`} />
+                        </form>
+                      )}
+                    </td>
+                  )}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {(page > 1 || result.has_more) && (
+        <nav class="ui-pager">
+          <span />
+          <span class="ui-actions">
+            {page > 1 && <Button variant="secondary" href={link({ page: page - 1 })}>{t.ui.previous}</Button>}
+            {result.has_more && <Button variant="secondary" href={link({ page: page + 1 })}>{t.ui.next}</Button>}
+          </span>
+        </nav>
+      )}
+    </>
+  )}
+</AppLayout>
+
+<script>
+  if (document.querySelector('[data-flash]')) {
+    const url = new URL(location.href);
+    url.searchParams.delete('voided_ok');
+    history.replaceState(null, '', url);
+  }
+</script>
+
+<style>
+  .tabs {
+    margin-bottom: var(--space-4);
+  }
+  .filters {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: var(--space-3);
+    margin-bottom: var(--space-4);
+  }
+  .filters > :global(.field:first-of-type) {
+    flex: 1 1 16rem;
+    max-width: 24rem;
+  }
+  .kpis {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+    gap: var(--space-3);
+    margin-bottom: var(--space-4);
+  }
+  .kpi {
+    display: grid;
+    gap: var(--space-1);
+    padding: var(--space-3) var(--space-4);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-container);
+  }
+  .kpi strong {
+    color: var(--text-title);
+    font-size: var(--text-lg);
+  }
+  .kpi-label {
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+  }
+  .due strong,
+  .owes {
+    color: var(--status-error-text);
+  }
+</style>

@@ -1,0 +1,33 @@
+---
+// Renders a Lucide icon by its kebab-case name (the format stored in modules.icon). Server-side only: no JS shipped.
+import { icons, type IconNode } from 'lucide';
+
+interface Props {
+  name: string;
+  size?: number;
+  /** Give a label only when the icon carries meaning on its own; otherwise it is hidden from screen readers. */
+  label?: string;
+}
+
+const { name, size = 20, label } = Astro.props;
+const key = name.replace(/(^|-)(\w)/g, (_, _sep, c: string) => c.toUpperCase());
+const node: IconNode = (icons as Record<string, IconNode>)[key] ?? icons.Circle;
+---
+
+<svg
+  xmlns="http://www.w3.org/2000/svg"
+  width={size}
+  height={size}
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="2"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+  role={label ? 'img' : undefined}
+  aria-label={label}
+  aria-hidden={label ? undefined : 'true'}
+  focusable="false"
+>
+  {node.map(([Tag, attrs]) => <Tag {...attrs} />)}
+</svg>

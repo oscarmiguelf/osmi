@@ -1,0 +1,86 @@
+---
+// Name, description and color: shared by "New calendar" and "Edit calendar".
+import Field from '@/components/ui/Field.astro';
+import { useTranslations, type Locale } from '@/i18n';
+import { CALENDAR_COLORS } from '@/lib/calendar';
+
+interface Props {
+  locale: Locale;
+  values: { name: string; description: string; color: string };
+}
+
+const { locale, values } = Astro.props;
+const c = useTranslations(locale).calendar;
+---
+
+<Field label={c.name} name="name" value={values.name} placeholder={c.namePlaceholder} required maxlength={100} />
+<Field
+  label={c.description}
+  name="description"
+  as="textarea"
+  rows={3}
+  value={values.description}
+  hint={c.descriptionHint}
+  maxlength={500}
+/>
+<fieldset class="colors">
+  <legend>{c.color}</legend>
+  <div class="swatches">
+    {
+      CALENDAR_COLORS.map((color, i) => (
+        <label class="swatch" style={`--swatch: ${color}`}>
+          <input type="radio" name="color" value={color} checked={color === values.color} />
+          <span class="visually-hidden">{c.colorNames[i]}</span>
+        </label>
+      ))
+    }
+  </div>
+</fieldset>
+
+<style>
+  .colors {
+    padding: 0;
+    border: 0;
+  }
+
+  legend {
+    margin-bottom: var(--space-2);
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
+  }
+
+  .swatches {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+  }
+
+  .swatch {
+    position: relative;
+    width: 2.25rem;
+    height: 2.25rem;
+    border-radius: 50%;
+    background: var(--swatch);
+    cursor: pointer;
+  }
+
+  .swatch input {
+    position: absolute;
+    inset: 0;
+    margin: 0;
+    opacity: 0;
+    cursor: pointer;
+  }
+
+  /* Selected: a ring in the same color with a white gap, readable for every swatch */
+  .swatch:has(:checked) {
+    box-shadow:
+      0 0 0 3px var(--bg-app),
+      0 0 0 5px var(--swatch);
+  }
+
+  .swatch:has(:focus-visible) {
+    outline: 2px solid var(--color-primary);
+    outline-offset: 5px;
+  }
+</style>

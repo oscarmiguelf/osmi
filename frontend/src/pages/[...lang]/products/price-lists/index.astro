@@ -1,0 +1,102 @@
+---
+// Price lists: create, open to set prices, delete (only when no customer uses it).
+import AppLayout from '@/layouts/AppLayout.astro';
+import Button from '@/components/ui/Button.astro';
+import EmptyState from '@/components/ui/EmptyState.astro';
+import Field from '@/components/ui/Field.astro';
+import Notice from '@/components/ui/Notice.astro';
+import { fmt, getLocale, localePath, useTranslations } from '@/i18n';
+import { ApiError } from '@/lib/api';
+import { createPriceList, deletePriceList, listPriceLists } from '@/lib/priceLists';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const pl = t.priceLists;
+const { session, accessToken } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'products')?.permissions ?? [];
+if (!perms.includes('read')) return Astro.rewrite('/404');
+const canManage = perms.includes('prices');
+const basePath = localePath(locale, '/products/price-lists');
+
+let addError: string | undefined;
+let pageError: string | undefined;
+let values = { name: '', percent: '' };
+if (Astro.request.method === 'POST' && canManage) {
+  const data = await Astro.request.formData();
+  try {
+    if (data.get('intent') === 'delete') {
+      await deletePriceList(accessToken, String(data.get('id')));
+      return Astro.redirect(basePath, 303);
+    }
+    values = { name: String(data.get('name') ?? '').trim(), percent: String(data.get('percent') ?? '').trim() };
+    if (!values.name) throw new ApiError(422, { detail: { field: 'name', code: 'empty' } });
+    const created = await createPriceList(accessToken, { name: values.name, percent: values.percent || '0' });
+    return Astro.redirect(localePath(locale, `/products/price-lists/${created.id}`), 303);
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    const d = e.body?.detail;
+    if (data.get('intent') === 'delete') pageError = d?.code === 'in_use' ? fmt(pl.inUse, { n: d.customers }) : t.ui.failed;
+    else addError = d?.code === 'empty' ? pl.nameRequired : e.status === 409 ? pl.nameTaken : e.status === 422 ? pl.percentInvalid : t.ui.failed;
+  }
+}
+const lists = await listPriceLists(accessToken);
+const pct = (p: string) => (Number(p) ? `${Number(p) > 0 ? '+' : ''}${Number(p)} %` : '—');
+---
+
+<AppLayout title={pl.title} current="/products">
+  <a class="ui-back" href={localePath(locale, '/products')}>← {t.products.title}</a>
+  <header class="ui-header"><div><h1>{pl.title}</h1><p class="ui-sub">{pl.intro}</p></div></header>
+  <div class="ui-notices">{pageError && <Notice tone="error">{pageError}</Notice>}</div>
+
+  {canManage && (
+    <form method="post" class="add" novalidate>
+      <Field label={pl.name} name="name" value={values.name} maxlength={80} error={addError} placeholder={pl.namePlaceholder} />
+      <Field label={pl.percent} name="percent" type="number" step="0.01" min="-90" max="200" value={values.percent} hint={pl.percentHint} />
+      <Button type="submit" icon="plus">{pl.create}</Button>
+    </form>
+  )}
+
+  {lists.length === 0 ? <EmptyState icon="tags" title={pl.empty} text={pl.emptyText} /> : (
+    <div class="ui-table-wrap">
+      <table class="ui-table">
+        <thead><tr><th scope="col">{pl.name}</th><th scope="col" class="ui-end">{pl.percent}</th><th scope="col" class="ui-end">{pl.prices}</th>
+          <th scope="col" class="ui-end">{pl.customers}</th><th scope="col"><span class="visually-hidden">{t.ui.delete}</span></th></tr></thead>
+        <tbody>
+          {lists.map((l) => (
+            <tr>
+              <td data-label={pl.name}><a class="ui-strong" href={localePath(locale, `/products/price-lists/${l.id}`)}>{l.name}</a></td>
+              <td data-label={pl.percent} class="ui-end num">{pct(l.percent)}</td>
+              <td data-label={pl.prices} class="ui-end num">{l.items_count}</td>
+              <td data-label={pl.customers} class="ui-end num">{l.customers}</td>
+              <td class="ui-row-action ui-end">
+                {canManage && (
+                  <form method="post" data-confirm={pl.deleteText} data-confirm-title={fmt(pl.deleteTitle, { name: l.name })} data-confirm-action={t.ui.delete}>
+                    <input type="hidden" name="intent" value="delete" /><input type="hidden" name="id" value={l.id} />
+                    <Button type="submit" variant="danger" icon="trash-2" aria-label={`${t.ui.delete}: ${l.name}`} />
+                  </form>
+                )}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )}
+</AppLayout>
+
+<style>
+  .add {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: var(--space-3);
+    margin-bottom: var(--space-5);
+    padding: var(--space-4);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-container);
+  }
+  .add > :global(.field) {
+    flex: 1 1 12rem;
+  }
+</style>

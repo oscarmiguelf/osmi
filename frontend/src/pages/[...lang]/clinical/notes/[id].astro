@@ -1,0 +1,361 @@
+---
+// One consultation note. Its author edits the draft and signs it; once signed it is final (addenda only).
+// Prescriptions hang from the note and print on their own page.
+import AppLayout from '@/layouts/AppLayout.astro';
+import Badge from '@/components/ui/Badge.astro';
+import Button from '@/components/ui/Button.astro';
+import Card from '@/components/ui/Card.astro';
+import Field from '@/components/ui/Field.astro';
+import Notice from '@/components/ui/Notice.astro';
+import WhatsAppShare from '@/components/ui/WhatsAppShare.astro';
+import { fmt, getLocale, localePath, useTranslations } from '@/i18n';
+import { ApiError } from '@/lib/api';
+import { addAddendum, getNote, prescribe, signNote, updateNote, VITALS, type Note, type NoteBody } from '@/lib/clinical';
+import { setFlash, takeFlash } from '@/lib/session';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const c = t.clinical;
+const { session, accessToken } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'clinical')?.permissions ?? [];
+if (!perms.includes('read') || session.business_type !== 'health') return Astro.rewrite('/404');
+const canCreate = perms.includes('create');
+const canUpdate = perms.includes('update');
+const id = Astro.params.id!;
+const selfPath = localePath(locale, `/clinical/notes/${id}`);
+const tz = session.user.timezone;
+const TEXTS = ['reason', 'history', 'exam', 'diagnosis', 'plan'] as const;
+
+let errors: Record<string, string> = {};
+let draft: NoteBody | undefined;
+let addendum = '';
+let rxRows: { name: string; dose: string; instructions: string }[] | undefined;
+const errText = (e: ApiError) => {
+  const d = e.body?.detail;
+  if (e.status === 403) return c.errors.forbidden;
+  if (d?.code === 'signed') return c.errors.signed;
+  if (d?.field === 'diagnosis') return c.errors.diagnosis;
+  return e.status === 422 ? c.errors.required : t.ui.failed;
+};
+
+if (Astro.request.method === 'POST') {
+  const data = await Astro.request.formData();
+  const intent = String(data.get('intent'));
+  const v = (k: string) => String(data.get(k) ?? '').trim();
+  try {
+    if ((intent === 'note' || intent === 'sign') && canUpdate) {
+      // Signing saves what is on screen first
+      const vitals = Object.fromEntries(VITALS.map((k) => [k, v(`v_${k}`)]).filter(([, x]) => x));
+      draft = { ...Object.fromEntries(TEXTS.map((k) => [k, v(k)]).filter(([, x]) => x)), ...(Object.keys(vitals).length && { vitals }) };
+      await updateNote(accessToken, id, draft!);
+      if (intent === 'sign') await signNote(accessToken, id);
+    } else if (intent === 'addendum' && canUpdate) {
+      addendum = v('text');
+      if (!addendum) throw new ApiError(422, null);
+      await addAddendum(accessToken, id, addendum);
+    } else if (intent === 'rx' && canCreate) {
+      const names = data.getAll('med_name').map(String);
+      const doses = data.getAll('med_dose').map(String);
+      const instr = data.getAll('med_instr').map(String);
+      rxRows = names.map((name, i) => ({ name: name.trim(), dose: (doses[i] ?? '').trim(), instructions: (instr[i] ?? '').trim() }));
+      const items = rxRows.filter((r) => r.name);
+      if (!items.length) {
+        errors.rx = c.rxNone;
+        throw null;
+      }
+      const p = await prescribe(accessToken, id, items);
+      setFlash(Astro.cookies, { done: 'rx' });
+      return Astro.redirect(`${selfPath}?printed=${p.id}#rx`, 303);
+    } else {
+      return Astro.redirect(selfPath, 303);
+    }
+    setFlash(Astro.cookies, { done: intent });
+    return Astro.redirect(selfPath, 303);
+  } catch (e) {
+    if (e instanceof ApiError) errors[intent] = errText(e);
+    else if (e !== null) throw e;
+  }
+  Astro.response.status = 422;
+}
+
+let note: Note;
+try {
+  note = await getNote(accessToken, id);
+} catch (e) {
+  if (e instanceof ApiError && (e.status === 404 || e.status === 422)) return Astro.rewrite('/404');
+  throw e;
+}
+const flash = takeFlash(Astro.cookies);
+const when = new Intl.DateTimeFormat(t.intl, { dateStyle: 'medium', timeStyle: 'short', timeZone: tz });
+const day = new Intl.DateTimeFormat(t.intl, { dateStyle: 'long', timeZone: tz });
+const editable = !note.signed_at && note.author_id === session.user.id && canUpdate;
+const body = draft ?? note.body;
+const rows = rxRows ?? [{ name: '', dose: '', instructions: '' }];
+const justSaved = Astro.url.searchParams.get('printed');
+---
+
+<AppLayout title={fmt(c.note.title, { date: when.format(new Date(note.visit_at)) })} current="/clinical">
+  <a class="ui-back" href={localePath(locale, `/clinical/patients/${note.customer_id}`)}>← {c.title}</a>
+  <header class="ui-header">
+    <div>
+      <h1>{fmt(c.note.title, { date: when.format(new Date(note.visit_at)) })}</h1>
+      <p class="ui-sub">
+        {fmt(c.note.author, { who: note.author ?? '—' })}
+        {' '}<Badge>{c.kinds[note.kind]}</Badge>
+        {' '}{note.signed_at ? <Badge tone="success">{c.signed}</Badge> : <Badge tone="warning">{c.draft}</Badge>}
+        {note.appointment_id && <> · <a href={localePath(locale, `/appointments/${note.appointment_id}`)}>{c.note.appointment}</a></>}
+      </p>
+    </div>
+  </header>
+
+  <div class="ui-notices">
+    {flash.done && c.done[flash.done] && <Notice tone="success">{c.done[flash.done]}</Notice>}
+    {(errors.note || errors.sign) && <Notice tone="error">{errors.note ?? errors.sign}</Notice>}
+    {note.signed_at && <Notice>{fmt(c.note.signedBy, { when: when.format(new Date(note.signed_at)) })}</Notice>}
+    {!note.signed_at && !editable && <Notice tone="warning">{fmt(c.note.othersDraft, { who: note.author ?? '—' })}</Notice>}
+  </div>
+
+  <div class="layout">
+    <div class="main">
+      {editable ? (
+        <form method="post" class="note-form" id="note-form" novalidate>
+          <Card>
+            <Field label={c.note.reason} name="reason" as="textarea" rows={2} value={body.reason ?? ''} maxlength={5000} id="n-reason" />
+            <Field label={c.note.history} name="history" as="textarea" rows={4} value={body.history ?? ''} maxlength={5000} id="n-history" />
+            <fieldset class="vitals">
+              <legend>{c.note.vitals}</legend>
+              {VITALS.map((k) => <Field label={c.vitals[k]} name={`v_${k}`} value={body.vitals?.[k] ?? ''} maxlength={40} inputmode={k === 'bp' ? 'text' : 'decimal'} id={`v-${k}`} />)}
+            </fieldset>
+            <Field label={c.note.exam} name="exam" as="textarea" rows={4} value={body.exam ?? ''} maxlength={5000} id="n-exam" />
+            <Field label={c.note.diagnosis} name="diagnosis" as="textarea" rows={2} value={body.diagnosis ?? ''} maxlength={5000} id="n-diagnosis"
+              error={errors.sign === c.errors.diagnosis ? c.errors.diagnosis : undefined} />
+            <Field label={c.note.plan} name="plan" as="textarea" rows={4} value={body.plan ?? ''} maxlength={5000} id="n-plan" />
+            <div class="actions" slot="footer">
+              <Button type="submit" name="intent" value="note" variant="secondary" icon="save">{c.note.save}</Button>
+              <Button type="button" icon="pen-line" data-sign>{c.note.sign}</Button>
+            </div>
+          </Card>
+        </form>
+      ) : (
+        <Card>
+          <dl class="read">
+            {(['reason', 'history'] as const).map((k) => <div><dt>{c.note[k]}</dt><dd>{body[k] || <span class="ui-muted">{c.note.empty}</span>}</dd></div>)}
+            {body.vitals && Object.keys(body.vitals).length > 0 && (
+              <div><dt>{c.note.vitals}</dt><dd class="vitals-read">{VITALS.filter((k) => body.vitals?.[k]).map((k) => <span><span class="ui-muted ui-small">{c.vitals[k]}</span> <span class="num">{body.vitals![k]}</span></span>)}</dd></div>
+            )}
+            {(['exam', 'diagnosis', 'plan'] as const).map((k) => <div><dt>{c.note[k]}</dt><dd>{body[k] || <span class="ui-muted">{c.note.empty}</span>}</dd></div>)}
+          </dl>
+        </Card>
+      )}
+
+      {(note.signed_at || note.addenda.length > 0) && (
+        <Card title={c.addendaTitle}>
+          {note.addenda.length > 0 && (
+            <ol class="addenda" role="list">
+              {note.addenda.map((a) => <li><p class="pre">{a.text}</p><p class="ui-muted ui-small">{a.author ?? '—'}, {when.format(new Date(a.created_at))}</p></li>)}
+            </ol>
+          )}
+          {note.signed_at && canUpdate && (
+            <form method="post" class="addendum-form">
+              <input type="hidden" name="intent" value="addendum" />
+              <Field label={c.addendum} name="text" as="textarea" rows={3} value={addendum} maxlength={5000} required id="addendum" hint={c.addendumHint}
+                error={errors.addendum} />
+              <Button type="submit" variant="secondary" icon="message-square-plus">{c.addendum}</Button>
+            </form>
+          )}
+        </Card>
+      )}
+    </div>
+
+    <Card title={c.rxTitle}>
+      <span id="rx" />
+      {justSaved && <Notice tone="success"><a href={localePath(locale, `/clinical/prescriptions/${justSaved}`)} target="_blank">{c.rxPrint}</a></Notice>}
+      {note.prescriptions.length === 0 ? <p class="ui-muted ui-small">{c.rxEmpty}</p> : (
+        <ul class="rx" role="list">
+          {note.prescriptions.map((p) => (
+            <li>
+              <span class="ui-small">{p.items.map((m) => m.name).join(', ')}</span>
+              <Button variant="tertiary" icon="printer" href={localePath(locale, `/clinical/prescriptions/${p.id}`)} target="_blank">{c.rxPrint}</Button>
+              <WhatsAppShare pdf={`/api/clinical/prescription-pdf?id=${p.id}&lang=${locale}`} fileName={`receta-${p.created_at.slice(0, 10)}.pdf`}
+                text={fmt(t.share.rxText, { name: p.patient.split(' ')[0], date: day.format(new Date(p.created_at)) })} phone={p.patient_phone} labels={t.share} />
+            </li>
+          ))}
+        </ul>
+      )}
+      {canCreate && (
+        <form method="post" class="rx-form" data-rx>
+          <input type="hidden" name="intent" value="rx" />
+          <h3 class="ui-small ui-strong">{c.rxNew}</h3>
+          {errors.rx && <p class="ui-alert" role="alert">{errors.rx}</p>}
+          <div class="meds" data-meds>
+            {rows.map((r) => (
+              <fieldset class="med" data-med>
+                <input class="ui-input" name="med_name" placeholder={c.rxMed} aria-label={c.rxMed} value={r.name} maxlength={200} />
+                <input class="ui-input" name="med_dose" placeholder={c.rxDose} aria-label={c.rxDose} value={r.dose} maxlength={200} />
+                <textarea class="ui-input" name="med_instr" rows={2} placeholder={c.rxInstr} aria-label={c.rxInstr} maxlength={500}>{r.instructions}</textarea>
+              </fieldset>
+            ))}
+          </div>
+          <div class="actions">
+            <Button variant="tertiary" icon="plus" data-add-med>{c.rxAddRow}</Button>
+            <Button type="submit" icon="save">{c.rxSave}</Button>
+          </div>
+        </form>
+      )}
+    </Card>
+  </div>
+
+  {editable && (
+    <form method="post" id="sign-form" data-confirm={c.note.signText} data-confirm-title={c.note.signTitle} data-confirm-action={c.note.sign} hidden>
+      <input type="hidden" name="intent" value="sign" />
+    </form>
+  )}
+</AppLayout>
+
+<script>
+  // Signing asks first (the shared ConfirmDialog), then sends the note as it is on screen
+  const sign = document.querySelector<HTMLFormElement>('#sign-form');
+  const note = document.querySelector<HTMLFormElement>('#note-form');
+  document.querySelector('[data-sign]')?.addEventListener('click', () => {
+    if (!sign || !note) return;
+    sign.querySelectorAll('[data-copy]').forEach((el) => el.remove());
+    for (const [k, v] of new FormData(note)) {
+      const input = Object.assign(document.createElement('input'), { type: 'hidden', name: k, value: String(v) });
+      input.dataset.copy = '';
+      sign.append(input);
+    }
+    sign.requestSubmit();
+  });
+
+  // Another medicine row
+  const meds = document.querySelector('[data-meds]');
+  document.querySelector('[data-add-med]')?.addEventListener('click', () => {
+    if (!meds || meds.children.length >= 30) return;
+    const row = meds.querySelector('[data-med]')!.cloneNode(true) as HTMLElement;
+    row.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>('input, textarea').forEach((el) => (el.value = ''));
+    meds.append(row);
+    row.querySelector('input')!.focus();
+  });
+</script>
+
+<style>
+  .layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 24rem);
+    align-items: start;
+    gap: var(--space-4);
+  }
+  .main {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--space-4);
+  }
+  .note-form :global(.card) {
+    gap: var(--space-4);
+  }
+  .vitals {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(7.5rem, 1fr));
+    gap: var(--space-3);
+    margin: 0;
+    padding: var(--space-3);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-control);
+  }
+  .vitals legend {
+    padding: 0 var(--space-1);
+    font-weight: var(--weight-bold);
+  }
+  .actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: var(--space-2);
+  }
+  .read {
+    display: grid;
+    gap: var(--space-4);
+    margin: 0;
+  }
+  .read dt {
+    font-size: var(--text-sm);
+    color: var(--text-muted);
+  }
+  .read dd {
+    margin: 0;
+    white-space: pre-line;
+  }
+  .vitals-read {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2) var(--space-4);
+  }
+  .addenda {
+    display: grid;
+    gap: var(--space-3);
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .addenda li {
+    padding: var(--space-3);
+    background: var(--bg-app);
+    border-inline-start: 3px solid var(--color-primary);
+    border-radius: var(--radius-control);
+  }
+  .pre {
+    margin: 0 0 var(--space-1);
+    white-space: pre-line;
+  }
+  .addendum-form {
+    display: grid;
+    gap: var(--space-2);
+    justify-items: start;
+  }
+  .addendum-form > :global(.field) {
+    width: 100%;
+  }
+  .rx {
+    display: grid;
+    gap: var(--space-2);
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .rx li {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+    padding-bottom: var(--space-2);
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .rx li > .ui-small {
+    flex-basis: 100%;
+  }
+  .rx-form {
+    display: grid;
+    gap: var(--space-2);
+    padding-top: var(--space-3);
+    border-top: 1px solid var(--border-subtle);
+  }
+  .rx-form h3 {
+    margin: 0;
+  }
+  .meds {
+    display: grid;
+    gap: var(--space-3);
+  }
+  .med {
+    display: grid;
+    gap: var(--space-1);
+    margin: 0;
+    padding: 0;
+    border: 0;
+  }
+  @media (max-width: 60rem) {
+    .layout {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+</style>

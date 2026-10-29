@@ -1,0 +1,101 @@
+---
+// Record an expense: what it was, how much, and how it was paid (register / another way / owed).
+import AppLayout from '@/layouts/AppLayout.astro';
+import PaymentSplit from '@/components/payments/PaymentSplit.astro';
+import Button from '@/components/ui/Button.astro';
+import Card from '@/components/ui/Card.astro';
+import Field from '@/components/ui/Field.astro';
+import { getLocale, localePath, money, useTranslations } from '@/i18n';
+import { ApiError } from '@/lib/api';
+import { currentSession } from '@/lib/cash';
+import { createExpense, paymentErrorText, readPayment } from '@/lib/expenses';
+import { listCatalog } from '@/lib/products';
+import { setFlash } from '@/lib/session';
+import { localInputToInstant } from '@/lib/time';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const ex = t.expenses;
+const { session, accessToken, branch } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'expenses')?.permissions ?? [];
+if (!perms.includes('create') || !branch) return Astro.rewrite('/404');
+const tz = session.user.timezone;
+
+let values = { description: '', amount: '', spent_at: '', supplier_id: '', reference: '', notes: '' };
+let payment = { cash_amount: '', other_amount: '' };
+let fieldErrors: Record<string, string> = {};
+let formError: string | undefined;
+if (Astro.request.method === 'POST') {
+  const data = await Astro.request.formData();
+  values = Object.fromEntries(Object.keys(values).map((k) => [k, String(data.get(k) ?? '').trim()])) as typeof values;
+  payment = { cash_amount: String(data.get('cash_amount') ?? ''), other_amount: String(data.get('other_amount') ?? '') };
+  if (!values.description) fieldErrors.description = ex.errors.description;
+  if (!(Number(values.amount) > 0)) fieldErrors.amount = ex.errors.amount;
+  if (!Object.keys(fieldErrors).length) {
+    try {
+      const created = await createExpense(accessToken, branch.id, {
+        description: values.description, amount: values.amount, supplier_id: values.supplier_id || null,
+        ...(values.spent_at && { spent_at: localInputToInstant(values.spent_at, tz) }),
+        reference: values.reference || null, notes: values.notes || null, ...readPayment(data),
+      });
+      setFlash(Astro.cookies, { saved: '1' });
+      return Astro.redirect(localePath(locale, `/expenses/${created.id}`), 303);
+    } catch (e) {
+      if (!(e instanceof ApiError)) throw e;
+      const detail = e.body?.detail;
+      if (detail?.field === 'spent_at') fieldErrors.spent_at = ex.errors.spent_at;
+      formError = paymentErrorText(detail, t.outgoing, (n) => money(locale, n))
+        ?? (Object.keys(fieldErrors).length || e.status === 422 ? t.ui.formError : e.status === 403 ? t.ui.forbidden : t.ui.failed);
+    }
+  }
+  formError ??= t.ui.formError;
+  Astro.response.status = 422;
+}
+
+const [mine, suppliers] = await Promise.all([currentSession(accessToken), listCatalog(accessToken, 'suppliers')]);
+const register = mine && mine.branch_id === branch.id ? { name: mine.cash_register, cash: Number(mine.cash_balance) } : null;
+const back = Astro.url.searchParams.get('from') === 'purchases' ? localePath(locale, '/purchases') : localePath(locale, '/expenses');
+---
+
+<AppLayout title={ex.newExpense} current="/expenses">
+  <a class="ui-back" href={back}>← {Astro.url.searchParams.get('from') === 'purchases' ? t.purchases.back : ex.back}</a>
+  <header class="ui-header">
+    <div>
+      <h1>{ex.newExpense}</h1>
+      <p class="ui-sub">{branch.name}</p>
+    </div>
+  </header>
+
+  <form method="post" class="layout" novalidate>
+    {formError && <p class="ui-alert" role="alert">{formError}</p>}
+    <Card>
+      <div class="ui-form">
+        <div class="ui-full"><Field label={ex.description} name="description" value={values.description} required maxlength={200}
+          hint={fieldErrors.description ? undefined : ex.descriptionHint} error={fieldErrors.description} autofocus /></div>
+        <Field label={ex.amount} name="amount" type="number" min="0.01" step="0.01" inputmode="decimal" value={values.amount} required error={fieldErrors.amount} />
+        <Field label={ex.spentAt} name="spent_at" type="datetime-local" value={values.spent_at}
+          max={Temporal.Now.plainDateTimeISO(tz).toString({ smallestUnit: 'minute' })}
+          hint={fieldErrors.spent_at ? undefined : ex.spentAtHint} error={fieldErrors.spent_at} />
+        <Field label={ex.supplier} name="supplier_id" as="select">
+          <option value="">{ex.noSupplier}</option>
+          {suppliers.map((s) => <option value={s.id} selected={s.id === values.supplier_id}>{s.name}</option>)}
+        </Field>
+        <Field label={ex.reference} name="reference" value={values.reference} maxlength={100} hint={ex.referenceHint} />
+        <div class="ui-full"><Field label={ex.notes} name="notes" as="textarea" rows={2} value={values.notes} maxlength={2000} /></div>
+      </div>
+    </Card>
+    <PaymentSplit locale={locale} register={register} values={payment} />
+    <div class="ui-form-actions">
+      <Button variant="tertiary" href={back}>{t.ui.cancel}</Button>
+      <Button type="submit" icon="check">{ex.save}</Button>
+    </div>
+  </form>
+</AppLayout>
+
+<style>
+  .layout {
+    display: grid;
+    gap: var(--space-4);
+    max-width: 48rem;
+  }
+</style>

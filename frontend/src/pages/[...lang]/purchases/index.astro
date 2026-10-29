@@ -1,0 +1,207 @@
+---
+import AppLayout from '@/layouts/AppLayout.astro';
+import Badge from '@/components/ui/Badge.astro';
+import Button from '@/components/ui/Button.astro';
+import Card from '@/components/ui/Card.astro';
+import EmptyState from '@/components/ui/EmptyState.astro';
+import Field from '@/components/ui/Field.astro';
+import Notice from '@/components/ui/Notice.astro';
+import { fmt, getLocale, localePath, money, useTranslations } from '@/i18n';
+import { ApiError } from '@/lib/api';
+import { listCatalog, listPurchases, purchaseSummary } from '@/lib/products';
+import { startOfDay } from '@/lib/time';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const pu = t.purchases;
+const { session, accessToken, branch } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'purchases')?.permissions ?? [];
+const seeSuppliers = session.modules.some((m) => m.code === 'suppliers' && m.permissions.includes('read'));
+if (!perms.includes('read')) return Astro.rewrite('/404');
+const canCreate = perms.includes('create') && !!branch;
+// Expenses are recorded from here too: "Record expense" next to "Record purchase"
+const canExpense = !!branch && session.modules.some((m) => m.code === 'expenses' && m.permissions.includes('create'));
+const tz = session.user.timezone;
+const basePath = localePath(locale, '/purchases');
+
+const params = Astro.url.searchParams;
+const tab = params.get('tab') === 'summary' ? 'summary' : 'list';
+const page = Math.max(1, Number.parseInt(params.get('page') ?? '1', 10) || 1);
+const date = (v: string | null) => { try { return v ? Temporal.PlainDate.from(v) : undefined; } catch { return undefined; } };
+const today = Temporal.Now.plainDateISO(tz);
+// The summary always has a period (this month by default); the list only filters by date when asked
+const from = date(params.get('from')) ?? (tab === 'summary' ? today.with({ day: 1 }) : undefined);
+const to = date(params.get('to')) ?? (tab === 'summary' ? today : undefined);
+const filters = {
+  from: from && startOfDay(from, tz),
+  to: to && startOfDay(to.add({ days: 1 }), tz), // "to" is inclusive for people, exclusive for the API
+  supplier_id: params.get('supplier_id') || undefined,
+  q: (params.get('q') ?? '').trim().slice(0, 100) || undefined,
+  include_voided: params.get('voided') === 'on' || undefined,
+  status: params.get('owed') === 'on' ? 'owed' : undefined,
+};
+const filtered = Object.values(filters).some(Boolean);
+
+let pageError: string | undefined;
+let result: Awaited<ReturnType<typeof listPurchases>> = { items: [], has_more: false };
+let summary: Awaited<ReturnType<typeof purchaseSummary>> | undefined;
+const suppliers = await listCatalog(accessToken, 'suppliers');
+if (branch) {
+  try {
+    if (tab === 'list') result = await listPurchases(accessToken, branch.id, { ...filters, page });
+    else summary = await purchaseSummary(accessToken, branch.id, filters.from!, filters.to!, tz);
+  } catch (e) {
+    if (!(e instanceof ApiError) || e.status !== 422) throw e;
+    pageError = pu.badRange;
+  }
+}
+const when = new Intl.DateTimeFormat(t.intl, { dateStyle: 'medium', timeStyle: 'short', timeZone: tz });
+const count = (n: number) => (Number(n) === 1 ? pu.onePurchase : fmt(pu.nPurchases, { n }));
+const dayName = (d: string) => Temporal.PlainDate.from(d).toLocaleString(t.intl, { dateStyle: 'medium' });
+const link = (extra: Record<string, string | number>) => {
+  const q = new URLSearchParams(params);
+  for (const [k, v] of Object.entries(extra)) q.set(k, String(v));
+  return `${basePath}?${q}`;
+};
+---
+
+<AppLayout title={pu.title} current="/purchases">
+  <header class="ui-header">
+    <div>
+      <h1>{pu.title}</h1>
+      {branch && <p class="ui-sub">{branch.name}</p>}
+    </div>
+    <div class="ui-actions">
+      {canExpense && <Button variant="secondary" icon="receipt" href={`${localePath(locale, '/expenses/new')}?from=purchases`}>{t.expenses.newExpense}</Button>}
+      {canCreate && <Button icon="plus" href={localePath(locale, '/purchases/new')}>{pu.newPurchase}</Button>}
+    </div>
+  </header>
+
+  <nav class="ui-tabs tabs" aria-label={pu.title}>
+    {(['list', 'summary'] as const).map((k) => <a href={k === 'list' ? basePath : `${basePath}?tab=summary`} aria-current={k === tab ? 'page' : undefined}>{pu.tabs[k]}</a>)}
+  </nav>
+
+  {
+    !branch ? <Notice tone="warning">{t.ui.noBranch}</Notice> : (
+      <>
+        <form method="get" class="filters">
+          {tab === 'summary' && <input type="hidden" name="tab" value="summary" />}
+          <Field label={pu.from} name="from" type="date" value={from?.toString()} max={today.toString()} />
+          <Field label={pu.to} name="to" type="date" value={to?.toString()} max={today.toString()} />
+          {tab === 'list' && (
+            <>
+              <Field label={pu.supplier} name="supplier_id" as="select">
+                <option value="">{pu.allSuppliers}</option>
+                {suppliers.map((s) => <option value={s.id} selected={s.id === filters.supplier_id}>{s.name}</option>)}
+              </Field>
+              <Field label={pu.searchReference} name="q" type="search" value={filters.q} maxlength={100} />
+              <label class="ui-check"><input type="checkbox" name="voided" checked={!!filters.include_voided} />{pu.includeVoided}</label>
+              <label class="ui-check"><input type="checkbox" name="owed" checked={!!filters.status} />{pu.onlyOwed}</label>
+            </>
+          )}
+          <Button type="submit" variant="secondary" icon="filter">{pu.filter}</Button>
+        </form>
+
+        {pageError && <Notice tone="error">{pageError}</Notice>}
+
+        {tab === 'summary' && summary && (
+          summary.by_supplier.length === 0 ? <p class="ui-muted">{pu.summaryEmpty}</p> : (
+            <div class="ui-grid">
+              <Card title={pu.bySupplier}>
+                <p class="total"><span class="ui-muted">{pu.summaryTotal}</span> <strong class="num">{money(locale, Number(summary.total))}</strong></p>
+                <dl class="ui-rows">
+                  {summary.by_supplier.map((r) => (
+                    <div>
+                      <dt>{r.supplier_id ? <a href={`${basePath}?${new URLSearchParams({ supplier_id: r.supplier_id, from: from!.toString(), to: to!.toString() })}`}>{r.supplier}</a> : pu.noSupplier}
+                        <span class="ui-line2">{count(r.purchases)}</span></dt>
+                      <dd class="num ui-strong">{money(locale, Number(r.total))}</dd>
+                    </div>
+                  ))}
+                </dl>
+              </Card>
+              <Card title={pu.byDay}>
+                <dl class="ui-rows">
+                  {summary.by_day.map((r) => (
+                    <div><dt>{dayName(r.day)}<span class="ui-line2">{count(r.purchases)}</span></dt><dd class="num ui-strong">{money(locale, Number(r.total))}</dd></div>
+                  ))}
+                </dl>
+              </Card>
+            </div>
+          )
+        )}
+
+        {tab === 'list' && (result.items.length === 0 && page === 1 ? (
+          filtered ? <p class="ui-muted">{pu.noResults}</p> : (
+            <EmptyState icon="truck" title={pu.empty} text={pu.emptyText}>
+              {canCreate && <Button icon="plus" href={localePath(locale, '/purchases/new')}>{pu.newPurchase}</Button>}
+            </EmptyState>
+          )
+        ) : (
+          <div class="ui-table-wrap">
+            <table class="ui-table">
+              <thead><tr><th scope="col">{pu.colDate}</th><th scope="col">{pu.colSupplier}</th><th scope="col">{pu.colReference}</th><th scope="col" class="ui-end">{pu.colItems}</th><th scope="col" class="ui-end">{pu.colTotal}</th><th scope="col" class="ui-end">{t.outgoing.owed}</th></tr></thead>
+              <tbody>
+                {result.items.map((p) => (
+                  <tr>
+                    <td data-label={pu.colDate}>
+                      <a class="ui-strong num" href={localePath(locale, `/purchases/${p.id}`)}>{when.format(new Date(p.purchased_at))}</a>
+                      {p.deleted_at && <Badge tone="error">{pu.voidedBadge}</Badge>}
+                      <span class="ui-line2">{p.created_by_email}</span>
+                    </td>
+                    <td data-label={pu.colSupplier}>{p.supplier && p.supplier_id && seeSuppliers ? <a href={localePath(locale, `/suppliers/${p.supplier_id}`)}>{p.supplier}</a> : p.supplier ?? <span class="ui-muted">{pu.noSupplier}</span>}</td>
+                    <td data-label={pu.colReference} class="num">{p.reference ?? '—'}</td>
+                    <td data-label={pu.colItems} class="ui-end num">{p.item_count}</td>
+                    <td data-label={pu.colTotal} class:list={['ui-end num ui-strong', p.deleted_at && 'voided']}>{money(locale, Number(p.total))}</td>
+                    <td data-label={t.outgoing.owed} class="ui-end num">{Number(p.owed) > 0 && !p.deleted_at ? <span class="owes">{money(locale, Number(p.owed))}</span> : <span class="ui-muted">—</span>}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ))}
+
+        {tab === 'list' && (page > 1 || result.has_more) && (
+          <nav class="ui-pager">
+            <span />
+            <span class="ui-actions">
+              {page > 1 && <Button variant="secondary" href={link({ page: page - 1 })}>{t.ui.previous}</Button>}
+              {result.has_more && <Button variant="secondary" href={link({ page: page + 1 })}>{t.ui.next}</Button>}
+            </span>
+          </nav>
+        )}
+      </>
+    )
+  }
+</AppLayout>
+
+<style>
+  .tabs {
+    margin-bottom: var(--space-4);
+  }
+  .filters {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: var(--space-3);
+    margin-bottom: var(--space-5);
+  }
+  .filters > :global(.field) {
+    flex: 1 1 10rem;
+  }
+  .filters > :global(.ui-check) {
+    min-height: var(--control-height);
+  }
+  .total {
+    display: flex;
+    justify-content: space-between;
+    margin-bottom: var(--space-3);
+    font-size: var(--text-lg);
+  }
+  .voided {
+    color: var(--text-muted);
+    text-decoration: line-through;
+  }
+  .owes {
+    color: var(--status-error-text);
+  }
+</style>

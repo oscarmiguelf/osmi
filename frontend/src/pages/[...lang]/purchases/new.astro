@@ -1,0 +1,108 @@
+---
+import AppLayout from '@/layouts/AppLayout.astro';
+import PaymentSplit from '@/components/payments/PaymentSplit.astro';
+import Button from '@/components/ui/Button.astro';
+import Card from '@/components/ui/Card.astro';
+import Field from '@/components/ui/Field.astro';
+import ItemsEditor from '@/components/ui/ItemsEditor.astro';
+import { fmt, getLocale, localePath, money, useTranslations } from '@/i18n';
+import { currentSession } from '@/lib/cash';
+import { paymentErrorText, readPayment } from '@/lib/expenses';
+import { ApiError } from '@/lib/api';
+import { costChangesText, createPurchase, listCatalog, readItems } from '@/lib/products';
+import { setFlash } from '@/lib/session';
+import { localInputToInstant } from '@/lib/time';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const pu = t.purchases;
+const { session, accessToken, branch } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'purchases')?.permissions ?? [];
+if (!perms.includes('create') || !branch) return Astro.rewrite('/404');
+
+let values = { supplier_id: '', purchased_at: '', reference: '', notes: '' };
+let fieldErrors: Record<string, string> = {};
+const tz = session.user.timezone;
+let items: ReturnType<typeof readItems> = [];
+let payment = { cash_amount: '', other_amount: '' };
+let formError: string | undefined;
+if (Astro.request.method === 'POST') {
+  const data = await Astro.request.formData();
+  values = Object.fromEntries(Object.keys(values).map((k) => [k, String(data.get(k) ?? '').trim()])) as typeof values;
+  items = readItems(data);
+  payment = { cash_amount: String(data.get('cash_amount') ?? ''), other_amount: String(data.get('other_amount') ?? '') };
+  if (!items.length) formError = pu.noItems;
+  else {
+    try {
+      const created = await createPurchase(accessToken, branch.id, {
+        supplier_id: values.supplier_id || null,
+        ...(values.purchased_at && { purchased_at: localInputToInstant(values.purchased_at, tz) }),
+        reference: values.reference || null,
+        notes: values.notes || null,
+        items: items.map((i) => ({ product_id: i.product_id, quantity: i.quantity, unit_cost: i.unit_cost || '0' })),
+        ...readPayment(data),
+      });
+      setFlash(Astro.cookies, { saved: '1', costs: costChangesText(created.cost_changes, locale, pu.costChange) });
+      return Astro.redirect(localePath(locale, `/purchases/${created.id}`), 303);
+    } catch (e) {
+      if (!(e instanceof ApiError)) throw e;
+      const detail = e.body?.detail;
+      if (detail?.field === 'purchased_at') fieldErrors.purchased_at = pu.futureDate;
+      formError = paymentErrorText(detail, t.outgoing, (n) => money(locale, n))
+        ?? (fieldErrors.purchased_at ? t.ui.formError : typeof detail?.message === 'string' ? fmt(pu.invalidItem, { message: detail.message })
+        : e.status === 422 ? t.ui.formError : e.status === 403 ? t.ui.forbidden : t.ui.failed);
+    }
+  }
+  Astro.response.status = 422;
+}
+const [suppliers, mine] = await Promise.all([listCatalog(accessToken, 'suppliers'), currentSession(accessToken)]);
+const register = mine && mine.branch_id === branch.id ? { name: mine.cash_register, cash: Number(mine.cash_balance) } : null;
+---
+
+<AppLayout title={pu.newPurchase} current="/purchases">
+  <a class="ui-back" href={localePath(locale, '/purchases')}>← {pu.back}</a>
+  <header class="ui-header">
+    <div>
+      <h1>{pu.newPurchase}</h1>
+      <p class="ui-sub">{branch.name}</p>
+    </div>
+  </header>
+
+  <form method="post" class="layout" novalidate>
+    {formError && <p class="ui-alert" role="alert">{formError}</p>}
+    <Card>
+      <div class="ui-form">
+        <Field label={pu.supplier} name="supplier_id" as="select">
+          <option value="">{pu.noSupplier}</option>
+          {suppliers.map((s) => <option value={s.id} selected={s.id === values.supplier_id}>{s.name}</option>)}
+        </Field>
+        <Field label={pu.purchasedAt} name="purchased_at" type="datetime-local" value={values.purchased_at}
+          max={Temporal.Now.plainDateTimeISO(tz).toString({ smallestUnit: 'minute' })}
+          hint={fieldErrors.purchased_at ? undefined : pu.purchasedAtHint} error={fieldErrors.purchased_at} />
+        <Field label={pu.reference} name="reference" value={values.reference} maxlength={100} />
+        <Field label={pu.notes} name="notes" as="textarea" rows={2} value={values.notes} maxlength={2000} />
+      </div>
+    </Card>
+    <Card title={pu.items}>
+      <p class="ui-muted ui-small">{pu.costHint}</p>
+      <ItemsEditor id="purchase-items" withCost items={items} intl={t.intl} labels={{
+        product: pu.product, placeholder: pu.productPlaceholder, hint: pu.productHint, noResults: pu.noProducts,
+        clear: t.calendar.clearSelection, quantity: pu.quantity, unitCost: pu.unitCost, lineTotal: pu.lineTotal,
+        add: pu.add, remove: pu.remove, total: pu.total, empty: pu.noItems,
+      }} />
+    </Card>
+    <PaymentSplit locale={locale} register={register} values={payment} />
+    <div class="ui-form-actions">
+      <Button variant="tertiary" href={localePath(locale, '/purchases')}>{t.ui.cancel}</Button>
+      <Button type="submit" icon="check">{pu.save}</Button>
+    </div>
+  </form>
+</AppLayout>
+
+<style>
+  .layout {
+    display: grid;
+    gap: var(--space-4);
+    max-width: 56rem;
+  }
+</style>

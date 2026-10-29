@@ -1,0 +1,185 @@
+---
+// Pay part (or all) of a sale's balance in one or several payment methods: an appointment's deposit when it's booked,
+// or later. Posts to /api/sales/abono, which comes back to `back` with a flash (paid / pay_error).
+import Button from '@/components/ui/Button.astro';
+import Dialog from '@/components/ui/Dialog.astro';
+import { fmt, money, useTranslations, type Locale } from '@/i18n';
+
+interface Props {
+  locale: Locale;
+  saleId: string;
+  balance: number;
+  methods: { id: string; description: string }[];
+  /** The page to come back to */
+  back: string;
+  open?: boolean;
+  error?: string;
+}
+
+const { locale, saleId, balance, methods, back, open = false, error } = Astro.props;
+const t = useTranslations(locale);
+const a = t.sales.abono;
+const cash = methods.find((m) => m.description === 'Cash')?.id ?? '';
+const label = (d: string) => t.cash.methodNames[d] ?? d;
+---
+
+<Dialog id="abono" title={a.title} closeLabel={t.ui.close} open={open || !!error}>
+  <form method="post" action="/api/sales/abono" class="abono" novalidate data-abono data-balance={balance} data-cash={cash} data-intl={t.intl}>
+    <input type="hidden" name="sale_id" value={saleId} />
+    <input type="hidden" name="back" value={back} />
+    <input type="hidden" name="locale" value={locale} />
+    <input type="hidden" name="cash_method" value={cash} />
+    {error && <p class="ui-alert" role="alert">{error}</p>}
+    <p class="ui-muted ui-small">{fmt(a.intro, { amount: money(locale, balance) })}</p>
+    <div class="rows" data-rows>
+      <div class="row" data-row>
+        <label class="field"><span class="label">{a.method}</span>
+          <select class="ui-input" name="method">{methods.map((m) => <option value={m.id} selected={m.id === cash}>{label(m.description)}</option>)}</select></label>
+        <label class="field"><span class="label">{a.amount}</span>
+          <input class="ui-input num" name="amount" type="text" inputmode="decimal" autocomplete="off" value={balance.toFixed(2)} /></label>
+        <label class="field ref"><span class="label">{a.reference}</span>
+          <input class="ui-input" name="reference" maxlength="100" autocomplete="off" /></label>
+        <button type="button" class="remove" aria-label={a.remove} data-remove hidden>×</button>
+      </div>
+    </div>
+    <Button variant="tertiary" icon="plus" data-add>{a.addMethod}</Button>
+    <label class="field" data-received-field><span class="label">{a.received}</span>
+      <input class="ui-input num" name="tendered" type="text" inputmode="decimal" autocomplete="off" />
+      <span class="ui-muted ui-small">{a.receivedHint}</span></label>
+    <dl class="sums">
+      <div><dt>{a.total}</dt><dd class="num" data-total></dd></div>
+      <div><dt>{a.left}</dt><dd class="num" data-left></dd></div>
+      <div data-change-row hidden><dt>{t.sales.cart.change}</dt><dd class="num" data-change></dd></div>
+    </dl>
+    <p class="ui-alert" role="alert" hidden data-over>{fmt(a.tooMuch, { amount: money(locale, balance) })}</p>
+    <div class="ui-form-actions">
+      <Button variant="tertiary" data-dialog-close>{a.later}</Button>
+      <Button type="submit" icon="hand-coins">{a.save}</Button>
+    </div>
+  </form>
+</Dialog>
+
+<script>
+  document.querySelectorAll<HTMLFormElement>('[data-abono]').forEach((form) => {
+    const balance = Number(form.dataset.balance);
+    const cash = form.dataset.cash!;
+    const money = new Intl.NumberFormat(form.dataset.intl, { style: 'currency', currency: 'MXN' });
+    const rows = form.querySelector<HTMLElement>('[data-rows]')!;
+    const cents = (v: string) => Math.round(Number(v.replace(',', '.')) * 100) || 0;
+    const $ = (sel: string) => form.querySelector<HTMLElement>(sel)!;
+
+    function update() {
+      const all = [...rows.querySelectorAll<HTMLElement>('[data-row]')];
+      all.forEach((r) => (r.querySelector<HTMLElement>('[data-remove]')!.hidden = all.length === 1));
+      const amounts = all.map((r) => ({ method: r.querySelector('select')!.value, c: cents(r.querySelector<HTMLInputElement>('[name=amount]')!.value) }));
+      const total = amounts.reduce((s, x) => s + x.c, 0);
+      const cashPart = amounts.filter((x) => x.method === cash).reduce((s, x) => s + x.c, 0);
+      $('[data-total]').textContent = money.format(total / 100);
+      $('[data-left]').textContent = money.format(Math.max(0, Math.round(balance * 100) - total) / 100);
+      $('[data-over]').hidden = total <= Math.round(balance * 100);
+      $('[data-received-field]').hidden = cashPart === 0;
+      const received = cents(form.querySelector<HTMLInputElement>('[name=tendered]')!.value);
+      $('[data-change-row]').hidden = !(cashPart && received > cashPart);
+      $('[data-change]').textContent = money.format(Math.max(0, received - cashPart) / 100);
+    }
+
+    form.querySelector('[data-add]')!.addEventListener('click', () => {
+      if (rows.children.length >= 5) return;
+      const row = rows.querySelector<HTMLElement>('[data-row]')!.cloneNode(true) as HTMLElement;
+      row.querySelector<HTMLInputElement>('[name=amount]')!.value = '';
+      row.querySelector<HTMLInputElement>('[name=reference]')!.value = '';
+      const select = row.querySelector('select')!;
+      // the next row starts on a method not used yet (the first is usually cash)
+      const used = new Set([...rows.querySelectorAll('select')].map((x) => x.value));
+      const free = [...select.options].find((o) => !used.has(o.value));
+      if (free) select.value = free.value;
+      rows.append(row);
+      update();
+      row.querySelector<HTMLInputElement>('[name=amount]')!.focus();
+    });
+    rows.addEventListener('click', (e) => {
+      const b = (e.target as HTMLElement).closest('[data-remove]');
+      if (b) { b.closest('[data-row]')!.remove(); update(); }
+    });
+    form.addEventListener('input', update);
+    form.addEventListener('change', update);
+    form.addEventListener('submit', (e) => {
+      update();
+      if (!$('[data-over]').hidden) e.preventDefault();
+    });
+    update();
+  });
+</script>
+
+<style>
+  .abono {
+    display: grid;
+    gap: var(--space-3);
+  }
+  .abono p {
+    margin: 0;
+  }
+  .rows {
+    display: grid;
+    gap: var(--space-2);
+  }
+  .row {
+    display: grid;
+    grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) minmax(0, 1fr) 2rem;
+    align-items: end;
+    gap: var(--space-2);
+  }
+  .field {
+    display: grid;
+    gap: var(--space-1);
+    min-width: 0;
+  }
+  .row .ui-input {
+    width: 100%;
+    min-width: 0;
+  }
+  .field[hidden] {
+    display: none;
+  }
+  .label {
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
+  }
+  .remove {
+    height: 2.5rem;
+    font-size: 1.25rem;
+    color: var(--text-muted);
+    background: none;
+    border: 0;
+    cursor: pointer;
+  }
+  .remove[hidden] {
+    visibility: hidden;
+    display: block;
+  }
+  .sums {
+    display: grid;
+    gap: var(--space-1);
+    margin: 0;
+  }
+  .sums div {
+    display: flex;
+    justify-content: space-between;
+  }
+  .sums div[hidden] {
+    display: none;
+  }
+  .sums dd {
+    margin: 0;
+    font-weight: var(--weight-bold);
+  }
+  @media (max-width: 30rem) {
+    .row {
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 2rem;
+    }
+    .ref {
+      grid-column: 1 / 3;
+      grid-row: 2;
+    }
+  }
+</style>

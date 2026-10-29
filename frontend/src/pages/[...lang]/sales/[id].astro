@@ -1,0 +1,342 @@
+---
+// A sale: the ticket (printable), what is still reserved, credit owed, returns and history.
+import AppLayout from '@/layouts/AppLayout.astro';
+import Badge from '@/components/ui/Badge.astro';
+import WhatsAppShare from '@/components/ui/WhatsAppShare.astro';
+import Button from '@/components/ui/Button.astro';
+import Card from '@/components/ui/Card.astro';
+import Dialog from '@/components/ui/Dialog.astro';
+import Field from '@/components/ui/Field.astro';
+import Notice from '@/components/ui/Notice.astro';
+import Timeline from '@/components/ui/Timeline.astro';
+import { fmt, getLocale, localePath, money, useTranslations } from '@/i18n';
+import { ApiError } from '@/lib/api';
+import { listPaymentMethods } from '@/lib/cash';
+import { addAbono, deliverItems, getSale, saleErrorText, saleHistory, type Sale } from '@/lib/sales';
+import { setFlash, takeFlash } from '@/lib/session';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const s = t.sales;
+const { session, accessToken, branch } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'sales')?.permissions ?? [];
+if (!perms.includes('read') || !branch) return Astro.rewrite('/404');
+const id = Astro.params.id!;
+const selfPath = localePath(locale, `/sales/${id}`);
+const canUpdate = perms.includes('update');
+
+let pageError: { text: string; items?: string[] } | undefined;
+let abonoError: string | undefined;
+let abonoValues = { payment_method_id: '', amount: '', amount_tendered: '', reference: '' };
+if (Astro.request.method === 'POST' && canUpdate) {
+  const data = await Astro.request.formData();
+  const intent = data.get('intent');
+  try {
+    if (intent === 'deliver') {
+      const ids = data.getAll('item').map(String);
+      if (!ids.length) pageError = { text: s.detail.chooseItems };
+      else {
+        await deliverItems(accessToken, branch.id, id, ids);
+        setFlash(Astro.cookies, { delivered: String(ids.length) });
+        return Astro.redirect(selfPath, 303);
+      }
+    }
+    if (intent === 'abono') {
+      abonoValues = Object.fromEntries(Object.keys(abonoValues).map((k) => [k, String(data.get(k) ?? '').trim()])) as typeof abonoValues;
+      await addAbono(accessToken, branch.id, id, {
+        payment_method_id: abonoValues.payment_method_id, amount: abonoValues.amount || '0',
+        amount_tendered: abonoValues.amount_tendered || null, reference: abonoValues.reference || null,
+      });
+      setFlash(Astro.cookies, { abono: abonoValues.amount });
+      return Astro.redirect(selfPath, 303);
+    }
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    const detail = e.body?.detail;
+    if (intent === 'abono') {
+      abonoError = detail?.outstanding !== undefined ? fmt(s.detail.tooMuch, { amount: money(locale, Number(detail.outstanding)) })
+        : saleErrorText(e.status, detail, t).text;
+    } else pageError = e.status === 409 ? { text: s.detail.alreadyDelivered } : saleErrorText(e.status, detail, t);
+  }
+  Astro.response.status = 422;
+}
+
+let sale: Sale;
+try {
+  sale = await getSale(accessToken, branch.id, id);
+} catch (e) {
+  if (e instanceof ApiError && (e.status === 404 || e.status === 422)) return Astro.rewrite('/404');
+  throw e;
+}
+const [history, methods] = await Promise.all([saleHistory(accessToken, branch.id, id), listPaymentMethods(accessToken)]);
+const flash = takeFlash(Astro.cookies);
+const tz = session.user.timezone;
+const when = new Intl.DateTimeFormat(t.intl, { dateStyle: 'medium', timeStyle: 'short', timeZone: tz });
+const tone = { PAID: 'success', PENDING: 'warning', RETURNED: 'neutral' } as const;
+const unit = (u: string) => t.products.unitNames[u] ?? u;
+const method = (d: string) => t.cash.methodNames[d] ?? d;
+const reserved = sale.items.filter((i) => i.fulfillment === 'RESERVED' && Number(i.returnable_quantity) > 0);
+const owes = Number(sale.credit_outstanding) > 0 && sale.status === 'PENDING';
+const change = sale.payments.reduce((sum, p) => sum + Number(p.change_given ?? 0), 0);
+const shareText = fmt(t.share.ticketText, { name: sale.customer?.split(' ')[0] ?? '', folio: sale.folio, business: sale.branch }).replace(/ ,/, ',');
+const realMethods = methods.filter((m) => !m.is_credit);
+const timeline = [
+  ...history.status.map((h) => ({ at: h.changed_at, title: s.status[h.to_status], meta: h.changed_by })),
+  ...history.fulfillment.filter((h) => h.from_status).map((h) => ({ at: h.changed_at, title: fmt(s.detail.deliveredItem, { product: h.product }), meta: h.changed_by })),
+  ...sale.payments.filter((p) => p.kind === 'credit_payment').map((p) => ({ at: p.created_at, title: fmt(s.detail.abonoItem, { amount: money(locale, Number(p.amount)) }), meta: p.created_by })),
+  ...sale.returns.map((r) => ({ at: r.created_at, title: fmt(s.detail.returnItem, { folio: r.folio, amount: money(locale, Number(r.refund_total)) }), meta: r.processed_by })),
+].sort((a, b) => b.at.localeCompare(a.at)).map((x) => ({ title: x.title, meta: `${x.meta}, ${when.format(new Date(x.at))}` }));
+---
+
+<AppLayout title={fmt(s.detail.title, { folio: sale.folio })} current="/sales">
+  <a class="ui-back no-print" href={localePath(locale, '/sales')}>← {s.back}</a>
+  <header class="ui-header no-print">
+    <div>
+      <h1 class="num">{fmt(s.detail.title, { folio: sale.folio })}</h1>
+      <p class="ui-sub">{when.format(new Date(sale.sold_at))} · {sale.seller} · {sale.cash_register} <Badge tone={tone[sale.status]}>{s.status[sale.status]}</Badge>
+        {sale.offline_folio && <> <Badge>{fmt(t.offline.soldOffline, { folio: sale.offline_folio })}</Badge></>}</p>
+    </div>
+    <div class="ui-actions">
+      <Button variant="secondary" icon="printer" data-print>{s.detail.print}</Button>
+      <WhatsAppShare pdf={`/api/sales/${id}/pdf?lang=${locale}`} fileName={`ticket-${sale.folio}.pdf`} text={shareText} phone={sale.customer_phone}
+        labels={t.share} />
+      {owes && canUpdate && <Button variant="secondary" icon="hand-coins" data-dialog="abono">{s.detail.abono}</Button>}
+      {perms.includes('delete') && sale.status !== 'RETURNED' && <Button variant="secondary" icon="undo-2" href={localePath(locale, `/sales/${id}/return`)}>{s.detail.return}</Button>}
+      {perms.includes('create') && <Button icon="plus" href={localePath(locale, '/')}>{s.newSale}</Button>}{/* back to the point of sale */}
+    </div>
+  </header>
+
+  <div class="ui-notices no-print">
+    {flash.sold && <Notice>{change ? fmt(s.detail.soldChange, { change: money(locale, change) }) : s.detail.sold}</Notice>}
+    {flash.delivered && <Notice>{s.detail.delivered}</Notice>}
+    {flash.abono && <Notice>{fmt(s.detail.abonoDone, { amount: money(locale, Number(flash.abono)) })}</Notice>}
+    {flash.returned && <Notice>{fmt(s.detail.returnDone, { folio: flash.returned, amount: money(locale, Number(flash.refund)) })}</Notice>}
+    {pageError && <Notice tone="error">{pageError.text}{pageError.items && <ul>{pageError.items.map((i) => <li>{i}</li>)}</ul>}</Notice>}
+  </div>
+
+  <div class="layout">
+    <article class="ticket" aria-label={s.detail.ticket}>
+      <header class="ticket-head">
+        {session.logo && <img class="logo" src={`/api/catalog/logo?v=${session.logo}`} alt="" />}
+        <strong>{sale.branch}</strong>
+        {sale.branch_address && <span>{sale.branch_address}</span>}
+        {sale.branch_phone && <span class="num">{sale.branch_phone}</span>}
+        <span class="num">{fmt(s.detail.title, { folio: sale.folio })} · {when.format(new Date(sale.sold_at))}</span>
+        {sale.customer && <span>{s.detail.customer}: {sale.customer}</span>}
+        {sale.quote_folio && <span>{fmt(s.detail.fromQuote, { folio: sale.quote_folio })}</span>}
+        {sale.appointment_id && <a href={localePath(locale, `/appointments/${sale.appointment_id}`)}>{fmt(s.fromAppointment, { date: new Intl.DateTimeFormat(t.intl, { dateStyle: 'medium', timeStyle: 'short', timeZone: session.user.timezone }).format(new Date(sale.appointment_at!)) })}</a>}
+      </header>
+      <table class="lines">
+        <thead><tr><th scope="col">{s.cart.product}</th><th scope="col" class="end">{s.cart.lineTotal}</th></tr></thead>
+        <tbody>
+          {sale.items.map((i) => (
+            <tr>
+              <td>
+                {i.product}
+                <span class="sub num">{Number(i.quantity)} {unit(i.unit)} × {money(locale, Number(i.unit_price))}{Number(i.discount) > 0 && <> · −{money(locale, Number(i.discount))}{i.promotion && ` (${i.promotion})`}</>}</span>
+                {i.fulfillment === 'RESERVED' && <span class="sub tag">{s.detail.reserved}</span>}
+                {Number(i.returned_quantity) > 0 && <span class="sub tag">{fmt(s.detail.returnedQty, { n: Number(i.returned_quantity) })}</span>}
+              </td>
+              <td class="end num">{money(locale, Number(i.line_total))}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <dl class="sums">
+        <div><dt>{s.cart.subtotal}</dt><dd class="num">{money(locale, Number(sale.subtotal))}</dd></div>
+        {Number(sale.discount) > 0 && <div><dt>{s.cart.discount}</dt><dd class="num">−{money(locale, Number(sale.discount))}</dd></div>}
+        <div class="grand"><dt>{s.cart.total}</dt><dd class="num">{money(locale, Number(sale.total))}</dd></div>
+        <div class="muted"><dt>{s.detail.taxIncluded}</dt><dd class="num">{money(locale, Number(sale.tax_total))}</dd></div>
+      </dl>
+      <dl class="sums">
+        {sale.payments.filter((p) => p.kind === 'sale').map((p) => (
+          <div><dt>{method(p.method)}{p.reference && <span class="sub">{p.reference}</span>}{p.amount_tendered !== null && <span class="sub">{fmt(s.detail.tendered, { amount: money(locale, Number(p.amount_tendered)) })}</span>}</dt><dd class="num">{money(locale, Number(p.amount))}</dd></div>
+        ))}
+        {change > 0 && <div class="grand"><dt>{s.cart.change}</dt><dd class="num">{money(locale, change)}</dd></div>}
+      </dl>
+      <p class="thanks">{s.detail.thanks}</p>
+    </article>
+
+    <div class="side no-print">
+      {owes && (
+        <Card title={s.detail.credit}>
+          <p class="owed num">{money(locale, Number(sale.credit_outstanding))}</p>
+          <p class="ui-muted ui-small">{fmt(s.detail.owedBy, { customer: sale.customer ?? '' })}</p>
+          {sale.customer_id && <a href={localePath(locale, `/customers/${sale.customer_id}`)}>{s.detail.customerAccount}</a>}
+        </Card>
+      )}
+
+      {reserved.length > 0 && (
+        <Card title={s.detail.toDeliver}>
+          <form method="post" class="stack">
+            <input type="hidden" name="intent" value="deliver" />
+            <fieldset class="ui-checks" disabled={!canUpdate}>
+              <legend class="visually-hidden">{s.detail.toDeliver}</legend>
+              {reserved.map((i) => <label class="ui-check"><input type="checkbox" name="item" value={i.id} checked />{i.product} ({Number(i.returnable_quantity)} {unit(i.unit)})</label>)}
+            </fieldset>
+            {canUpdate && <Button type="submit" variant="secondary" icon="package-check">{s.detail.deliver}</Button>}
+          </form>
+        </Card>
+      )}
+
+      {sale.returns.length > 0 && (
+        <Card title={s.detail.returns}>
+          <dl class="ui-rows">
+            {sale.returns.map((r) => <div><dt><span class="num">{r.folio}</span><span class="ui-line2">{when.format(new Date(r.created_at))}{r.reason && ` · ${r.reason}`}</span></dt><dd class="num">−{money(locale, Number(r.refund_total))}</dd></div>)}
+          </dl>
+        </Card>
+      )}
+
+      <Card title={t.ui.history}>
+        <Timeline items={timeline} />
+      </Card>
+    </div>
+  </div>
+
+  {owes && canUpdate && (
+    <Dialog id="abono" title={s.detail.abono} closeLabel={t.ui.close} open={!!abonoError}>
+      <form method="post" class="ui-form" novalidate>
+        {abonoError && <p class="ui-alert" role="alert">{abonoError}</p>}
+        <input type="hidden" name="intent" value="abono" />
+        <p class="ui-full ui-muted ui-small">{fmt(s.detail.owedNow, { amount: money(locale, Number(sale.credit_outstanding)) })}</p>
+        <Field label={s.cart.method} name="payment_method_id" as="select">
+          {realMethods.map((m) => <option value={m.id} selected={m.id === abonoValues.payment_method_id}>{method(m.description)}</option>)}
+        </Field>
+        <Field label={s.cart.amount} name="amount" type="number" step="0.01" min="0.01" max={String(sale.credit_outstanding)} inputmode="decimal"
+          value={abonoValues.amount || String(Number(sale.credit_outstanding).toFixed(2))} required />
+        <Field label={s.cart.tendered} name="amount_tendered" type="number" step="0.01" min="0" inputmode="decimal" value={abonoValues.amount_tendered}
+          hint={s.detail.tenderedHint} />
+        <Field label={s.cart.reference} name="reference" maxlength={100} value={abonoValues.reference} />
+        <div class="ui-form-actions">
+          <Button variant="tertiary" data-dialog-close>{t.ui.cancel}</Button>
+          <Button type="submit">{s.detail.abonoSave}</Button>
+        </div>
+      </form>
+    </Dialog>
+  )}
+</AppLayout>
+
+<script>
+  document.querySelector('[data-print]')?.addEventListener('click', () => window.print());
+  // Opened from the point of sale's "Print ticket"
+  if (new URLSearchParams(location.search).has('print')) window.print();
+</script>
+
+<style>
+  .layout {
+    display: grid;
+    grid-template-columns: minmax(0, 26rem) minmax(0, 1fr);
+    align-items: start;
+    gap: var(--space-4);
+  }
+  .side {
+    display: grid;
+    gap: var(--space-4);
+  }
+  .ticket {
+    display: grid;
+    gap: var(--space-3);
+    padding: var(--space-5);
+    background: var(--bg-app);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-container);
+    font-size: var(--text-sm);
+  }
+  .ticket-head {
+    display: grid;
+    gap: 2px;
+    padding-bottom: var(--space-3);
+    border-bottom: 1px dashed var(--border-input);
+    text-align: center;
+  }
+  .lines {
+    width: 100%;
+    border-collapse: collapse;
+  }
+  .lines th {
+    padding-bottom: var(--space-1);
+    color: var(--text-muted);
+    font-weight: var(--weight-medium);
+    text-align: start;
+  }
+  .lines td {
+    padding: var(--space-1) 0;
+    vertical-align: top;
+  }
+  .end {
+    text-align: end !important;
+  }
+  .sub {
+    display: block;
+    color: var(--text-muted);
+    font-size: var(--text-xs);
+  }
+  .tag {
+    font-weight: var(--weight-bold);
+  }
+  .sums {
+    display: grid;
+    gap: 2px;
+    margin: 0;
+    padding-top: var(--space-2);
+    border-top: 1px dashed var(--border-input);
+  }
+  .sums div {
+    display: flex;
+    justify-content: space-between;
+    gap: var(--space-3);
+  }
+  .sums dd {
+    margin: 0;
+  }
+  .grand {
+    font-size: var(--text-lg);
+    font-weight: var(--weight-bold);
+  }
+  .muted {
+    color: var(--text-muted);
+  }
+  .thanks {
+    text-align: center;
+    color: var(--text-muted);
+  }
+  .owed {
+    font-size: var(--text-xl, 1.5rem);
+    font-weight: var(--weight-bold);
+  }
+  .stack {
+    display: grid;
+    gap: var(--space-3);
+    justify-items: start;
+  }
+  @media (max-width: 60rem) {
+    .layout {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+  .logo {
+    max-width: 8rem;
+    max-height: 4rem;
+    margin: 0 auto var(--space-2);
+    object-fit: contain;
+  }
+  /* Print only the ticket */
+  @media print {
+    :global(#sidebar),
+    :global(.no-print),
+    .no-print,
+    :global(header.topbar) {
+      display: none !important;
+    }
+    .layout {
+      display: block;
+    }
+    .ticket {
+      max-width: 80mm;
+      margin: 0 auto;
+      border: 0;
+      padding: 0;
+      color: #000;
+    }
+  }
+</style>

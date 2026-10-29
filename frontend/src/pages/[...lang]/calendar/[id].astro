@@ -1,0 +1,950 @@
+---
+import AppLayout from '@/layouts/AppLayout.astro';
+import CalendarFields from '@/components/calendar/CalendarFields.astro';
+import ShareDialog from '@/components/calendar/ShareDialog.astro';
+import Badge from '@/components/ui/Badge.astro';
+import Button from '@/components/ui/Button.astro';
+import Dialog from '@/components/ui/Dialog.astro';
+import Field from '@/components/ui/Field.astro';
+import Icon from '@/components/ui/Icon.astro';
+import SearchPicker from '@/components/ui/SearchPicker.astro';
+import { fmt, getLocale, localePath, useTranslations } from '@/i18n';
+import {
+  ApiError, CALENDAR_COLORS, addMember, createEvent, deleteEvent, listCalendars, listEvents,
+  listMembers, revokeMember, updateCalendar, updateEvent, updateMember, type CalendarEvent,
+} from '@/lib/calendar';
+import { coversDay, localInputToInstant, monthGrid, startOfDay, toLocalInput, weekdayNames, zoned } from '@/lib/time';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const c = t.calendar;
+const { session, accessToken } = Astro.locals as Required<App.Locals>;
+const tz = session.user.timezone;
+
+const calendar = (await listCalendars(accessToken)).find((cal) => cal.id === Astro.params.id);
+if (!calendar) return Astro.rewrite('/404');
+const canEdit = calendar.access_level !== 'view';
+const isOwner = calendar.access_level === 'owner';
+// Linking a customer means searching customers, which needs customers.read
+const canPickCustomers = session.modules.some((m) => m.code === 'customers' && m.permissions.includes('read'));
+const color = calendar.color ?? 'var(--color-primary)';
+
+// --- Form POSTs, then redirect back to the same month (and reopen the share dialog for sharing changes) ---
+let openDialog: 'event' | 'calendar' | 'share' | undefined;
+let formError: string | undefined;
+let calendarError: string | undefined;
+let shareError: string | undefined;
+let pageError: string | undefined;
+let form = {
+  intent: 'create', event_id: '', title: '', start: '', end: '', location: '', description: '', customer_id: '', customer_label: '',
+};
+let calendarForm = {
+  name: calendar.name,
+  description: calendar.description ?? '',
+  color: calendar.color ?? CALENDAR_COLORS[0],
+};
+const OWNER_INTENTS = ['calendar_update', 'share', 'member_level', 'revoke'];
+
+if (Astro.request.method === 'POST') {
+  const data = await Astro.request.formData();
+  const field = (name: string) => String(data.get(name) ?? '').trim();
+  const intent = field('intent');
+  const back = (hash = '') => Astro.redirect(Astro.url.pathname + Astro.url.search + hash, 303);
+  const level = field('access_level') === 'edit' ? 'edit' : 'view';
+
+  if (OWNER_INTENTS.includes(intent)) {
+    try {
+      if (!isOwner) throw new ApiError(403);
+      if (intent === 'calendar_update') {
+        calendarForm = { name: field('name'), description: field('description'), color: field('color') };
+        if (!CALENDAR_COLORS.includes(calendarForm.color)) calendarForm.color = CALENDAR_COLORS[0];
+        if (calendarForm.name) {
+          await updateCalendar(accessToken, calendar.id, { ...calendarForm, description: calendarForm.description || null });
+          return back();
+        }
+        calendarError = c.nameRequired;
+        openDialog = 'calendar';
+      } else if (intent === 'share' && !field('user_id')) {
+        shareError = c.pickPerson;
+        openDialog = 'share';
+      } else {
+        if (intent === 'share') await addMember(accessToken, calendar.id, field('user_id'), level);
+        if (intent === 'member_level') await updateMember(accessToken, calendar.id, field('user_id'), level);
+        if (intent === 'revoke') await revokeMember(accessToken, calendar.id, field('user_id'));
+        return back('#share');
+      }
+    } catch (e) {
+      if (!(e instanceof ApiError)) throw e;
+      if (intent === 'calendar_update') {
+        calendarError = e.status === 403 ? c.forbidden : c.failed;
+        openDialog = 'calendar';
+      } else {
+        shareError = e.status === 409 ? c.alreadyShared : e.status === 404 ? c.userNotFound : c.shareFailed;
+        openDialog = 'share';
+      }
+    }
+  }
+
+  if (!OWNER_INTENTS.includes(intent)) form = {
+    intent: field('intent') === 'update' ? 'update' : field('intent') === 'delete' ? 'delete' : 'create',
+    event_id: field('event_id'),
+    title: field('title'),
+    start: field('start'),
+    end: field('end'),
+    location: field('location'),
+    description: field('description'),
+    customer_id: field('customer_id'),
+    customer_label: field('customer_id_label'),
+  };
+  const apiMessage = (e: unknown) => {
+    if (!(e instanceof ApiError)) throw e;
+    return e.status === 403 ? c.forbidden : e.status === 404 ? c.gone : c.failed;
+  };
+
+  if (OWNER_INTENTS.includes(intent)) {
+    // handled above
+  } else if (form.intent === 'delete') {
+    try {
+      await deleteEvent(accessToken, form.event_id);
+      return Astro.redirect(Astro.url.pathname + Astro.url.search, 303);
+    } catch (e) {
+      pageError = apiMessage(e);
+    }
+  } else {
+    let start: string | undefined;
+    let end: string | undefined;
+    try {
+      start = localInputToInstant(form.start, tz);
+      end = localInputToInstant(form.end, tz);
+    } catch {
+      // empty or malformed datetime-local value
+    }
+    openDialog = 'event';
+    if (!form.title) formError = c.titleRequired;
+    else if (!start || !end) formError = c.dateRequired;
+    else if (Temporal.Instant.compare(start, end) >= 0) formError = c.endBeforeStart;
+    else {
+      const payload = {
+        title: form.title,
+        description: form.description || null,
+        location: form.location || null,
+        start_at: start,
+        end_at: end,
+        // Without customers.read the picker isn't shown: leave any existing link untouched
+        ...(canPickCustomers && { customer_id: form.customer_id || null }),
+      };
+      try {
+        if (form.intent === 'update') await updateEvent(accessToken, form.event_id, payload);
+        else await createEvent(accessToken, calendar.id, payload);
+        return Astro.redirect(Astro.url.pathname + Astro.url.search, 303);
+      } catch (e) {
+        formError = e instanceof ApiError && e.status === 422 && form.customer_id ? c.customerGone : apiMessage(e);
+      }
+    }
+  }
+  Astro.response.status = 422;
+}
+
+// --- Month view ---
+const today = Temporal.Now.plainDateISO(tz);
+let month: Temporal.PlainYearMonth;
+try {
+  month = Temporal.PlainYearMonth.from(Astro.url.searchParams.get('month') ?? '');
+} catch {
+  month = today.toPlainYearMonth();
+}
+const days = monthGrid(month, t.intl);
+const events = await listEvents(
+  accessToken,
+  startOfDay(days[0], tz),
+  startOfDay(days[days.length - 1].add({ days: 1 }), tz),
+  [calendar.id],
+);
+const eventsOn = (day: Temporal.PlainDate) => events.filter((e) => coversDay(e, day, tz));
+
+const capitalize = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+const monthLabel = capitalize(month.toPlainDate({ day: 1 }).toLocaleString(t.intl, { month: 'long', year: 'numeric' }));
+const monthLink = (m: Temporal.PlainYearMonth) => `${localePath(locale, `/calendar/${calendar.id}`)}?month=${m}`;
+const dayLabel = (d: Temporal.PlainDate) => d.toLocaleString(t.intl, { weekday: 'long', day: 'numeric', month: 'long' });
+const timeOf = (instant: string) => zoned(instant, tz).toLocaleString(t.intl, { hour: 'numeric', minute: '2-digit' });
+const startsOn = (e: CalendarEvent, d: Temporal.PlainDate) => zoned(e.start_at, tz).toPlainDate().equals(d);
+const rangeFormat = new Intl.DateTimeFormat(t.intl, { dateStyle: 'full', timeStyle: 'short', timeZone: tz });
+const tzName = new Intl.DateTimeFormat(t.intl, { timeZone: tz, timeZoneName: 'longGeneric' })
+  .formatToParts(new Date())
+  .find((p) => p.type === 'timeZoneName')?.value ?? tz;
+
+// Defaults for "New event": the next full hour today, or 9:00–10:00 on a day picked in the grid.
+const nextHour = Temporal.Now.zonedDateTimeISO(tz).round({ smallestUnit: 'hour', roundingMode: 'ceil' });
+const newDefaults = (d?: Temporal.PlainDate) => {
+  const start = d ? d.toPlainDateTime({ hour: 9 }) : nextHour.toPlainDateTime();
+  return { start: start.toString({ smallestUnit: 'minute' }), end: start.add({ hours: 1 }).toString({ smallestUnit: 'minute' }) };
+};
+const editData = (e: CalendarEvent) =>
+  JSON.stringify({
+    id: e.id, title: e.title, location: e.location ?? '', description: e.description ?? '',
+    start: toLocalInput(e.start_at, tz), end: toLocalInput(e.end_at, tz),
+    customer: e.customer_id ? { id: e.customer_id, title: e.customer_name } : null,
+  });
+
+const members = isOwner ? await listMembers(accessToken, calendar.id) : [];
+const VISIBLE_PER_DAY = 3;
+const agendaDays = days.filter((d) => d.month === month.month && eventsOn(d).length > 0);
+---
+
+<AppLayout title={calendar.name} current="/calendar">
+  <header class="page-header" style={`--cal: ${color}`}>
+    <Button variant="tertiary" icon="arrow-left" href={localePath(locale, '/calendar')} class="back">{c.back}</Button>
+    <div class="title-row">
+      <span class="dot" aria-hidden="true"></span>
+      <h1>{calendar.name}</h1>
+      {calendar.access_level !== 'owner' && <Badge>{c.access[calendar.access_level]}</Badge>}
+      {
+        isOwner && (
+          <div class="owner-actions">
+            <Button variant="secondary" icon="users" data-dialog="share-dialog">{c.share}</Button>
+            <Button variant="tertiary" icon="pencil" data-dialog="calendar-dialog">{c.edit}</Button>
+          </div>
+        )
+      }
+    </div>
+    {calendar.description && <p class="description">{calendar.description}</p>}
+  </header>
+
+  {pageError && <p class="alert" role="alert">{pageError}</p>}
+
+  <div class="toolbar">
+    <div class="month-nav">
+      <h2 class="month-label">{monthLabel}</h2>
+      <a class="icon-link" href={monthLink(month.subtract({ months: 1 }))} aria-label={c.previousMonth}>
+        <Icon name="chevron-left" />
+      </a>
+      <a class="icon-link" href={monthLink(month.add({ months: 1 }))} aria-label={c.nextMonth}>
+        <Icon name="chevron-right" />
+      </a>
+      <Button variant="secondary" href={monthLink(today.toPlainYearMonth())}>{c.today}</Button>
+    </div>
+    {
+      canEdit && (
+        <Button icon="plus" data-new-event={JSON.stringify(newDefaults())}>
+          {c.newEvent}
+        </Button>
+      )
+    }
+  </div>
+  <p class="tz">{fmt(c.timezone, { tz: tzName })}</p>
+
+  <!-- Month grid (wide screens) -->
+  <div class="month" style={`--cal: ${color}`}>
+    <div class="weekdays" aria-hidden="true">
+      {weekdayNames(t.intl, 'short').map((name) => <span>{name}</span>)}
+    </div>
+    <ol class="days" role="list">
+      {
+        days.map((day) => {
+          const dayEvents = eventsOn(day);
+          const iso = day.toString();
+          return (
+            <li class:list={['day', { outside: day.month !== month.month, today: day.equals(today) }]}>
+              <div class="day-head">
+                <time class="day-number num" datetime={iso} aria-label={dayLabel(day)}>
+                  {day.day}
+                </time>
+                {canEdit && (
+                  <button
+                    type="button"
+                    class="add"
+                    data-new-event={JSON.stringify(newDefaults(day))}
+                    aria-label={fmt(c.addOn, { date: dayLabel(day) })}
+                  >
+                    <Icon name="plus" size={16} />
+                  </button>
+                )}
+              </div>
+              <ul class="chips" role="list">
+                {dayEvents.slice(0, VISIBLE_PER_DAY).map((e) => (
+                  <li>
+                    <button type="button" class="chip" popovertarget={`event-${e.id}`}>
+                      {startsOn(e, day) && <span class="chip-time num">{timeOf(e.start_at)}</span>}
+                      <span class="chip-title">{e.title}</span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+              {dayEvents.length > VISIBLE_PER_DAY && (
+                <>
+                  <button type="button" class="more" popovertarget={`day-${iso}`}>
+                    {fmt(c.more, { n: dayEvents.length - VISIBLE_PER_DAY })}
+                  </button>
+                  <div popover id={`day-${iso}`} class="popover">
+                    <h3 class="popover-title">{capitalize(dayLabel(day))}</h3>
+                    <ul class="chips" role="list">
+                      {dayEvents.map((e) => (
+                        <li>
+                          <button type="button" class="chip" popovertarget={`event-${e.id}`}>
+                            {startsOn(e, day) && <span class="chip-time num">{timeOf(e.start_at)}</span>}
+                            <span class="chip-title">{e.title}</span>
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                </>
+              )}
+            </li>
+          );
+        })
+      }
+    </ol>
+  </div>
+
+  <!-- Agenda (narrow screens) -->
+  <div class="agenda" style={`--cal: ${color}`}>
+    {
+      agendaDays.length === 0 ? (
+        <p class="agenda-empty">{canEdit ? c.noEventsMonthEdit : c.noEventsMonth}</p>
+      ) : (
+        <ol role="list">
+          {agendaDays.map((day) => (
+            <li class:list={['agenda-day', { today: day.equals(today) }]}>
+              <h3 class="agenda-date">{capitalize(dayLabel(day))}</h3>
+              <ul class="chips" role="list">
+                {eventsOn(day).map((e) => (
+                  <li>
+                    <button type="button" class="chip large" popovertarget={`event-${e.id}`}>
+                      <span class="chip-time num">{startsOn(e, day) ? timeOf(e.start_at) : '…'}</span>
+                      <span class="chip-title">{e.title}</span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </li>
+          ))}
+        </ol>
+      )
+    }
+  </div>
+
+  <!-- One detail card per event, shared by the grid and the agenda -->
+  {
+    events.map((e) => (
+      <div popover id={`event-${e.id}`} class="popover event" style={`--cal: ${color}`}>
+        <div class="event-head">
+          <span class="dot" aria-hidden="true" />
+          <h3 class="popover-title">{e.title}</h3>
+          <button type="button" class="close" popovertarget={`event-${e.id}`} popovertargetaction="hide" aria-label={c.close}>
+            <Icon name="x" size={18} />
+          </button>
+        </div>
+        <p class="detail num">
+          <Icon name="clock" size={18} />
+          {rangeFormat.formatRange(new Date(e.start_at), new Date(e.end_at))}
+        </p>
+        {e.location && (
+          <p class="detail">
+            <Icon name="map-pin" size={18} />
+            {e.location}
+          </p>
+        )}
+        {e.customer_name && (
+          <p class="detail">
+            <Icon name="user-check" size={18} />
+            <span>
+              {e.customer_name}
+              {e.customer_deleted && <span class="muted"> ({c.customerDeleted})</span>}
+            </span>
+          </p>
+        )}
+        {e.description && <p class="event-description">{e.description}</p>}
+        {canEdit && (
+          <div class="event-actions">
+            <form
+              method="post"
+              data-confirm={fmt(c.deleteEventText, { title: e.title })}
+              data-confirm-title={c.deleteEventTitle}
+              data-confirm-action={c.delete}
+            >
+              <input type="hidden" name="intent" value="delete" />
+              <input type="hidden" name="event_id" value={e.id} />
+              <Button type="submit" variant="danger" icon="trash-2">{c.delete}</Button>
+            </form>
+            <Button variant="secondary" icon="pencil" data-edit-event={editData(e)}>{c.edit}</Button>
+          </div>
+        )}
+      </div>
+    ))
+  }
+
+  {
+    canEdit && (
+      <Dialog
+        id="event-dialog"
+        title={form.intent === 'update' ? c.editEvent : c.newEvent}
+        closeLabel={c.close}
+        open={openDialog === 'event'}
+      >
+        <form
+          method="post"
+          class="form"
+          data-event-form
+          data-title-create={c.newEvent}
+          data-title-update={c.editEvent}
+          data-submit-create={c.saveEvent}
+          data-submit-update={c.saveChanges}
+        >
+          {formError && <p class="alert" role="alert">{formError}</p>}
+          <input type="hidden" name="intent" value={form.intent} />
+          <input type="hidden" name="event_id" value={form.event_id} />
+          <Field label={c.eventTitle} name="title" value={form.title} placeholder={c.eventTitlePlaceholder} required maxlength={200} />
+          <div class="pair">
+            <Field label={c.start} name="start" type="datetime-local" value={form.start} required />
+            <Field label={c.end} name="end" type="datetime-local" value={form.end} required />
+          </div>
+          <Field label={c.location} name="location" value={form.location} placeholder={c.locationPlaceholder} maxlength={255} />
+          {canPickCustomers && (
+            <div class="customer">
+              <label class="customer-label" for="event-customer">{c.customer}</label>
+              <SearchPicker
+                id="event-customer"
+                name="customer_id"
+                endpoint="/api/customers"
+                placeholder={c.customerPlaceholder}
+                hint={c.customerHint}
+                noResults={c.customerNoResults}
+                clearLabel={c.clearSelection}
+                value={form.customer_id ? { id: form.customer_id, title: form.customer_label } : null}
+              />
+            </div>
+          )}
+          <Field label={c.notes} name="description" as="textarea" rows={3} value={form.description} />
+          <div class="actions">
+            <Button variant="tertiary" data-dialog-close>{c.cancel}</Button>
+            <Button type="submit" data-submit-label>
+              {form.intent === 'update' ? c.saveChanges : c.saveEvent}
+            </Button>
+          </div>
+        </form>
+      </Dialog>
+    )
+  }
+
+  {
+    isOwner && (
+      <Dialog id="calendar-dialog" title={c.editCalendar} closeLabel={c.close} open={openDialog === 'calendar'}>
+        <form method="post" class="form">
+          {calendarError && <p class="alert" role="alert">{calendarError}</p>}
+          <input type="hidden" name="intent" value="calendar_update" />
+          <CalendarFields locale={locale} values={calendarForm} />
+          <div class="actions">
+            <Button variant="tertiary" data-dialog-close>{c.cancel}</Button>
+            <Button type="submit">{c.saveCalendar}</Button>
+          </div>
+        </form>
+      </Dialog>
+    )
+  }
+
+  {
+    isOwner && (
+      <ShareDialog
+        locale={locale}
+        calendarName={calendar.name}
+        members={members}
+        owner={session.user}
+        error={shareError}
+        open={openDialog === 'share'}
+      />
+    )
+  }
+</AppLayout>
+
+<script>
+  // Fills the shared event form for "new" (from the toolbar or a day) or "edit" (from an event card), then opens it.
+  const dialog = document.querySelector<HTMLDialogElement>('#event-dialog');
+  const form = dialog?.querySelector<HTMLFormElement>('[data-event-form]');
+
+  type Customer = { id: string; title: string } | null;
+  type Values = {
+    id?: string; title?: string; start: string; end: string; location?: string; description?: string; customer?: Customer;
+  };
+
+  function openForm(intent: 'create' | 'update', v: Values) {
+    if (!dialog || !form) return;
+    const set = (name: string, value = '') => ((form.elements.namedItem(name) as HTMLInputElement).value = value);
+    set('intent', intent);
+    set('event_id', v.id);
+    set('title', v.title);
+    set('start', v.start);
+    set('end', v.end);
+    set('location', v.location);
+    set('description', v.description);
+    form.querySelector('[data-picker]')?.dispatchEvent(new CustomEvent('picker:set', { detail: v.customer ?? null }));
+    form.querySelector('[role=alert]')?.remove();
+    dialog.querySelector('[data-dialog-title]')!.textContent = form.dataset[`title${intent === 'create' ? 'Create' : 'Update'}`]!;
+    form.querySelector('[data-submit-label]')!.textContent = form.dataset[`submit${intent === 'create' ? 'Create' : 'Update'}`]!;
+    document.querySelectorAll<HTMLElement>(':popover-open').forEach((p) => p.hidePopover());
+    dialog.showModal();
+    (form.elements.namedItem('title') as HTMLInputElement).focus();
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-new-event]').forEach((el) =>
+    el.addEventListener('click', () => openForm('create', JSON.parse(el.dataset.newEvent!))),
+  );
+  document.querySelectorAll<HTMLElement>('[data-edit-event]').forEach((el) =>
+    el.addEventListener('click', () => openForm('update', JSON.parse(el.dataset.editEvent!))),
+  );
+
+  // Keep the end after the start while typing: moving the start moves the end with it.
+  const start = form?.elements.namedItem('start') as HTMLInputElement | undefined;
+  const end = form?.elements.namedItem('end') as HTMLInputElement | undefined;
+  let previousStart = start?.value;
+  start?.addEventListener('change', () => {
+    if (start.value && end?.value && previousStart) {
+      const shift = new Date(start.value).getTime() - new Date(previousStart).getTime();
+      end.value = toLocalValue(new Date(new Date(end.value).getTime() + shift));
+    }
+    previousStart = start.value;
+  });
+  start?.addEventListener('focus', () => (previousStart = start.value));
+
+  function toLocalValue(d: Date) {
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+
+  // After a sharing change the page reloads with #share: reopen the dialog where the user left it.
+  const share = document.querySelector<HTMLDialogElement>('#share-dialog');
+  if (share && location.hash === '#share' && !share.open) share.showModal();
+  share?.addEventListener('close', () => history.replaceState(null, '', location.pathname + location.search));
+</script>
+
+<style>
+  .page-header {
+    display: grid;
+    gap: var(--space-2);
+    margin-bottom: var(--space-6);
+  }
+
+  .page-header > :global(.back) {
+    justify-self: start;
+    margin-inline-start: calc(-1 * var(--space-2));
+  }
+
+  .title-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-3);
+  }
+
+  .dot {
+    flex-shrink: 0;
+    width: 0.875rem;
+    height: 0.875rem;
+    border-radius: 50%;
+    background: var(--cal);
+  }
+
+  .description {
+    color: var(--text-muted);
+  }
+
+  .owner-actions {
+    display: flex;
+    gap: var(--space-2);
+    margin-inline-start: auto;
+  }
+
+
+  .alert {
+    margin-bottom: var(--space-4);
+    padding: var(--space-3);
+    background: color-mix(in srgb, var(--status-error) 8%, var(--bg-app));
+    border: 1px solid var(--status-error);
+    border-radius: var(--radius-control);
+    color: var(--text-title);
+    font-size: var(--text-sm);
+  }
+
+  /* --- Toolbar --- */
+  .toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+  }
+
+  .month-nav {
+    display: flex;
+    align-items: center;
+    gap: var(--space-1);
+  }
+
+  .month-label {
+    min-width: 11ch;
+    margin-inline-end: var(--space-2);
+    font-size: var(--text-xl);
+  }
+
+  .icon-link {
+    display: grid;
+    place-items: center;
+    width: var(--control-height);
+    height: var(--control-height);
+    border-radius: var(--radius-control);
+    color: var(--text-body);
+  }
+
+  .icon-link:hover {
+    background: var(--color-primary-tint);
+    color: var(--color-primary);
+  }
+
+  .month-nav > :global(.btn) {
+    margin-inline-start: var(--space-2);
+  }
+
+  .tz {
+    margin: var(--space-2) 0 var(--space-4);
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+  }
+
+  /* --- Month grid --- */
+  .month {
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-container);
+    overflow: hidden;
+  }
+
+  .weekdays,
+  .days {
+    display: grid;
+    grid-template-columns: repeat(7, minmax(0, 1fr));
+  }
+
+  .weekdays span {
+    padding: var(--space-2) var(--space-3);
+    background: var(--bg-surface);
+    border-bottom: 1px solid var(--border-subtle);
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
+    text-transform: capitalize;
+  }
+
+  .days {
+    padding: 0;
+    list-style: none;
+  }
+
+  .day {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    min-height: 7.5rem;
+    padding: var(--space-1) var(--space-2) var(--space-2);
+    border-inline-end: 1px solid var(--border-subtle);
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .day:nth-child(7n) {
+    border-inline-end: 0;
+  }
+
+  .days > .day:nth-last-child(-n + 7) {
+    border-bottom: 0;
+  }
+
+  .outside {
+    background: var(--bg-surface);
+  }
+
+  .outside .day-number {
+    color: var(--text-muted);
+  }
+
+  .day-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .day-number {
+    display: grid;
+    place-items: center;
+    min-width: 1.75rem;
+    height: 1.75rem;
+    border-radius: var(--radius-pill);
+    color: var(--text-title);
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
+  }
+
+  .today .day-number {
+    background: var(--color-primary);
+    color: var(--text-on-color);
+    font-weight: var(--weight-bold);
+  }
+
+  .add {
+    display: grid;
+    place-items: center;
+    width: 1.75rem;
+    height: 1.75rem;
+    background: none;
+    border: 0;
+    border-radius: var(--radius-control);
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+
+  .add:hover {
+    background: var(--color-primary-tint);
+    color: var(--color-primary);
+  }
+
+  /* With a mouse, the add button appears on the day you point at (keyboard focus shows it too) */
+  @media (hover: hover) {
+    .add {
+      opacity: 0;
+    }
+    .day:hover .add,
+    .add:focus-visible {
+      opacity: 1;
+    }
+  }
+
+  /* --- Event chips: tinted with the calendar color, text stays dark for contrast --- */
+  .chips {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr); /* lets long titles truncate inside the day cell */
+    gap: 2px;
+    padding: 0;
+    list-style: none;
+  }
+
+  .chip {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-1);
+    width: 100%;
+    padding: 2px var(--space-2);
+    background: color-mix(in srgb, var(--cal) 14%, var(--bg-app));
+    border: 0;
+    border-inline-start: 3px solid var(--cal);
+    border-radius: 4px;
+    color: var(--text-title);
+    font-size: var(--text-xs);
+    text-align: start;
+    cursor: pointer;
+  }
+
+  .chip:hover {
+    background: color-mix(in srgb, var(--cal) 24%, var(--bg-app));
+  }
+
+  .chip-time {
+    flex-shrink: 0;
+    color: var(--text-body);
+  }
+
+  .chip-title {
+    overflow: hidden;
+    font-weight: var(--weight-bold);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .chip.large {
+    gap: var(--space-3);
+    padding: var(--space-3);
+    font-size: var(--text-md);
+  }
+
+  .more {
+    align-self: start;
+    padding: 0 var(--space-1);
+    background: none;
+    border: 0;
+    border-radius: 4px;
+    color: var(--text-muted);
+    font-size: var(--text-xs);
+    font-weight: var(--weight-bold);
+    cursor: pointer;
+  }
+
+  .more:hover {
+    color: var(--color-primary);
+    text-decoration: underline;
+  }
+
+  /* --- Agenda --- */
+  .agenda {
+    display: none;
+  }
+
+  .agenda ol {
+    display: grid;
+    gap: var(--space-5);
+    padding: 0;
+    list-style: none;
+  }
+
+  .agenda-date {
+    margin-bottom: var(--space-2);
+    color: var(--text-body);
+    font-size: var(--text-sm);
+  }
+
+  .agenda-day.today .agenda-date {
+    color: var(--color-primary);
+  }
+
+  .agenda-empty {
+    padding: var(--space-8) var(--space-4);
+    background: var(--bg-surface);
+    border: 1px dashed var(--border-input);
+    border-radius: var(--radius-container);
+    color: var(--text-muted);
+    text-align: center;
+  }
+
+  @media (max-width: 48rem) {
+    .month {
+      display: none;
+    }
+    .agenda {
+      display: block;
+    }
+    .month-label {
+      font-size: var(--text-lg);
+    }
+  }
+
+  /* --- Popovers: event detail and "+N more" --- */
+  .popover {
+    width: min(100% - 2 * var(--space-4), 24rem);
+    padding: var(--space-5);
+    background: var(--bg-app);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-container);
+    box-shadow: var(--shadow-overlay);
+    color: var(--text-body);
+  }
+
+  .popover::backdrop {
+    background: color-mix(in srgb, var(--text-title) 15%, transparent);
+  }
+
+  .popover-title {
+    font-size: var(--text-lg);
+  }
+
+  .popover > .popover-title {
+    margin-bottom: var(--space-3);
+  }
+
+  .event-head {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-3);
+    margin-bottom: var(--space-4);
+  }
+
+  .event-head .dot {
+    margin-top: 0.4em;
+  }
+
+  .event-head .popover-title {
+    flex: 1;
+    overflow-wrap: anywhere;
+  }
+
+  .close {
+    display: grid;
+    place-items: center;
+    width: 2rem;
+    height: 2rem;
+    margin: calc(-1 * var(--space-1));
+    background: none;
+    border: 0;
+    border-radius: var(--radius-control);
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+
+  .close:hover {
+    background: var(--color-primary-tint);
+    color: var(--color-primary);
+  }
+
+  .detail {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-3);
+    margin-top: var(--space-2);
+  }
+
+  .detail :global(svg) {
+    flex-shrink: 0;
+    margin-top: 0.15em;
+    color: var(--text-muted);
+  }
+
+  .event-description {
+    margin-top: var(--space-4);
+    padding-top: var(--space-4);
+    border-top: 1px solid var(--border-subtle);
+    white-space: pre-line;
+  }
+
+  .event-actions {
+    display: flex;
+    justify-content: space-between;
+    gap: var(--space-2);
+    margin-top: var(--space-5);
+  }
+
+  /* --- Event form --- */
+  .customer {
+    display: grid;
+    gap: var(--space-1);
+  }
+
+  .customer-label {
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
+  }
+
+  .detail .muted {
+    color: var(--text-muted);
+  }
+
+  .form {
+    display: grid;
+    gap: var(--space-5);
+  }
+
+  .form .alert {
+    margin: 0;
+  }
+
+  .pair {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--space-4);
+  }
+
+  .actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--space-2);
+  }
+
+  @media (max-width: 30rem) {
+    .pair {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+</style>

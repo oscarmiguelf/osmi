@@ -1,0 +1,248 @@
+---
+// A list of products with quantities (and optionally a unit cost), built with the product picker.
+// Posts parallel fields: item_product, item_name, item_qty[, item_cost]. Rows can be edited or removed before saving.
+import Button from './Button.astro';
+import Icon from './Icon.astro';
+import SearchPicker from './SearchPicker.astro';
+
+interface Item {
+  product_id: string;
+  name: string;
+  quantity: string;
+  unit_cost?: string;
+}
+
+interface Props {
+  id: string;
+  mode?: 'stock' | 'available';
+  withCost?: boolean;
+  items?: Item[];
+  intl: string;
+  labels: {
+    product: string; placeholder: string; hint: string; noResults: string; clear: string;
+    quantity: string; unitCost: string; lineTotal: string; add: string; remove: string; total: string; empty: string;
+  };
+}
+
+const { id, mode = 'stock', withCost = false, items = [], intl, labels } = Astro.props;
+---
+
+<div class="items" data-items data-with-cost={withCost ? '' : undefined} data-intl={intl} data-remove={labels.remove}>
+  <div class="adder">
+    <div class="pick">
+      <label class="label" for={`${id}-search`}>{labels.product}</label>
+      <SearchPicker id={`${id}-search`} name="pick" endpoint={`/api/products?mode=${mode}`} placeholder={labels.placeholder}
+        hint={labels.hint} noResults={labels.noResults} clearLabel={labels.clear} focusAfter="[data-new-qty]" />
+    </div>
+    <label class="field">
+      <span class="label">{labels.quantity}</span>
+      <input class="ui-input num" type="number" step="0.001" min="0" inputmode="decimal" data-new-qty />
+    </label>
+    {withCost && (
+      <label class="field">
+        <span class="label">{labels.unitCost}</span>
+        <input class="ui-input num" type="number" step="0.01" min="0" inputmode="decimal" data-new-cost />
+      </label>
+    )}
+    <div class="field add">
+      <span class="label" aria-hidden="true">&nbsp;</span>{/* lines the button up with the inputs, not the picker's hint */}
+      <Button variant="secondary" icon="plus" data-add>{labels.add}</Button>
+    </div>
+  </div>
+
+  <table class="rows">
+    <thead>
+      <tr>
+        <th scope="col">{labels.product}</th>
+        <th scope="col" class="end">{labels.quantity}</th>
+        {withCost && <th scope="col" class="end">{labels.unitCost}</th>}
+        {withCost && <th scope="col" class="end">{labels.lineTotal}</th>}
+        <th scope="col"><span class="visually-hidden">{labels.remove}</span></th>
+      </tr>
+    </thead>
+    <tbody data-body>
+      {items.map((i) => (
+        <tr data-row>
+          <td><input type="hidden" name="item_product" value={i.product_id} /><input type="hidden" name="item_name" value={i.name} />{i.name}</td>
+          <td class="end"><input class="ui-input num qty" name="item_qty" type="number" step="0.001" min="0" value={i.quantity} aria-label={`${labels.quantity}: ${i.name}`} /></td>
+          {withCost && <td class="end"><input class="ui-input num qty" name="item_cost" type="number" step="0.01" min="0" value={i.unit_cost} aria-label={`${labels.unitCost}: ${i.name}`} /></td>}
+          {withCost && <td class="end num" data-line />}
+          <td class="end"><button type="button" class="remove" data-remove-row aria-label={`${labels.remove}: ${i.name}`}><Icon name="x" size={16} /></button></td>
+        </tr>
+      ))}
+    </tbody>
+    {withCost && (
+      <tfoot><tr><th scope="row" colspan="3" class="end">{labels.total}</th><td class="end num total" data-total /><td /></tr></tfoot>
+    )}
+  </table>
+  <p class="empty" data-empty hidden={items.length > 0}>{labels.empty}</p>
+</div>
+
+<script>
+  document.querySelectorAll<HTMLElement>('[data-items]').forEach((root) => {
+    const withCost = root.hasAttribute('data-with-cost');
+    const money = new Intl.NumberFormat(root.dataset.intl, { style: 'currency', currency: 'MXN' });
+    const body = root.querySelector<HTMLTableSectionElement>('[data-body]')!;
+    const empty = root.querySelector<HTMLElement>('[data-empty]')!;
+    const picker = root.querySelector<HTMLElement>('[data-picker]')!;
+    const qty = root.querySelector<HTMLInputElement>('[data-new-qty]')!;
+    const cost = root.querySelector<HTMLInputElement>('[data-new-cost]');
+
+    const totals = () => {
+      let total = 0;
+      body.querySelectorAll('tr').forEach((tr) => {
+        const q = Number((tr.querySelector('[name=item_qty]') as HTMLInputElement).value);
+        const c = Number((tr.querySelector('[name=item_cost]') as HTMLInputElement | null)?.value ?? 0);
+        const line = Math.round(q * c * 100) / 100;
+        total += line;
+        const cell = tr.querySelector('[data-line]');
+        if (cell) cell.textContent = money.format(line);
+      });
+      const t = root.querySelector('[data-total]');
+      if (t) t.textContent = money.format(total);
+      empty.hidden = body.children.length > 0;
+      root.dispatchEvent(new CustomEvent('items:total', { bubbles: true, detail: total })); // e.g. the payment split below
+    };
+
+    const input = (name: string, value: string, label: string, step: string) => {
+      const el = document.createElement('input');
+      Object.assign(el, { className: 'ui-input num qty', name, type: 'number', step, min: '0', value });
+      el.setAttribute('aria-label', label);
+      return el;
+    };
+
+    root.querySelector('[data-add]')!.addEventListener('click', () => {
+      const id = (picker.querySelector('[data-value]') as HTMLInputElement).value;
+      const name = (picker.querySelector('[data-label]') as HTMLInputElement).value;
+      if (!id || !(Number(qty.value) > 0)) return (id ? qty : picker.querySelector<HTMLInputElement>('input[type=search]'))?.focus();
+      const existing = [...body.querySelectorAll<HTMLInputElement>('[name=item_product]')].find((i) => i.value === id);
+      if (existing) {  // same product twice: add up the quantity
+        const q = existing.closest('tr')!.querySelector<HTMLInputElement>('[name=item_qty]')!;
+        q.value = String(Number(q.value) + Number(qty.value));
+      } else {
+        const tr = document.createElement('tr');
+        const td = () => tr.appendChild(document.createElement('td'));
+        const first = td();
+        first.append(Object.assign(document.createElement('input'), { type: 'hidden', name: 'item_product', value: id }),
+          Object.assign(document.createElement('input'), { type: 'hidden', name: 'item_name', value: name }), name);
+        const q = td(); q.className = 'end'; q.append(input('item_qty', qty.value, name, '0.001'));
+        if (withCost) {
+          const c = td(); c.className = 'end'; c.append(input('item_cost', cost!.value || '0', name, '0.01'));
+          const l = td(); l.className = 'end num'; l.dataset.line = '';
+        }
+        const r = td(); r.className = 'end';
+        const btn = document.createElement('button');
+        Object.assign(btn, { type: 'button', className: 'remove', textContent: '×' });
+        btn.dataset.removeRow = '';
+        btn.setAttribute('aria-label', `${root.dataset.remove}: ${name}`);
+        r.append(btn);
+        body.append(tr);
+      }
+      picker.dispatchEvent(new CustomEvent('picker:set', { detail: null }));
+      qty.value = '';
+      if (cost) cost.value = '';
+      totals();
+    });
+
+    body.addEventListener('click', (e) => {
+      const btn = (e.target as HTMLElement).closest('[data-remove-row]');
+      if (btn) {
+        btn.closest('tr')!.remove();
+        totals();
+      }
+    });
+    body.addEventListener('input', totals);
+    totals();
+  });
+</script>
+
+<style>
+  .items {
+    display: grid;
+    gap: var(--space-3);
+  }
+  .adder {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 7rem 9rem auto;
+    align-items: start; /* the picker has a hint below it: aligning to the end would push the other fields down */
+    gap: var(--space-2);
+  }
+  .items:not([data-with-cost]) .adder {
+    grid-template-columns: minmax(0, 1fr) 7rem auto;
+  }
+  .pick,
+  .field {
+    display: grid;
+    gap: var(--space-1);
+  }
+  .label {
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
+  }
+  .field input {
+    width: 100%;
+  }
+  .rows {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: var(--text-sm);
+  }
+  .rows th {
+    padding: var(--space-2);
+    color: var(--text-muted);
+    font-weight: var(--weight-medium);
+    text-align: start;
+  }
+  .rows td {
+    padding: var(--space-1) var(--space-2);
+    border-top: 1px solid var(--border-subtle);
+  }
+  .rows .end {
+    text-align: end;
+  }
+  .rows :global(.qty) {
+    width: 7rem;
+    text-align: end;
+  }
+  .rows thead:has(+ tbody:empty),
+  .rows tbody:empty + tfoot {
+    display: none;
+  }
+  .total {
+    color: var(--text-title);
+    font-weight: var(--weight-bold);
+  }
+  .rows :global(.remove) {
+    width: 2rem;
+    height: 2rem;
+    background: none;
+    border: 0;
+    border-radius: var(--radius-control);
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+  .rows :global(.remove:hover) {
+    background: color-mix(in srgb, var(--status-error) 8%, transparent);
+    color: var(--status-error-text);
+  }
+  .empty {
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+  }
+  .empty[hidden] {
+    display: none;
+  }
+  @media (max-width: 40rem) {
+    .adder,
+    .items:not([data-with-cost]) .adder {
+      grid-template-columns: 1fr 1fr;
+    }
+    .pick,
+    .add {
+      grid-column: 1 / -1;
+    }
+    .add .label {
+      display: none;
+    }
+  }
+</style>

@@ -1,0 +1,72 @@
+---
+import AppLayout from '@/layouts/AppLayout.astro';
+import PromotionFields, { type PromotionValues } from '@/components/promotions/PromotionFields.astro';
+import Button from '@/components/ui/Button.astro';
+import Card from '@/components/ui/Card.astro';
+import { getLocale, localePath, useTranslations } from '@/i18n';
+import { ApiError } from '@/lib/api';
+import { listBranches } from '@/lib/transfers';
+import { createPromotion, promotionErrors, readPromotion } from '@/lib/promotions';
+import { setFlash } from '@/lib/session';
+import { toLocalInput } from '@/lib/time';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const pr = t.promotions;
+const { session, accessToken } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'promotions')?.permissions ?? [];
+if (!perms.includes('create')) return Astro.rewrite('/404');
+const tz = session.user.timezone;
+
+// Starts now, lasts a week
+const now = new Date();
+let values: PromotionValues = {
+  name: '', description: '', kind: 'PERCENT', percent: '', amount: '', buy_quantity: '2', get_quantity: '1',
+  starts_at: toLocalInput(now.toISOString(), tz), ends_at: toLocalInput(new Date(now.getTime() + 7 * 864e5).toISOString(), tz),
+  is_enabled: true, products: [], branch_ids: [],
+};
+let errors: Record<string, string> = {};
+let formError: string | undefined;
+if (Astro.request.method === 'POST') {
+  const data = await Astro.request.formData();
+  const body = readPromotion(data, tz);
+  const names = data.getAll('product_id').map(String);
+  values = {
+    ...values, ...Object.fromEntries(['name', 'description', 'kind', 'percent', 'amount', 'buy_quantity', 'get_quantity', 'starts_at', 'ends_at']
+      .map((k) => [k, String(data.get(k) ?? '')])), is_enabled: body.is_enabled, branch_ids: body.branch_ids,
+    products: names.map((id, n) => ({ id, name: String(data.getAll('product_name')[n] ?? '') })),
+  } as PromotionValues;
+  try {
+    const created = await createPromotion(accessToken, body);
+    setFlash(Astro.cookies, { created: '1' });
+    return Astro.redirect(localePath(locale, `/promotions/${created.id}`), 303);
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    ({ fields: errors, form: formError } = promotionErrors(e.status, e.body, pr.errors, t.ui.formError));
+    formError ??= t.ui.formError;
+  }
+  Astro.response.status = 422;
+}
+const branches = await listBranches(accessToken);
+---
+
+<AppLayout title={pr.newPromotion} current="/promotions">
+  <a class="ui-back" href={localePath(locale, '/promotions')}>← {pr.back}</a>
+  <header class="ui-header"><h1>{pr.newPromotion}</h1></header>
+  <Card class="form-card">
+    <form method="post" class="ui-form" novalidate>
+      {formError && <p class="ui-alert ui-full" role="alert">{formError}</p>}
+      <PromotionFields locale={locale} id="new" values={values} errors={errors} branches={branches} />
+      <div class="ui-form-actions">
+        <Button variant="tertiary" href={localePath(locale, '/promotions')}>{t.ui.cancel}</Button>
+        <Button type="submit" icon="check">{pr.save}</Button>
+      </div>
+    </form>
+  </Card>
+</AppLayout>
+
+<style>
+  :global(.form-card) {
+    max-width: 48rem;
+  }
+</style>

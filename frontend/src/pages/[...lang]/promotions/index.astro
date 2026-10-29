@@ -1,0 +1,140 @@
+---
+// Promotions by status (computed: active now, scheduled, ended, disabled). Delete and restore live here.
+import AppLayout from '@/layouts/AppLayout.astro';
+import Badge from '@/components/ui/Badge.astro';
+import Button from '@/components/ui/Button.astro';
+import EmptyState from '@/components/ui/EmptyState.astro';
+import Field from '@/components/ui/Field.astro';
+import Notice from '@/components/ui/Notice.astro';
+import { fmt, getLocale, localePath, money, useTranslations } from '@/i18n';
+import { ApiError } from '@/lib/api';
+import { deletePromotion, describe, listPromotions, restorePromotion } from '@/lib/promotions';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const pr = t.promotions;
+const { session, accessToken } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'promotions')?.permissions ?? [];
+if (!perms.includes('read')) return Astro.rewrite('/404');
+const canDelete = perms.includes('delete');
+const basePath = localePath(locale, '/promotions');
+const TABS = ['ACTIVE', 'SCHEDULED', 'ENDED', 'DISABLED', 'ALL'] as const;
+const params = Astro.url.searchParams;
+const tab = (TABS as readonly string[]).includes(params.get('status') ?? '') ? (params.get('status') as (typeof TABS)[number]) : 'ACTIVE';
+const q = (params.get('q') ?? '').trim().slice(0, 100);
+const showDeleted = canDelete && params.get('deleted') === '1';
+const page = Math.max(1, Number.parseInt(params.get('page') ?? '1', 10) || 1);
+
+let pageError: string | undefined;
+if (Astro.request.method === 'POST' && canDelete) {
+  const data = await Astro.request.formData();
+  const id = String(data.get('id') ?? '');
+  try {
+    if (data.get('intent') === 'restore') await restorePromotion(accessToken, id);
+    else await deletePromotion(accessToken, id);
+    return Astro.redirect(Astro.url.pathname + Astro.url.search, 303);
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    pageError = t.ui.failed;
+  }
+}
+
+const result = await listPromotions(accessToken, { status: tab === 'ALL' ? undefined : tab, q, include_deleted: showDeleted, page });
+const day = new Intl.DateTimeFormat(t.intl, { dateStyle: 'medium', timeStyle: 'short', timeZone: session.user.timezone });
+const tone = { ACTIVE: 'success', SCHEDULED: 'accent', ENDED: 'neutral', DISABLED: 'warning' } as const;
+const link = (extra: Record<string, string | number>) => {
+  const qp = new URLSearchParams(params);
+  for (const [k, v] of Object.entries(extra)) qp.set(k, String(v));
+  return `${basePath}?${qp}`;
+};
+---
+
+<AppLayout title={pr.title} current="/promotions">
+  <header class="ui-header">
+    <h1>{pr.title}</h1>
+    <div class="ui-actions">
+      {canDelete && <Button variant="tertiary" href={link({ deleted: showDeleted ? '0' : '1', page: 1 })}>{showDeleted ? t.ui.hideDeleted : t.ui.showDeleted}</Button>}
+      {perms.includes('create') && <Button icon="plus" href={localePath(locale, '/promotions/new')}>{pr.newPromotion}</Button>}
+    </div>
+  </header>
+
+  <nav class="ui-tabs tabs" aria-label={pr.title}>
+    {TABS.map((k) => <a href={k === 'ACTIVE' ? basePath : `${basePath}?status=${k}`} aria-current={k === tab ? 'page' : undefined}>{pr.tabs[k]}</a>)}
+  </nav>
+
+  <form method="get" class="filters">
+    {tab !== 'ACTIVE' && <input type="hidden" name="status" value={tab} />}
+    {showDeleted && <input type="hidden" name="deleted" value="1" />}
+    <Field label={pr.search} name="q" type="search" value={q} maxlength={100} />
+    <Button type="submit" variant="secondary" icon="search">{t.ui.search}</Button>
+  </form>
+
+  <div class="ui-notices">{pageError && <Notice tone="error">{pageError}</Notice>}</div>
+
+  {
+    result.items.length === 0 && page === 1 ? (
+      tab === 'ACTIVE' && !q ? (
+        <EmptyState icon="percent" title={pr.empty} text={pr.emptyText}>
+          {perms.includes('create') && <Button icon="plus" href={localePath(locale, '/promotions/new')}>{pr.newPromotion}</Button>}
+        </EmptyState>
+      ) : <p class="ui-muted">{pr.noResults}</p>
+    ) : (
+      <div class="ui-table-wrap">
+        <table class="ui-table">
+          <thead><tr><th scope="col">{pr.name}</th><th scope="col">{pr.offer}</th><th scope="col">{pr.window}</th><th scope="col" class="ui-end">{pr.given}</th><th scope="col"><span class="visually-hidden">{t.ui.delete}</span></th></tr></thead>
+          <tbody>
+            {result.items.map((p) => (
+              <tr>
+                <td data-label={pr.name}>
+                  <a class="ui-strong" href={localePath(locale, `/promotions/${p.id}`)}>{p.name}</a>
+                  {p.deleted_at ? <Badge tone="error">{t.ui.deletedBadge}</Badge> : <Badge tone={tone[p.status]}>{pr.statuses[p.status]}</Badge>}
+                  <span class="ui-line2">{fmt(pr.counts, { products: p.product_count })} · {p.branch_count ? fmt(pr.someBranches, { n: p.branch_count }) : pr.allBranches}</span>
+                </td>
+                <td data-label={pr.offer}>{describe(p, (n) => money(locale, n), pr.perUnit)}</td>
+                <td data-label={pr.window} class="num">{day.format(new Date(p.starts_at))}<span class="ui-line2">{fmt(pr.until, { date: day.format(new Date(p.ends_at)) })}</span></td>
+                <td data-label={pr.given} class="ui-end num">{money(locale, Number(p.discount_given ?? 0))}<span class="ui-line2">{fmt(pr.lines, { n: p.lines_sold ?? 0 })}</span></td>
+                <td class="ui-row-action ui-end">
+                  {canDelete && (
+                    <form method="post" data-confirm={p.deleted_at ? undefined : pr.deleteText} data-confirm-title={fmt(pr.deleteTitle, { name: p.name })} data-confirm-action={t.ui.delete}>
+                      <input type="hidden" name="id" value={p.id} />
+                      <input type="hidden" name="intent" value={p.deleted_at ? 'restore' : 'delete'} />
+                      {p.deleted_at
+                        ? <Button type="submit" variant="tertiary" icon="rotate-ccw">{t.ui.restore}</Button>
+                        : <Button type="submit" variant="danger" icon="trash-2" aria-label={`${t.ui.delete}: ${p.name}`} />}
+                    </form>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    )
+  }
+  {(page > 1 || result.has_more) && (
+    <nav class="ui-pager">
+      <span />
+      <span class="ui-actions">
+        {page > 1 && <Button variant="secondary" href={link({ page: page - 1 })}>{t.ui.previous}</Button>}
+        {result.has_more && <Button variant="secondary" href={link({ page: page + 1 })}>{t.ui.next}</Button>}
+      </span>
+    </nav>
+  )}
+</AppLayout>
+
+<style>
+  .tabs {
+    margin-bottom: var(--space-4);
+  }
+  .filters {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: var(--space-3);
+    margin-bottom: var(--space-5);
+  }
+  .filters > :global(.field) {
+    flex: 1 1 16rem;
+    max-width: 28rem;
+  }
+</style>

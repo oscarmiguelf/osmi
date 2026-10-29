@@ -1,0 +1,630 @@
+---
+// Point of sale without internet. A static page (built once, kept on the device by the service worker): it has no
+// session or data in it. The catalog copy and the queue of sales live in IndexedDB (lib/offline), filled while online.
+// Paid sales only (cash, card, transfer): no credit, layaways, promotions, packages or returns offline.
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import Button from '@/components/ui/Button.astro';
+import es from '@/i18n/es';
+import en from '@/i18n/en';
+
+export const prerender = true;
+
+// Both languages go in the page; the device's copy says which one its user works in
+const words = Object.fromEntries([['es', es], ['en', en]].map(([k, d]) => [k as string, {
+  ...(d as typeof es).offline, intl: (d as typeof es).intl, units: (d as typeof es).products.unitNames, methods: (d as typeof es).cash.methodNames,
+}]));
+const t = es.offline;
+---
+
+<BaseLayout title={t.title}>
+  <script type="application/json" id="offline-words" set:html={JSON.stringify(words)} />
+  <div class="pos-off">
+    <header class="top">
+      <div>
+        <h1 data-w="title">{t.title}</h1>
+        <p class="ui-muted ui-small" data-who></p>
+      </div>
+      <div class="top-actions">
+        <span class="net" data-net></span>
+        <a class="back" href="/" hidden data-back data-w="back">{t.back}</a>
+      </div>
+    </header>
+
+    <p class="nocopy" hidden data-nocopy data-w="noCopy">{t.noCopy}</p>
+
+    <div class="grid" hidden data-pos>
+      <section class="panel">
+        <p class="ui-muted ui-small" data-copy></p>
+        <label class="visually-hidden" for="off-search" data-w="search">{t.search}</label>
+        <input id="off-search" class="ui-input search" type="search" autocomplete="off" data-search data-wp="search" placeholder={t.search} />
+        <ul class="results" role="list" data-results></ul>
+      </section>
+
+      <section class="panel cart-panel">
+        <div class="customer">
+          <label class="ui-small ui-strong" for="off-customer" data-w="customer">{t.customer}</label>
+          <div class="chip" hidden data-cust-chip>
+            <span><strong data-cust-name></strong> <span class="ui-muted ui-small" data-cust-list></span></span>
+            <button type="button" class="link" data-cust-clear data-w="remove">{t.remove}</button>
+          </div>
+          <input id="off-customer" class="ui-input" type="search" autocomplete="off" data-cust-search data-wp="customerSearch" placeholder={t.customerSearch} />
+          <ul class="cust-results" role="list" data-cust-results></ul>
+        </div>
+
+        <ul class="cart" role="list" data-cart></ul>
+        <p class="ui-muted ui-small" data-empty data-w="cartEmpty">{t.cartEmpty}</p>
+
+        <div class="sum"><span data-w="total">{t.total}</span><strong class="num" data-total>$0.00</strong></div>
+        <div class="pay">
+          <label class="field"><span class="ui-small ui-strong" data-w="method">{t.method}</span><select class="ui-input" data-method></select></label>
+          <label class="field" data-received-field><span class="ui-small ui-strong" data-w="received">{t.received}</span>
+            <input class="ui-input num" type="text" inputmode="decimal" autocomplete="off" data-received /></label>
+        </div>
+        <p class="ui-small" data-change></p>
+        <p class="ui-alert" role="alert" hidden data-pay-error></p>
+        <Button icon="banknote" data-charge>{t.charge}</Button>
+      </section>
+    </div>
+
+    <details class="queue" data-queue-box>
+      <summary><span data-w="pendingTitle">{t.pendingTitle}</span> <span class="count" data-queue-count></span></summary>
+      <ul class="queue-list" role="list" data-queue></ul>
+      <Button variant="secondary" icon="refresh-cw" data-send-now><span data-w="sendNow">{t.sendNow}</span></Button>
+    </details>
+  </div>
+
+  <dialog class="saved" data-saved aria-labelledby="saved-title">
+    <h2 id="saved-title" data-w="saved">{t.saved}</h2>
+    <p class="folio num" data-saved-folio></p>
+    <p class="change num" data-saved-change></p>
+    <p class="ui-muted ui-small" data-w="savedText">{t.savedText}</p>
+    <div class="saved-actions">
+      <Button variant="secondary" icon="printer" data-print><span data-w="print">{t.print}</span></Button>
+      <Button icon="plus" data-new><span data-w="newSale">{t.newSale}</span></Button>
+    </div>
+  </dialog>
+
+  <article class="ticket" aria-hidden="true" data-ticket></article>
+</BaseLayout>
+
+<script>
+  import { cents, lineCents, listPrice, milli, toAmount, toQuantity } from '@/lib/offline/price';
+  import { getKv, nextOfflineFolio, putQueued, queued, type QueuedSale, type Snapshot } from '@/lib/offline/store';
+  import { syncQueue } from '@/lib/offline/sync';
+
+  type Words = typeof import('@/i18n/es').default.offline & { intl: string; units: Record<string, string>; methods: Record<string, string> };
+  const all = JSON.parse(document.getElementById('offline-words')!.textContent!) as Record<string, Words>;
+  const $ = <T extends HTMLElement = HTMLElement>(sel: string) => document.querySelector<T>(sel)!;
+  const fill = (s: string, v: Record<string, string | number>) => s.replace(/\{(\w+)\}/g, (_, k) => String(v[k] ?? ''));
+  const h = (tag: string, props: Record<string, string> = {}, ...kids: (Node | string | null)[]) => {
+    const el = document.createElement(tag);
+    for (const [k, v] of Object.entries(props)) k === 'class' ? (el.className = v) : el.setAttribute(k, v);
+    el.append(...kids.filter((k): k is Node | string => k !== null));
+    return el;
+  };
+  const INTEGER_UNITS = ['unit', 'service']; // same as the API: whole pieces; kg / lt / g take 3 decimals
+
+  let w: Words = all.es;
+  let snap: Snapshot | null = null;
+  let customer: Snapshot['customers'][number] | null = null;
+  const cart = new Map<string, number>(); // product id -> quantity in thousandths
+  let money = new Intl.NumberFormat('es-MX', { style: 'currency', currency: 'MXN' });
+  const fmt = (c: number) => money.format(c / 100);
+
+  const product = (id: string) => snap!.products.find((p) => p.id === id)!;
+  const plist = () => (customer?.price_list_id ? snap!.price_lists.find((l) => l.id === customer!.price_list_id) ?? null : null);
+  const unitCents = (p: Snapshot['products'][number], q: number) => {
+    const l = plist();
+    return listPrice(cents(p.price), q, l?.tiers[p.id] ?? [], l?.percent ?? 0);
+  };
+  const isCash = () => snap!.payment_methods.find((m) => m.id === $<HTMLSelectElement>('[data-method]').value)?.description === 'Cash';
+  const lines = () => [...cart].map(([id, q]) => { const p = product(id); const u = unitCents(p, q); return { p, q, u, total: lineCents(q, u) }; });
+  const total = () => lines().reduce((s, l) => s + l.total, 0);
+
+  function applyWords() {
+    document.documentElement.lang = snap?.locale ?? 'es';
+    w = all[snap?.locale ?? 'es'] ?? all.es;
+    money = new Intl.NumberFormat(w.intl, { style: 'currency', currency: 'MXN' });
+    document.querySelectorAll<HTMLElement>('[data-w]').forEach((el) => (el.textContent = (w as any)[el.dataset.w!]));
+    document.querySelectorAll<HTMLInputElement>('[data-wp]').forEach((el) => (el.placeholder = (w as any)[el.dataset.wp!]));
+    document.title = `${w.title} · Osmi`;
+  }
+
+  function renderNet() {
+    const online = navigator.onLine;
+    const net = $('[data-net]');
+    net.textContent = online ? w.online : w.offline;
+    net.classList.toggle('is-online', online);
+    $('[data-back]').hidden = !online;
+  }
+
+  // --- products ---------------------------------------------------------------
+  function renderResults() {
+    const q = $<HTMLInputElement>('[data-search]').value.trim().toLowerCase();
+    const list = $('[data-results]');
+    list.replaceChildren();
+    if (!q) return;
+    const found = snap!.products.filter((p) => p.name.toLowerCase().includes(q) || p.barcode === q).slice(0, 30);
+    if (!found.length) list.append(h('li', { class: 'ui-muted ui-small' }, w.noResults));
+    for (const p of found) {
+      const btn = h('button', { type: 'button', class: 'result' },
+        h('span', {}, p.name, p.stock !== null ? h('span', { class: 'ui-muted ui-small' }, ` · ${fill(w.stock, { n: Number(p.stock) })}`) : null),
+        h('span', { class: 'num' }, fmt(unitCents(p, 1000))));
+      btn.addEventListener('click', () => add(p.id));
+      list.append(h('li', {}, btn));
+    }
+  }
+
+  function add(id: string) {
+    cart.set(id, (cart.get(id) ?? 0) + 1000);
+    $<HTMLInputElement>('[data-search]').value = '';
+    renderResults();
+    renderCart();
+    $<HTMLInputElement>('[data-search]').focus();
+  }
+
+  // --- cart ---------------------------------------------------------------------
+  function renderCart() {
+    const list = $('[data-cart]');
+    list.replaceChildren();
+    for (const { p, q, u, total: lt } of lines()) {
+      const whole = INTEGER_UNITS.includes(p.unit.toLowerCase());
+      const qty = h('input', { class: 'ui-input num qty', type: 'text', inputmode: whole ? 'numeric' : 'decimal', value: toQuantity(q),
+        'aria-label': `${w.quantity} · ${p.name}` }) as HTMLInputElement;
+      qty.addEventListener('change', () => {
+        const n = Number(qty.value.replace(',', '.'));
+        const m = whole ? Math.round(n) * 1000 : milli(n);
+        if (!Number.isFinite(n) || m <= 0) cart.delete(p.id);
+        else cart.set(p.id, m);
+        renderCart();
+      });
+      const remove = h('button', { type: 'button', class: 'link', 'aria-label': `${w.remove} · ${p.name}` }, w.remove);
+      remove.addEventListener('click', () => { cart.delete(p.id); renderCart(); });
+      const over = p.stock !== null && q > milli(p.stock) ? h('span', { class: 'warn ui-small' }, fill(w.overStock, { n: Number(p.stock) })) : null;
+      list.append(h('li', {},
+        h('span', { class: 'name' }, p.name, h('span', { class: 'ui-muted ui-small' }, `${w.units[p.unit] ?? p.unit} × ${fmt(u)}`), over),
+        qty, h('span', { class: 'num line' }, fmt(lt)), remove));
+    }
+    $('[data-empty]').hidden = cart.size > 0;
+    const sum = total();
+    $('[data-total]').textContent = fmt(sum);
+    $('[data-charge]').lastChild!.textContent = fill(w.charge, { total: fmt(sum) });
+    renderChange();
+  }
+
+  function receivedCents() {
+    const raw = $<HTMLInputElement>('[data-received]').value.trim().replace(',', '.');
+    return raw ? cents(raw) : null;
+  }
+
+  function renderChange() {
+    const cash = isCash();
+    $('[data-received-field]').hidden = !cash;
+    const r = receivedCents();
+    $('[data-change]').textContent = cash && r !== null && r >= total() ? `${w.change}: ${fmt(r - total())}` : '';
+    $('[data-pay-error]').hidden = true;
+  }
+
+  // --- customer -----------------------------------------------------------------
+  function renderCustomer() {
+    $('[data-cust-chip]').hidden = !customer;
+    $('[data-cust-search]').hidden = !!customer;
+    if (customer) {
+      $('[data-cust-name]').textContent = customer.full_name;
+      const l = plist();
+      $('[data-cust-list]').textContent = l ? fill(w.priceList, { list: l.name }) : '';
+    }
+    $('[data-cust-results]').replaceChildren();
+    renderCart(); // their price list changes the prices
+  }
+
+  function renderCustomerResults() {
+    const q = $<HTMLInputElement>('[data-cust-search]').value.trim().toLowerCase();
+    const list = $('[data-cust-results]');
+    list.replaceChildren();
+    if (q.length < 2) return;
+    for (const c of snap!.customers.filter((x) => x.full_name.toLowerCase().includes(q)).slice(0, 8)) {
+      const btn = h('button', { type: 'button', class: 'result' }, c.full_name);
+      btn.addEventListener('click', () => { customer = c; $<HTMLInputElement>('[data-cust-search]').value = ''; renderCustomer(); });
+      list.append(h('li', {}, btn));
+    }
+  }
+
+  // --- charging -----------------------------------------------------------------
+  async function charge() {
+    const sum = total();
+    const error = $('[data-pay-error]');
+    if (!cart.size) return;
+    const cash = isCash();
+    const r = cash ? receivedCents() : null;
+    if (r !== null && r < sum) {
+      error.textContent = w.short;
+      error.hidden = false;
+      return;
+    }
+    const method = snap!.payment_methods.find((m) => m.id === $<HTMLSelectElement>('[data-method]').value)!;
+    const ls = lines();
+    const sale: QueuedSale = {
+      id: crypto.randomUUID(), offline_folio: await nextOfflineFolio(), sold_at: new Date().toISOString(), cash_register_id: snap!.register.id,
+      customer_id: customer?.id ?? null,
+      items: ls.map((l) => ({ product_id: l.p.id, quantity: toQuantity(l.q), unit_price: toAmount(l.u) })),
+      payments: [{ payment_method_id: method.id, amount: toAmount(sum), amount_tendered: r !== null ? toAmount(r) : null }],
+      user_id: snap!.user_id, branch_id: snap!.branch.id, status: 'pending',
+      ticket: { lines: ls.map((l) => ({ name: l.p.name, quantity: toQuantity(l.q), unit: w.units[l.p.unit] ?? l.p.unit, unit_price: fmt(l.u), total: fmt(l.total) })),
+        total: fmt(sum), change: r !== null && r > sum ? fmt(r - sum) : '', customer: customer?.full_name ?? null,
+        method: w.methods[method.description] ?? method.description, register: snap!.register.name },
+    };
+    await putQueued(sale); // saved before anything else: the money was already received
+    renderTicket(sale);
+    $('[data-saved-folio]').textContent = fill(w.ticketFolio, { folio: sale.offline_folio });
+    $('[data-saved-change]').textContent = sale.ticket.change ? `${w.change}: ${sale.ticket.change}` : '';
+    $<HTMLDialogElement>('[data-saved]').showModal();
+    cart.clear();
+    customer = null;
+    $<HTMLInputElement>('[data-received]').value = '';
+    renderCustomer();
+    await renderQueue();
+    if (navigator.onLine) sync();
+  }
+
+  function renderTicket(sale: QueuedSale) {
+    const b = snap!.branch;
+    const when = new Intl.DateTimeFormat(w.intl, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(sale.sold_at));
+    $('[data-ticket]').replaceChildren(...[
+      h('strong', {}, b.name), b.address ? h('span', {}, b.address) : null, b.phone ? h('span', {}, b.phone) : null,
+      h('span', {}, `${fill(w.ticketFolio, { folio: sale.offline_folio })} · ${when}`),
+      h('span', {}, sale.ticket.register), sale.ticket.customer ? h('span', {}, sale.ticket.customer) : null,
+      h('hr'),
+      ...sale.ticket.lines.map((l) => h('div', { class: 'tl' }, h('span', {}, `${l.name}`, h('small', {}, `${l.quantity} ${l.unit} × ${l.unit_price}`)), h('span', {}, l.total))),
+      h('hr'),
+      h('div', { class: 'tl big' }, h('span', {}, w.total), h('span', {}, sale.ticket.total)),
+      h('div', { class: 'tl' }, h('span', {}, sale.ticket.method), h('span', {}, sale.ticket.total)),
+      sale.ticket.change ? h('div', { class: 'tl' }, h('span', {}, w.change), h('span', {}, sale.ticket.change)) : null,
+      h('p', {}, w.thanks),
+    ].filter((n): n is HTMLElement => n !== null));
+  }
+
+  // --- queue ----------------------------------------------------------------------
+  async function renderQueue() {
+    const sales = await queued();
+    const list = $('[data-queue]');
+    list.replaceChildren();
+    const pending = sales.filter((s) => s.status !== 'synced').length;
+    $('[data-queue-count]').textContent = pending ? `(${pending})` : '';
+    if (!sales.length) list.append(h('li', { class: 'ui-muted ui-small' }, w.pendingNone));
+    const when = new Intl.DateTimeFormat(w.intl, { dateStyle: 'short', timeStyle: 'short' });
+    for (const s of [...sales].reverse()) {
+      const status = fill(w.statuses[s.status], { folio: s.folio ?? '' });
+      const note = s.status === 'error' ? (w.errors[s.error ?? ''] ?? w.errors.other)
+        : s.status === 'pending' && snap && s.user_id !== snap.user_id ? w.otherUser : null;
+      list.append(h('li', { class: `q-${s.status}` },
+        h('span', { class: 'num' }, s.offline_folio), h('span', { class: 'ui-small' }, when.format(new Date(s.sold_at))),
+        h('span', { class: 'num' }, s.ticket.total), h('span', { class: 'ui-small status' }, status, note ? h('small', {}, note) : null)));
+    }
+    $<HTMLButtonElement>('[data-send-now]').hidden = !pending;
+  }
+
+  let syncing = false;
+  async function sync() {
+    if (syncing || !snap) return;
+    syncing = true;
+    try {
+      await syncQueue(snap.user_id);
+    } catch { /* still offline */ }
+    syncing = false;
+    await renderQueue();
+  }
+
+  // --- start ----------------------------------------------------------------------
+  (async () => {
+    snap = (await getKv<Snapshot>('snapshot').catch(() => undefined)) ?? null;
+    applyWords();
+    renderNet();
+    await renderQueue().catch(() => {});
+    if (!snap) {
+      $('[data-nocopy]').hidden = false;
+      return;
+    }
+    $('[data-pos]').hidden = false;
+    $('[data-who]').textContent = `${snap.branch.name} · ${snap.register.name} · ${snap.user}`;
+    const copy = new Intl.DateTimeFormat(w.intl, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(snap.generated_at));
+    $('[data-copy]').textContent = `${fill(w.copyOf, { date: copy })} · ${w.stockHint}`;
+    const select = $<HTMLSelectElement>('[data-method]');
+    select.replaceChildren(...snap.payment_methods.map((m) => h('option', { value: m.id }, w.methods[m.description] ?? m.description)));
+    renderCart();
+
+    const search = $<HTMLInputElement>('[data-search]');
+    search.addEventListener('input', renderResults);
+    search.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter') return;
+      e.preventDefault();
+      const q = search.value.trim();
+      const exact = snap!.products.find((p) => p.barcode && p.barcode === q); // a barcode scanner types the code + Enter
+      const only = $('[data-results]').querySelectorAll('button.result');
+      if (exact) add(exact.id);
+      else if (only.length === 1) (only[0] as HTMLButtonElement).click();
+    });
+    $('[data-cust-search]').addEventListener('input', renderCustomerResults);
+    $('[data-cust-clear]').addEventListener('click', () => { customer = null; renderCustomer(); });
+    select.addEventListener('change', renderChange);
+    $('[data-received]').addEventListener('input', renderChange);
+    $('[data-charge]').addEventListener('click', () => charge().catch(() => { $('[data-pay-error]').textContent = w.errors.other; $('[data-pay-error]').hidden = false; }));
+    $('[data-print]').addEventListener('click', () => window.print());
+    $('[data-new]').addEventListener('click', () => { $<HTMLDialogElement>('[data-saved]').close(); search.focus(); });
+    $('[data-send-now]').addEventListener('click', sync);
+    addEventListener('online', () => { renderNet(); sync(); });
+    addEventListener('offline', renderNet);
+    if (navigator.onLine) sync();
+    search.focus();
+  })();
+</script>
+
+<!-- Global: most of this page is built by its script, and Astro's scoped styles don't reach elements made at runtime.
+     This page is standalone, so nothing else picks them up. -->
+<style is:global>
+  .pos-off [hidden],
+  .saved [hidden] {
+    display: none !important;
+  }
+  .pos-off {
+    max-width: 72rem;
+    margin: 0 auto;
+    padding: var(--space-4);
+  }
+  .top {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--space-3);
+    margin-bottom: var(--space-4);
+  }
+  .top h1 {
+    margin: 0;
+  }
+  .top p {
+    margin: var(--space-1) 0 0;
+  }
+  .top-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+  }
+  .net {
+    padding: var(--space-1) var(--space-3);
+    font-size: var(--text-sm);
+    font-weight: var(--weight-bold);
+    color: var(--text-title);
+    background: color-mix(in srgb, var(--status-warning) 18%, var(--bg-app));
+    border-radius: 999px;
+  }
+  .net.is-online {
+    background: color-mix(in srgb, var(--status-success) 15%, var(--bg-app));
+  }
+  .back {
+    font-weight: var(--weight-bold);
+  }
+  .nocopy {
+    padding: var(--space-4);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-container);
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 26rem);
+    align-items: start;
+    gap: var(--space-4);
+  }
+  .grid[hidden] {
+    display: none;
+  }
+  .panel {
+    display: grid;
+    gap: var(--space-3);
+    padding: var(--space-4);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-container);
+  }
+  .panel p {
+    margin: 0;
+  }
+  .search {
+    font-size: var(--text-lg, 1.125rem);
+  }
+  .results,
+  .cust-results,
+  .cart,
+  .queue-list {
+    display: grid;
+    gap: var(--space-1);
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .result {
+    display: flex;
+    justify-content: space-between;
+    gap: var(--space-3);
+    width: 100%;
+    padding: var(--space-3);
+    font: inherit;
+    text-align: start;
+    color: var(--text-title);
+    background: var(--bg-app);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-control);
+    cursor: pointer;
+  }
+  .result:hover,
+  .result:focus-visible {
+    border-color: var(--color-primary);
+  }
+  .customer {
+    display: grid;
+    gap: var(--space-1);
+  }
+  .chip {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    background: var(--bg-app);
+    border-radius: var(--radius-control);
+  }
+  .chip[hidden] {
+    display: none;
+  }
+  .link {
+    padding: 0;
+    font: inherit;
+    font-size: var(--text-sm);
+    color: var(--color-primary);
+    background: none;
+    border: 0;
+    text-decoration: underline;
+    cursor: pointer;
+  }
+  .cart li {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 4.5rem auto auto;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-2) 0;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .name {
+    display: grid;
+  }
+  .warn {
+    color: var(--status-warning-text);
+  }
+  .qty {
+    width: 100%;
+    text-align: end;
+  }
+  .sum {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    font-size: var(--text-lg, 1.125rem);
+  }
+  .sum strong {
+    font-size: 1.5rem;
+  }
+  .pay {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--space-3);
+  }
+  .field {
+    display: grid;
+    gap: var(--space-1);
+  }
+  .field[hidden] {
+    display: none;
+  }
+  .queue {
+    margin-top: var(--space-6, 2rem);
+    padding: var(--space-4);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-container);
+  }
+  .queue summary {
+    font-weight: var(--weight-bold);
+    cursor: pointer;
+  }
+  .queue-list {
+    margin: var(--space-3) 0;
+  }
+  .queue-list li {
+    display: grid;
+    grid-template-columns: 9rem 8rem 6rem minmax(0, 1fr);
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-2) 0;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .status {
+    display: grid;
+  }
+  .q-synced .status {
+    color: var(--status-success-text);
+  }
+  .q-error .status {
+    color: var(--status-error-text);
+  }
+  .saved {
+    width: min(100% - 2 * var(--space-4), 26rem);
+    padding: var(--space-6, 2rem);
+    text-align: center;
+    color: var(--text-body, inherit);
+    background: var(--bg-surface);
+    border: 0;
+    border-radius: var(--radius-container);
+  }
+  .saved::backdrop {
+    background: rgb(0 0 0 / 0.45);
+  }
+  .saved h2 {
+    margin: 0 0 var(--space-2);
+  }
+  .folio {
+    font-size: 1.25rem;
+    font-weight: var(--weight-bold);
+  }
+  .saved-actions {
+    display: flex;
+    justify-content: center;
+    gap: var(--space-2);
+    margin-top: var(--space-4);
+  }
+  .ticket {
+    display: none;
+  }
+  @media (max-width: 52rem) {
+    .grid {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .queue-list li {
+      grid-template-columns: 1fr auto;
+    }
+  }
+  /* Print only the ticket */
+  @media print {
+    .pos-off,
+    .saved {
+      display: none !important;
+    }
+    .ticket {
+      display: grid;
+      gap: 2px;
+      max-width: 80mm;
+      margin: 0 auto;
+      font-size: 12px;
+      color: #000;
+      text-align: center;
+    }
+    .ticket .tl {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      text-align: start;
+    }
+    .ticket .tl small {
+      display: block;
+    }
+    .ticket .big {
+      font-weight: 700;
+      font-size: 14px;
+    }
+    .ticket hr {
+      width: 100%;
+      border: 0;
+      border-top: 1px dashed #000;
+    }
+  }
+</style>

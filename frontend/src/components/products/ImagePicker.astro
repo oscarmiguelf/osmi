@@ -1,0 +1,172 @@
+---
+// Image tiles for a product form: a "+" tile adds images one (or a few) at a time, up to `room`, each with a preview
+// and a remove button. The picked files live in a hidden <input name="images"> so the form posts them as usual.
+import Icon from '@/components/ui/Icon.astro';
+import { fmt, useTranslations, type Locale } from '@/i18n';
+
+interface Props {
+  locale: Locale;
+  /** How many images may still be added */
+  room: number;
+}
+
+const { locale, room } = Astro.props;
+const pr = useTranslations(locale).products;
+---
+
+<div class="picker" data-image-picker data-room={room}
+  data-labels={JSON.stringify({ remove: pr.removePicked, tooBig: pr.imageTooBig, badType: pr.imageBadType, full: fmt(pr.imagePickTooMany, { n: room }),
+    hint: pr.imagesHint, notImage: pr.imageNotReadable })}>
+  <span class="label">{pr.addImages}</span>
+  <ul class="tiles" role="list" data-tiles>
+    <li class="add-tile" data-add-tile>
+      <label>
+        <Icon name="plus" size={28} />
+        <span class="visually-hidden">{pr.addImage}</span>
+        <input type="file" accept="image/jpeg,image/png,image/webp" multiple data-pick />
+      </label>
+    </li>
+  </ul>
+  <input type="file" name="images" multiple hidden data-store />
+  <span class="ui-muted ui-small" data-hint>{fmt(pr.imagesHint, { n: room })}</span>
+  <p class="ui-alert" data-pick-error role="alert" hidden></p>
+</div>
+
+<script>
+  const TYPES = ['image/jpeg', 'image/png', 'image/webp'];
+  const MAX = 8 * 1024 * 1024;
+  document.querySelectorAll<HTMLElement>('[data-image-picker]').forEach((root) => {
+    const L = JSON.parse(root.dataset.labels!);
+    const room = Number(root.dataset.room);
+    const pick = root.querySelector<HTMLInputElement>('[data-pick]')!;
+    const store = root.querySelector<HTMLInputElement>('[data-store]')!;
+    const tiles = root.querySelector<HTMLElement>('[data-tiles]')!;
+    const addTile = root.querySelector<HTMLElement>('[data-add-tile]')!;
+    const error = root.querySelector<HTMLElement>('[data-pick-error]')!;
+    let files: File[] = [];
+
+    function sync() {
+      // The hidden input is what the form posts: rebuild its FileList from the picked files
+      const dt = new DataTransfer();
+      files.forEach((f) => dt.items.add(f));
+      store.files = dt.files;
+      tiles.querySelectorAll('[data-picked]').forEach((li) => {
+        URL.revokeObjectURL(li.querySelector('img')!.src);
+        li.remove();
+      });
+      files.forEach((file) => {
+        const li = document.createElement('li');
+        li.className = 'picked';
+        li.dataset.picked = '';
+        const img = document.createElement('img');
+        img.src = URL.createObjectURL(file);
+        img.alt = file.name;
+        // The browser can't draw it: not a real image (whatever its name says), so it isn't sent
+        img.addEventListener('error', () => {
+          files = files.filter((f) => f !== file);
+          error.textContent = `${file.name}: ${L.notImage}`;
+          error.hidden = false;
+          sync();
+        });
+        const rm = document.createElement('button');
+        rm.type = 'button';
+        rm.className = 'remove';
+        rm.textContent = '×';
+        rm.setAttribute('aria-label', `${L.remove}: ${file.name}`);
+        rm.addEventListener('click', () => { files = files.filter((f) => f !== file); error.hidden = true; sync(); });
+        li.append(img, rm);
+        tiles.insertBefore(li, addTile);
+      });
+      addTile.hidden = files.length >= room;
+      root.querySelector('[data-hint]')!.textContent = L.hint.replace('{n}', String(room - files.length));
+    }
+
+    pick.addEventListener('change', () => {
+      const problems: string[] = [];
+      for (const file of [...(pick.files ?? [])]) {
+        if (files.length >= room) { problems.push(L.full); break; }
+        if (!TYPES.includes(file.type)) problems.push(`${file.name}: ${L.badType}`);
+        else if (file.size > MAX) problems.push(`${file.name}: ${L.tooBig}`);
+        else files.push(file);
+      }
+      pick.value = ''; // the same file can be picked again after removing it
+      error.textContent = problems.join(' ');
+      error.hidden = !problems.length;
+      sync();
+    });
+  });
+</script>
+
+<style>
+  .picker {
+    display: grid;
+    gap: var(--space-2);
+  }
+  .label {
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
+  }
+  .tiles {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .tiles > :global(li) {
+    position: relative;
+    width: 5.5rem;
+    height: 5.5rem;
+    overflow: hidden;
+    border-radius: var(--radius-control);
+  }
+  .tiles :global(img) {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-control);
+  }
+  .tiles :global(.remove) {
+    position: absolute;
+    top: 0.25rem;
+    inset-inline-end: 0.25rem;
+    display: grid;
+    place-items: center;
+    width: 1.5rem;
+    height: 1.5rem;
+    padding: 0;
+    background: color-mix(in srgb, var(--text-title) 75%, transparent);
+    border: 0;
+    border-radius: 999px;
+    color: var(--bg-app);
+    font-size: 1rem;
+    line-height: 1;
+    cursor: pointer;
+  }
+  .add-tile[hidden] {
+    display: none;
+  }
+  .add-tile label {
+    display: grid;
+    place-items: center;
+    width: 100%;
+    height: 100%;
+    border: 2px dashed var(--border-input);
+    border-radius: var(--radius-control);
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+  .add-tile label:hover,
+  .add-tile label:focus-within {
+    border-color: var(--color-primary);
+    color: var(--color-primary);
+  }
+  .add-tile input {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    opacity: 0;
+  }
+</style>

@@ -1,0 +1,56 @@
+---
+// Home. Whoever can sell lands on the point of sale (same page as /sales/new, the URL stays /);
+// everyone else gets their modules.
+import AppLayout from '@/layouts/AppLayout.astro';
+import Icon from '@/components/ui/Icon.astro';
+import { fmt, getLocale, localePath, longDate, useTranslations } from '@/i18n';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const d = t.dashboard;
+const { session, branch } = Astro.locals as Required<App.Locals>;
+const canSell = session.modules.find((m) => m.code === 'sales')?.permissions.includes('create');
+if (canSell && branch) return Astro.rewrite(localePath(locale, '/sales/new') + Astro.url.search);
+---
+
+<AppLayout title={t.app.home} current="/">
+  <header class="ui-header">
+    <div>
+      <h1>{branch ? fmt(d.title, { branch: branch.name }) : d.titleNoBranch}</h1>
+      <p class="ui-sub">{longDate(locale, new Date())}</p>
+    </div>
+  </header>
+  {session.modules.length === 0 ? <p class="ui-muted">{d.noModules}</p> : (
+    <ul class="modules" role="list">
+      {session.modules.map((m) => (
+        <li><a href={localePath(locale, m.route)}><Icon name={m.icon} size={22} />{t.modules[m.code] ?? m.name}</a></li>
+      ))}
+    </ul>
+  )}
+</AppLayout>
+
+<style>
+  .modules {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr));
+    gap: var(--space-3);
+    padding: 0;
+    list-style: none;
+  }
+  .modules a {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    padding: var(--space-4);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-container);
+    color: var(--text-title);
+    font-weight: var(--weight-bold);
+    text-decoration: none;
+  }
+  .modules a:hover {
+    border-color: var(--color-primary);
+    color: var(--color-primary);
+  }
+</style>

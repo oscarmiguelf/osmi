@@ -1,0 +1,532 @@
+---
+import AppLayout from '@/layouts/AppLayout.astro';
+import BranchFields from '@/components/branches/BranchFields.astro';
+import Badge from '@/components/ui/Badge.astro';
+import Button from '@/components/ui/Button.astro';
+import Card from '@/components/ui/Card.astro';
+import Dialog from '@/components/ui/Dialog.astro';
+import Icon from '@/components/ui/Icon.astro';
+import Notice from '@/components/ui/Notice.astro';
+import SearchPicker from '@/components/ui/SearchPicker.astro';
+import Timeline from '@/components/ui/Timeline.astro';
+import { fmt, getLocale, localePath, useTranslations } from '@/i18n';
+import { ApiError } from '@/lib/api';
+import {
+  addBranchMember, branchFormErrors, branchHistory, branchMembers, getBranch, removeBranchMember, restoreBranch,
+  updateBranch, type Branch, type BranchHistoryEntry,
+} from '@/lib/branches';
+import { formatPhone } from '@/lib/customers';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const br = t.branches;
+const { session, accessToken } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'branches')?.permissions ?? [];
+if (!perms.includes('read')) return Astro.rewrite('/404');
+const canUpdate = perms.includes('update');
+const canDelete = perms.includes('delete');
+const id = Astro.params.id!;
+const selfPath = localePath(locale, `/branches/${id}`);
+
+let branch: Branch;
+try {
+  branch = await getBranch(accessToken, id);
+} catch (e) {
+  if (e instanceof ApiError && (e.status === 404 || e.status === 422)) return Astro.rewrite('/404');
+  throw e;
+}
+
+// --- Edit, assign / remove people, restore (form POST, then back here with a notice) ---
+let values = { name: branch.name, code: branch.code, phone: branch.phone ?? '', address: branch.address ?? '' };
+let fieldErrors: Record<string, string> = {};
+let formError: string | undefined;
+let memberError: string | undefined;
+let pageError: { text: string; items?: string[] } | undefined;
+
+if (Astro.request.method === 'POST') {
+  const data = await Astro.request.formData();
+  const intent = data.get('intent');
+  const userId = String(data.get('user_id') ?? '');
+  try {
+    if (intent === 'add_member') {
+      if (!userId) memberError = br.pickUser;
+      else {
+        await addBranchMember(accessToken, id, userId);
+        return Astro.redirect(`${selfPath}?added=1#members`, 303);
+      }
+    } else if (intent === 'remove_member') {
+      await removeBranchMember(accessToken, id, userId);
+      return Astro.redirect(`${selfPath}?removed=1#members`, 303);
+    } else if (intent === 'restore') {
+      await restoreBranch(accessToken, id);
+      return Astro.redirect(`${selfPath}?restored=1`, 303);
+    } else {
+      values = Object.fromEntries(Object.keys(values).map((k) => [k, String(data.get(k) ?? '').trim()])) as typeof values;
+      if (!branch.code_editable) values.code = branch.code; // disabled field isn't posted
+      if (!values.name) fieldErrors.name = br.errors.name;
+      if (!values.code) fieldErrors.code = br.errors.code;
+      if (!Object.keys(fieldErrors).length) {
+        await updateBranch(accessToken, id, {
+          name: values.name,
+          phone: values.phone || null,
+          address: values.address || null,
+          ...(branch.code_editable && { code: values.code }),
+        });
+        return Astro.redirect(`${selfPath}?saved=1`, 303);
+      }
+    }
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    const detail = e.body?.detail;
+    if (intent === 'add_member') {
+      memberError = e.status === 409 ? br.alreadyMember : e.status === 403 ? br.forbidden : br.failed;
+    } else if (intent === 'remove_member') {
+      const open: Record<string, number> = detail?.open ?? {};
+      pageError =
+        e.status === 409
+          ? { text: br.openWork, items: Object.entries(open).map(([k, n]) => fmt(br.blockers[k] ?? k, { n })) }
+          : { text: e.status === 403 ? br.forbidden : br.failed };
+    } else if (intent === 'restore') {
+      pageError = { text: e.status === 409 ? br.restoreTaken : br.failed };
+    } else {
+      const errors = branchFormErrors(e, br);
+      fieldErrors = errors.fields;
+      formError = errors.form;
+    }
+  }
+  if (Object.keys(fieldErrors).length) formError ??= br.formError;
+  Astro.response.status = 422;
+}
+
+const deleted = branch.deleted_at !== null;
+const params = Astro.url.searchParams;
+const historyPage = Math.max(1, Number.parseInt(params.get('history') ?? '1', 10) || 1);
+const [members, history] = await Promise.all([branchMembers(accessToken, id), branchHistory(accessToken, id, historyPage)]);
+
+const tz = session.user.timezone;
+const when = new Intl.DateTimeFormat(t.intl, { dateStyle: 'medium', timeStyle: 'short', timeZone: tz });
+const day = new Intl.DateTimeFormat(t.intl, { dateStyle: 'long', timeZone: tz });
+const show = (field: string, value: unknown) =>
+  value === null || value === undefined || value === '' ? '—' : field === 'phone' ? formatPhone(String(value)) : String(value);
+const timeline = history.items.map((h: BranchHistoryEntry) => ({
+  title: fmt(br.actions[`${h.entity_type}:${h.action}`] ?? h.action, { who: h.member_email ?? br.someone }),
+  meta: `${h.changed_by_email ?? br.unknownUser}, ${when.format(new Date(h.changed_at))}`,
+  changes:
+    h.entity_type === 'branch' && h.action === 'UPDATE'
+      ? (h.changed_fields ?? [])
+          .filter((f) => f in br.fields)
+          .map((f) => ({ label: br.fields[f], from: show(f, h.old_data?.[f]), to: show(f, h.new_data?.[f]) }))
+      : [],
+}));
+const initials = (m: { first_name: string; last_name: string }) => `${m.first_name.charAt(0)}${m.last_name.charAt(0)}`.toUpperCase();
+const manage = canUpdate && !deleted;
+---
+
+<AppLayout title={branch.name} current="/branches">
+  <header class="page-header">
+    <Button variant="tertiary" icon="arrow-left" href={localePath(locale, '/branches')} class="back">{br.back}</Button>
+    <div class="title-row">
+      <h1>{branch.name}</h1>
+      <Badge>{branch.code}</Badge>
+      {deleted && <Badge tone="error">{br.deletedBadge}</Badge>}
+      {manage && <Button variant="secondary" icon="pencil" data-dialog="edit-branch" class="edit">{br.edit}</Button>}
+    </div>
+  </header>
+
+  <div class="notices">
+    {params.get('created') && <Notice>{fmt(br.created, { name: branch.name })}</Notice>}
+    {params.get('saved') && <Notice>{br.saved}</Notice>}
+    {params.get('restored') && <Notice>{br.restored}</Notice>}
+    {params.get('added') && <Notice>{br.memberAdded}</Notice>}
+    {params.get('removed') && <Notice>{br.memberRemoved}</Notice>}
+    {
+      pageError && (
+        <Notice tone="error">
+          {pageError.text}
+          {pageError.items && (
+            <ul class="list">
+              {pageError.items.map((item) => (
+                <li>{item}</li>
+              ))}
+            </ul>
+          )}
+        </Notice>
+      )
+    }
+    {
+      deleted && (
+        <Notice tone="error">
+          {fmt(br.deletedBanner, { date: day.format(new Date(branch.deleted_at!)) })}
+          {canDelete && (
+            <form method="post" slot="action">
+              <input type="hidden" name="intent" value="restore" />
+              <Button type="submit" variant="secondary" icon="rotate-ccw">{br.restore}</Button>
+            </form>
+          )}
+        </Notice>
+      )
+    }
+  </div>
+
+  <div class="grid">
+    <Card title={br.info}>
+      <dl class="rows">
+        <div>
+          <dt><Icon name="hash" size={16} />{br.code}</dt>
+          <dd>{branch.code}</dd>
+        </div>
+        <div>
+          <dt><Icon name="phone" size={16} />{br.phone}</dt>
+          <dd class="num">{branch.phone ? <a href={`tel:${branch.phone}`}>{formatPhone(branch.phone)}</a> : <span class="muted">—</span>}</dd>
+        </div>
+        <div>
+          <dt><Icon name="map-pin" size={16} />{br.address}</dt>
+          <dd>{branch.address ?? <span class="muted">—</span>}</dd>
+        </div>
+      </dl>
+      {!branch.code_editable && <p class="muted small">{br.codeLocked}</p>}
+    </Card>
+
+    <section class="members" id="members" aria-labelledby="members-title">
+      <Card>
+        <div class="members-head">
+          <h2 id="members-title" class="card-title">{br.members}</h2>
+          <p class="muted small">{br.membersHint}</p>
+        </div>
+        {
+          members.length === 0 ? (
+            <p class="muted">{br.membersEmpty}</p>
+          ) : (
+            <ul class="people" role="list">
+              {members.map((m) => {
+                const name = `${m.first_name} ${m.last_name}`;
+                return (
+                  <li class="person">
+                    <span class="avatar" aria-hidden="true">{initials(m)}</span>
+                    <span class="who">
+                      <span class="person-name">{name}</span>
+                      <span class="email">{m.email}</span>
+                    </span>
+                    {manage && (
+                      <form
+                        method="post"
+                        data-confirm={fmt(br.removeText, { name, branch: branch.name })}
+                        data-confirm-title={br.removeTitle}
+                        data-confirm-action={br.removeAction}
+                      >
+                        <input type="hidden" name="intent" value="remove_member" />
+                        <input type="hidden" name="user_id" value={m.id} />
+                        <button type="submit" class="remove" aria-label={fmt(br.removeMember, { name })}>
+                          <Icon name="user-minus" size={18} />
+                        </button>
+                      </form>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          )
+        }
+        {
+          manage && (
+            <form method="post" class="add">
+              <input type="hidden" name="intent" value="add_member" />
+              <label class="label" for="member-search">{br.addMember}</label>
+              <div class="add-row">
+                <SearchPicker
+                  id="member-search"
+                  name="user_id"
+                  endpoint="/api/users"
+                  placeholder={br.searchUser}
+                  hint={br.searchHint}
+                  noResults={br.noUserResults}
+                  clearLabel={t.calendar.clearSelection}
+                  requiredMessage={br.pickUser}
+                  exclude={members.map((m) => m.id)}
+                  focusAfter="button[type=submit]"
+                />
+                <Button type="submit" icon="user-plus">{br.addMemberAction}</Button>
+              </div>
+              {memberError && <p class="member-error" role="alert">{memberError}</p>}
+            </form>
+          )
+        }
+      </Card>
+    </section>
+
+    <Card title={br.history} class="history">
+      <Timeline items={timeline} />
+      {
+        (historyPage > 1 || history.has_more) && (
+          <div class="history-pager">
+            {historyPage > 1 && <Button variant="tertiary" href={`${selfPath}?history=${historyPage - 1}`}>{br.newerHistory}</Button>}
+            {history.has_more && <Button variant="tertiary" href={`${selfPath}?history=${historyPage + 1}`}>{br.olderHistory}</Button>}
+          </div>
+        )
+      }
+    </Card>
+  </div>
+
+  {
+    manage && (
+      <Dialog id="edit-branch" title={br.editTitle} closeLabel={br.close} open={!!formError}>
+        <form method="post" class="form" novalidate>
+          {formError && <p class="alert" role="alert">{formError}</p>}
+          <input type="hidden" name="intent" value="update" />
+          <BranchFields locale={locale} values={values} errors={fieldErrors} codeEditable={branch.code_editable} />
+          <div class="actions">
+            <Button variant="tertiary" data-dialog-close>{br.cancel}</Button>
+            <Button type="submit">{br.saveChanges}</Button>
+          </div>
+        </form>
+      </Dialog>
+    )
+  }
+</AppLayout>
+
+<script>
+  // Notices show once: reloading or sharing the URL shouldn't repeat them
+  const url = new URL(location.href);
+  const keys = ['created', 'saved', 'restored', 'added', 'removed'];
+  if (keys.some((k) => url.searchParams.has(k))) {
+    keys.forEach((k) => url.searchParams.delete(k));
+    history.replaceState(null, '', url);
+  }
+</script>
+
+<style>
+  .page-header {
+    display: grid;
+    gap: var(--space-2);
+    margin-bottom: var(--space-6);
+  }
+
+  .page-header > :global(.back) {
+    justify-self: start;
+    margin-inline-start: calc(-1 * var(--space-2));
+  }
+
+  .title-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-3);
+  }
+
+  .title-row > :global(.edit) {
+    margin-inline-start: auto;
+  }
+
+  .notices {
+    display: grid;
+    gap: var(--space-2);
+    margin-bottom: var(--space-4);
+  }
+
+  .notices:empty {
+    display: none;
+  }
+
+  .list {
+    margin-top: var(--space-1);
+    padding-inline-start: var(--space-5);
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 22rem), 1fr));
+    align-items: start;
+    gap: var(--space-4);
+  }
+
+  .grid > :global(.history) {
+    grid-column: 1 / -1;
+  }
+
+  .rows {
+    display: grid;
+  }
+
+  .rows > div {
+    display: flex;
+    justify-content: space-between;
+    gap: var(--space-4);
+    padding-block: var(--space-2);
+    border-top: 1px solid var(--border-subtle);
+  }
+
+  .rows > div:first-child {
+    border-top: 0;
+  }
+
+  .rows dt {
+    display: flex;
+    flex-shrink: 0;
+    align-items: center;
+    gap: var(--space-2);
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+  }
+
+  .rows dd {
+    min-width: 0;
+    color: var(--text-title);
+    text-align: end;
+    overflow-wrap: anywhere;
+  }
+
+  .rows a {
+    color: inherit;
+    text-decoration: none;
+  }
+
+  .rows a:hover {
+    color: var(--color-primary);
+    text-decoration: underline;
+  }
+
+  .muted {
+    color: var(--text-muted);
+  }
+
+  .small {
+    font-size: var(--text-sm);
+  }
+
+  .members-head {
+    display: grid;
+    gap: var(--space-1);
+  }
+
+  .card-title {
+    font-size: var(--text-md);
+  }
+
+  .people {
+    display: grid;
+    gap: var(--space-1);
+    padding: 0;
+    list-style: none;
+  }
+
+  .person {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    min-height: 3rem;
+  }
+
+  .avatar {
+    display: grid;
+    flex-shrink: 0;
+    place-items: center;
+    width: 2.25rem;
+    height: 2.25rem;
+    background: var(--bg-app);
+    border: 1px solid var(--border-subtle);
+    border-radius: 50%;
+    color: var(--color-primary);
+    font-size: var(--text-xs);
+    font-weight: var(--weight-bold);
+  }
+
+  .who {
+    display: grid;
+    flex: 1;
+    min-width: 0;
+  }
+
+  .person-name {
+    color: var(--text-title);
+    font-weight: var(--weight-medium);
+  }
+
+  .email {
+    overflow: hidden;
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .remove {
+    display: grid;
+    place-items: center;
+    width: var(--control-height);
+    height: var(--control-height);
+    background: none;
+    border: 0;
+    border-radius: var(--radius-control);
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+
+  .remove:hover {
+    background: color-mix(in srgb, var(--status-error) 8%, transparent);
+    color: var(--status-error-text);
+  }
+
+  .add {
+    display: grid;
+    gap: var(--space-2);
+    padding-top: var(--space-4);
+    border-top: 1px solid var(--border-subtle);
+  }
+
+  .label {
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
+  }
+
+  .add-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: start;
+    gap: var(--space-2);
+  }
+
+  .member-error {
+    color: var(--status-error-text);
+    font-size: var(--text-sm);
+  }
+
+  .history-pager {
+    display: flex;
+    justify-content: space-between;
+  }
+
+  .form {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--space-4);
+  }
+
+  .alert,
+  .actions,
+  .form > :global(.field:first-of-type),
+  .form > :global(.field:has(textarea)) {
+    grid-column: 1 / -1;
+  }
+
+  .alert {
+    padding: var(--space-3);
+    background: color-mix(in srgb, var(--status-error) 8%, var(--bg-app));
+    border: 1px solid var(--status-error);
+    border-radius: var(--radius-control);
+    color: var(--text-title);
+    font-size: var(--text-sm);
+  }
+
+  .actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--space-2);
+  }
+
+  @media (max-width: 30rem) {
+    .form,
+    .add-row {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+</style>

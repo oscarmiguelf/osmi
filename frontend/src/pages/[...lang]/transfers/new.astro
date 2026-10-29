@@ -1,0 +1,95 @@
+---
+import AppLayout from '@/layouts/AppLayout.astro';
+import Button from '@/components/ui/Button.astro';
+import Card from '@/components/ui/Card.astro';
+import Field from '@/components/ui/Field.astro';
+import ItemsEditor from '@/components/ui/ItemsEditor.astro';
+import Notice from '@/components/ui/Notice.astro';
+import { fmt, getLocale, localePath, useTranslations } from '@/i18n';
+import { ApiError } from '@/lib/api';
+import { readItems } from '@/lib/products';
+import { setFlash } from '@/lib/session';
+import { listBranches, sendTransfer } from '@/lib/transfers';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const tr = t.transfers;
+const { session, accessToken, branch } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'transfers')?.permissions ?? [];
+if (!perms.includes('create') || !branch) return Astro.rewrite('/404');
+
+// The destination can be any other active branch, including ones the user doesn't belong to
+const destinations = (await listBranches(accessToken)).filter((b) => b.id !== branch.id);
+let values = { to_branch_id: destinations[0]?.id ?? '', notes: '' };
+let items: ReturnType<typeof readItems> = [];
+let formError: string | undefined;
+if (Astro.request.method === 'POST') {
+  const data = await Astro.request.formData();
+  values = { to_branch_id: String(data.get('to_branch_id') ?? ''), notes: String(data.get('notes') ?? '').trim() };
+  items = readItems(data);
+  if (!items.length) formError = t.purchases.noItems;
+  else {
+    try {
+      const sent = await sendTransfer(accessToken, branch.id, {
+        to_branch_id: values.to_branch_id,
+        notes: values.notes || null,
+        items: items.map((i) => ({ product_id: i.product_id, quantity: i.quantity })),
+      });
+      setFlash(Astro.cookies, { sent: sent.folio });
+      return Astro.redirect(localePath(locale, `/transfers/${sent.id}`), 303);
+    } catch (e) {
+      if (!(e instanceof ApiError)) throw e;
+      const detail = e.body?.detail;
+      formError = detail?.available !== undefined ? fmt(tr.notEnough, { message: `${detail.message} (${Number(detail.available)})` })
+        : typeof detail?.message === 'string' ? fmt(t.purchases.invalidItem, { message: detail.message })
+        : e.status === 403 ? t.ui.forbidden : t.ui.failed;
+    }
+  }
+  Astro.response.status = 422;
+}
+---
+
+<AppLayout title={tr.newTransfer} current="/transfers">
+  <a class="ui-back" href={localePath(locale, '/transfers')}>← {tr.back}</a>
+  <header class="ui-header">
+    <div>
+      <h1>{tr.newTransfer}</h1>
+      <p class="ui-sub">{fmt(tr.route, { from: branch.name, to: '…' })}</p>
+    </div>
+  </header>
+
+  {
+    destinations.length === 0 ? <Notice tone="warning">{tr.noOtherBranches}</Notice> : (
+      <form method="post" class="layout" novalidate>
+        {formError && <p class="ui-alert" role="alert">{formError}</p>}
+        <Card>
+          <div class="ui-form">
+            <Field label={tr.destination} name="to_branch_id" as="select">
+              {destinations.map((d) => <option value={d.id} selected={d.id === values.to_branch_id}>{d.name}</option>)}
+            </Field>
+            <Field label={tr.notes} name="notes" value={values.notes} maxlength={1000} />
+          </div>
+        </Card>
+        <Card title={tr.items}>
+          <ItemsEditor id="transfer-items" mode="available" items={items} intl={t.intl} labels={{
+            product: t.purchases.product, placeholder: t.purchases.productPlaceholder, hint: tr.productHint,
+            noResults: t.purchases.noProducts, clear: t.calendar.clearSelection, quantity: t.purchases.quantity, unitCost: '',
+            lineTotal: '', add: t.purchases.add, remove: t.purchases.remove, total: '', empty: t.purchases.noItems,
+          }} />
+        </Card>
+        <div class="ui-form-actions">
+          <Button variant="tertiary" href={localePath(locale, '/transfers')}>{t.ui.cancel}</Button>
+          <Button type="submit" icon="send">{tr.send}</Button>
+        </div>
+      </form>
+    )
+  }
+</AppLayout>
+
+<style>
+  .layout {
+    display: grid;
+    gap: var(--space-4);
+    max-width: 48rem;
+  }
+</style>

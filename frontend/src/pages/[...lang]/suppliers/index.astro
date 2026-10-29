@@ -1,0 +1,213 @@
+---
+// Suppliers: search, create (with a duplicate-name check), and delete / restore from the list.
+import AppLayout from '@/layouts/AppLayout.astro';
+import SupplierFields from '@/components/suppliers/SupplierFields.astro';
+import Badge from '@/components/ui/Badge.astro';
+import Button from '@/components/ui/Button.astro';
+import Dialog from '@/components/ui/Dialog.astro';
+import EmptyState from '@/components/ui/EmptyState.astro';
+import Field from '@/components/ui/Field.astro';
+import Notice from '@/components/ui/Notice.astro';
+import { fmt, getLocale, localePath, useTranslations } from '@/i18n';
+import { ApiError } from '@/lib/api';
+import { createSupplier, deleteSupplier, listSuppliers, restoreSupplier, supplierSaveError } from '@/lib/suppliers';
+
+const locale = getLocale(Astro.currentLocale);
+const t = useTranslations(locale);
+const s = t.suppliers;
+const { session, accessToken } = Astro.locals as Required<App.Locals>;
+const perms = session.modules.find((m) => m.code === 'suppliers')?.permissions ?? [];
+if (!perms.includes('read')) return Astro.rewrite('/404');
+const canCreate = perms.includes('create');
+const canDelete = perms.includes('delete');
+const basePath = localePath(locale, '/suppliers');
+const params = Astro.url.searchParams;
+const q = (params.get('q') ?? '').trim().slice(0, 100);
+const showDeleted = canDelete && params.get('deleted') === '1';
+const page = Math.max(1, Number.parseInt(params.get('page') ?? '1', 10) || 1);
+const PAGE_SIZE = 25;
+
+let values = { name: '', phone: '', email: '' };
+let fieldErrors: Record<string, string> = {};
+let duplicate: { id: string; name: string }[] = [];
+let formError: string | undefined;
+let pageError: string | undefined;
+
+const data = Astro.request.method === 'POST' ? await Astro.request.formData() : undefined;
+const intent = data?.get('intent');
+if (data && (intent === 'delete' || intent === 'restore')) {
+  const name = String(data.get('name') ?? '');
+  try {
+    if (!canDelete) throw new ApiError(403, null);
+    if (intent === 'delete') await deleteSupplier(accessToken, String(data.get('id')));
+    else await restoreSupplier(accessToken, String(data.get('id')));
+    const back = new URL(Astro.url);
+    back.searchParams.set(intent === 'delete' ? 'removed' : 'restored', name);
+    return Astro.redirect(back.pathname + back.search, 303);
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    pageError = e.status === 403 ? t.ui.forbidden : t.ui.failed;
+  }
+} else if (data) {
+  values = { name: String(data.get('name') ?? '').trim(), phone: String(data.get('phone') ?? '').trim(), email: String(data.get('email') ?? '').trim() };
+  if (!values.name) fieldErrors.name = s.errors.name;
+  if (!canCreate) formError = t.ui.forbidden;
+  else if (!fieldErrors.name) {
+    try {
+      const created = await createSupplier(accessToken, { name: values.name, phone: values.phone || null, email: values.email || null }, data.has('force'));
+      return Astro.redirect(`${localePath(locale, `/suppliers/${created.id}`)}?created=1`, 303);
+    } catch (e) {
+      if (!(e instanceof ApiError)) throw e;
+      const err = supplierSaveError(e.status, e.body?.detail, s.errors);
+      fieldErrors = err.fields ?? {};
+      duplicate = err.duplicate ?? [];
+      formError = duplicate.length ? fmt(s.duplicate, { names: duplicate.map((d) => d.name).join(', ') }) : Object.keys(fieldErrors).length ? t.ui.formError : t.ui.failed;
+    }
+  }
+  if (Object.keys(fieldErrors).length) formError ??= t.ui.formError;
+  Astro.response.status = 422;
+}
+
+const result = await listSuppliers(accessToken, { q, include_deleted: showDeleted, page, page_size: PAGE_SIZE });
+const day = new Intl.DateTimeFormat(t.intl, { dateStyle: 'medium', timeZone: session.user.timezone });
+const link = (extra: Record<string, string | number>) => {
+  const qp = new URLSearchParams(params);
+  for (const k of ['removed', 'restored']) qp.delete(k);
+  for (const [k, v] of Object.entries(extra)) qp.set(k, String(v));
+  return `${basePath}?${qp}`;
+};
+const removed = params.get('removed');
+const restored = params.get('restored');
+---
+
+<AppLayout title={s.title} current="/suppliers">
+  <header class="ui-header">
+    <div>
+      <h1>{s.title}</h1>
+      {result.total > 0 && <p class="ui-sub num">{result.total === 1 ? s.countOne : fmt(s.count, { n: result.total })}</p>}
+    </div>
+    <div class="ui-actions">
+      {canDelete && <Button variant="tertiary" href={link({ deleted: showDeleted ? '0' : '1', page: 1 })}>{showDeleted ? t.ui.hideDeleted : t.ui.showDeleted}</Button>}
+      {canCreate && <Button icon="plus" data-dialog="new-supplier">{s.newSupplier}</Button>}
+    </div>
+  </header>
+
+  <div class="ui-notices" data-flash={removed || restored ? '' : undefined}>
+    {removed && <Notice tone="success">{fmt(s.deleted, { name: removed })}</Notice>}
+    {restored && <Notice tone="success">{s.restored}</Notice>}
+    {pageError && <Notice tone="error">{pageError}</Notice>}
+  </div>
+
+  {(result.total > 0 || q) && (
+    <form method="get" class="filters" role="search" data-filters>
+      {showDeleted && <input type="hidden" name="deleted" value="1" />}
+      <Field label={s.search} name="q" type="search" value={q} maxlength={100} autocomplete="off" autofocus={!!q} />
+      <Button type="submit" variant="secondary" icon="search">{t.ui.search}</Button>
+    </form>
+  )}
+
+  {
+    result.total === 0 && !q ? (
+      <EmptyState icon="factory" title={s.empty} text={s.emptyText}>
+        {canCreate && <Button icon="plus" data-dialog="new-supplier">{s.newSupplier}</Button>}
+      </EmptyState>
+    ) : result.total === 0 ? (
+      <p class="ui-muted">{s.noResults}</p>
+    ) : (
+      <div class="ui-table-wrap">
+        <table class="ui-table">
+          <thead>
+            <tr>
+              <th scope="col">{s.name}</th><th scope="col">{s.phone}</th><th scope="col">{s.email}</th>
+              <th scope="col" class="ui-end">{s.products}</th><th scope="col">{s.lastPurchase}</th>
+              {canDelete && <th scope="col"><span class="visually-hidden">{t.ui.delete}</span></th>}
+            </tr>
+          </thead>
+          <tbody>
+            {result.items.map((r) => (
+              <tr>
+                <td data-label={s.name}>
+                  <a class="ui-strong" href={localePath(locale, `/suppliers/${r.id}`)}>{r.name}</a>
+                  {r.deleted_at && <Badge tone="error">{t.ui.deletedBadge}</Badge>}
+                </td>
+                <td data-label={s.phone} class="num">{r.phone ? <a href={`tel:${r.phone.replace(/[^\d+]/g, '')}`}>{r.phone}</a> : <span class="ui-muted">—</span>}</td>
+                <td data-label={s.email}>{r.email ? <a href={`mailto:${r.email}`}>{r.email}</a> : <span class="ui-muted">—</span>}</td>
+                <td data-label={s.products} class="ui-end num">{r.products}</td>
+                <td data-label={s.lastPurchase} class="num">{r.last_purchase_at ? day.format(new Date(r.last_purchase_at)) : <span class="ui-muted">{s.never}</span>}</td>
+                {canDelete && (
+                  <td class="ui-row-action ui-end">
+                    <form method="post" data-confirm={r.deleted_at ? undefined : r.products || r.last_purchase_at ? fmt(s.deleteTextUsed, { products: r.products }) : s.deleteText} data-confirm-title={fmt(s.deleteTitle, { name: r.name })}
+                      data-confirm-action={t.ui.delete}>
+                      <input type="hidden" name="id" value={r.id} />
+                      <input type="hidden" name="name" value={r.name} />
+                      <input type="hidden" name="intent" value={r.deleted_at ? 'restore' : 'delete'} />
+                      {r.deleted_at
+                        ? <Button type="submit" variant="tertiary" icon="rotate-ccw">{t.ui.restore}</Button>
+                        : <Button type="submit" variant="danger" icon="trash-2" aria-label={`${t.ui.delete}: ${r.name}`} />}
+                    </form>
+                  </td>
+                )}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    )
+  }
+  {(page > 1 || page * PAGE_SIZE < result.total) && (
+    <nav class="ui-pager">
+      <span class="num">{fmt(t.ui.showing, { n: result.total })}</span>
+      <span class="ui-actions">
+        {page > 1 && <Button variant="secondary" href={link({ page: page - 1 })}>{t.ui.previous}</Button>}
+        {page * PAGE_SIZE < result.total && <Button variant="secondary" href={link({ page: page + 1 })}>{t.ui.next}</Button>}
+      </span>
+    </nav>
+  )}
+
+  {canCreate && (
+    <Dialog id="new-supplier" title={s.newSupplier} closeLabel={t.ui.close} open={!!formError}>
+      <form method="post" class="ui-form" novalidate>
+        <input type="hidden" name="intent" value="create" />
+        {formError && <p class="ui-alert ui-full" role="alert">{formError}</p>}
+        <SupplierFields locale={locale} values={values} errors={fieldErrors} duplicate={duplicate.length > 0} />
+        <div class="ui-form-actions">
+          <Button variant="tertiary" data-dialog-close>{t.ui.cancel}</Button>
+          <Button type="submit">{t.ui.save}</Button>
+        </div>
+      </form>
+    </Dialog>
+  )}
+</AppLayout>
+
+<script>
+  // Filter as you type; the URL keeps the search shareable
+  const form = document.querySelector<HTMLFormElement>('[data-filters]');
+  const search = form?.querySelector<HTMLInputElement>('input[name=q]');
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  search?.addEventListener('input', () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => form!.requestSubmit(), 350);
+  });
+  if (search && document.activeElement === search) search.setSelectionRange(search.value.length, search.value.length);
+  // Notices show once: reloading or sharing the URL shouldn't repeat them
+  if (document.querySelector('[data-flash]')) {
+    const url = new URL(location.href);
+    url.searchParams.delete('removed');
+    url.searchParams.delete('restored');
+    history.replaceState(null, '', url);
+  }
+</script>
+
+<style>
+  .filters {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: var(--space-3);
+    margin-bottom: var(--space-5);
+  }
+  .filters > :global(.field) {
+    flex: 1 1 16rem;
+    max-width: 28rem;
+  }
+</style>

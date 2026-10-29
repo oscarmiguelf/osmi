@@ -1,0 +1,197 @@
+---
+// Services of an appointment, found by typing (a business may offer dozens). Each chosen one posts a hidden
+// service=<id> (with data-minutes for the length); the picker fires "change" when the choice changes.
+import { fmt, money, useTranslations, type Locale } from '@/i18n';
+import type { BookableService } from '@/lib/appointments';
+
+interface Props {
+  locale: Locale;
+  id: string;
+  services: BookableService[];
+  selected: string[];
+  hint?: string;
+}
+
+const { locale, id, services, selected, hint } = Astro.props;
+const t = useTranslations(locale);
+const ap = t.appointments;
+const detail = (sv: BookableService) => [sv.duration && fmt(t.products.minutes, { n: sv.duration }), money(locale, sv.price)].filter(Boolean).join(' · ');
+const items = services.map((sv) => ({ id: sv.id, name: sv.name, minutes: sv.duration ?? 0, detail: detail(sv) }));
+const chosen = items.filter((sv) => selected.includes(sv.id));
+---
+
+<div class="svc-picker" data-service-picker data-items={JSON.stringify(items)} data-remove={t.offline.remove} data-none={t.offline.noResults}>
+  <label class="label" for={id}>{ap.services}</label>
+  <ul class="chosen" role="list" data-chosen>
+    {chosen.map((sv) => (
+      <li>
+        <input type="hidden" name="service" value={sv.id} data-minutes={sv.minutes} />
+        <span>{sv.name}</span><span class="ui-muted ui-small num">{sv.detail}</span>
+        <button type="button" class="remove" aria-label={`${t.offline.remove}: ${sv.name}`} data-remove-service>×</button>
+      </li>
+    ))}
+  </ul>
+  <div class="search">
+    <input id={id} class="ui-input" type="search" autocomplete="off" placeholder={ap.servicesSearch} data-service-search
+      aria-controls={`${id}-matches`} aria-expanded="false" />
+    <ul class="matches" id={`${id}-matches`} role="listbox" hidden data-matches></ul>
+  </div>
+  {hint && <span class="ui-muted ui-small">{hint}</span>}
+</div>
+
+<script>
+  type Item = { id: string; name: string; minutes: number; detail: string };
+  document.querySelectorAll<HTMLElement>('[data-service-picker]').forEach((box) => {
+    const items: Item[] = JSON.parse(box.dataset.items!);
+    const chosen = box.querySelector<HTMLUListElement>('[data-chosen]')!;
+    const search = box.querySelector<HTMLInputElement>('[data-service-search]')!;
+    const matches = box.querySelector<HTMLUListElement>('[data-matches]')!;
+    const picked = () => new Set([...chosen.querySelectorAll<HTMLInputElement>('input[name=service]')].map((i) => i.value));
+    const changed = () => box.dispatchEvent(new Event('change', { bubbles: true }));
+    const el = (tag: string, cls: string, text: string) => Object.assign(document.createElement(tag), { className: cls, textContent: text });
+
+    function add(item: Item) {
+      const li = document.createElement('li');
+      const input = Object.assign(document.createElement('input'), { type: 'hidden', name: 'service', value: item.id });
+      input.dataset.minutes = String(item.minutes);
+      const remove = el('button', 'remove', '×') as HTMLButtonElement;
+      remove.type = 'button';
+      remove.dataset.removeService = '';
+      remove.setAttribute('aria-label', `${box.dataset.remove}: ${item.name}`);
+      li.append(input, el('span', '', item.name), el('span', 'ui-muted ui-small num', item.detail), remove);
+      chosen.append(li);
+      search.value = '';
+      show();
+      changed();
+      search.focus();
+    }
+
+    function show() {
+      const q = search.value.trim().toLowerCase();
+      const have = picked();
+      const found = q ? items.filter((i) => !have.has(i.id) && i.name.toLowerCase().includes(q)).slice(0, 8) : [];
+      matches.replaceChildren(...found.map((item) => {
+        const li = document.createElement('li');
+        const b = el('button', 'match', '') as HTMLButtonElement;
+        b.type = 'button';
+        b.setAttribute('role', 'option');
+        b.append(el('span', '', item.name), el('span', 'ui-muted ui-small num', item.detail));
+        b.addEventListener('click', () => add(item));
+        li.append(b);
+        return li;
+      }));
+      if (q && !found.length) matches.append(el('li', 'ui-muted ui-small none', box.dataset.none!));
+      matches.hidden = !q;
+      search.setAttribute('aria-expanded', String(!!q));
+    }
+
+    search.addEventListener('input', show);
+    search.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { // the first match, not the form's submit
+        e.preventDefault();
+        matches.querySelector<HTMLButtonElement>('button')?.click();
+      } else if (e.key === 'Escape' && search.value) {
+        e.stopPropagation(); // clears the search instead of closing the dialog
+        search.value = '';
+        show();
+      }
+    });
+    chosen.addEventListener('click', (e) => {
+      const b = (e.target as HTMLElement).closest('[data-remove-service]');
+      if (!b) return;
+      b.closest('li')!.remove();
+      show();
+      changed();
+    });
+  });
+</script>
+
+<style>
+  .svc-picker {
+    display: grid;
+    gap: var(--space-1);
+  }
+  .label {
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
+  }
+  .chosen,
+  .matches {
+    display: grid;
+    gap: var(--space-1);
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .chosen:empty {
+    display: none;
+  }
+  /* Rows are also made by the script: :global reaches them */
+  .chosen :global(li) {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-1) var(--space-1) var(--space-1) var(--space-3);
+    background: var(--bg-app);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-control);
+  }
+  .chosen :global(.remove) {
+    width: 2rem;
+    height: 2rem;
+    font-size: 1.25rem;
+    line-height: 1;
+    color: var(--text-muted);
+    background: none;
+    border: 0;
+    border-radius: var(--radius-control);
+    cursor: pointer;
+  }
+  .chosen :global(.remove:hover) {
+    color: var(--status-error-text);
+    background: var(--bg-surface);
+  }
+  .search {
+    position: relative;
+  }
+  .search input {
+    width: 100%;
+  }
+  .matches[hidden] {
+    display: none;
+  }
+  .matches {
+    position: absolute;
+    inset: calc(100% + 2px) 0 auto;
+    z-index: 5;
+    max-height: 16rem;
+    overflow-y: auto;
+    padding: var(--space-1);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-control);
+    box-shadow: 0 6px 18px rgb(0 0 0 / 0.12);
+  }
+  .matches :global(.match) {
+    display: flex;
+    justify-content: space-between;
+    gap: var(--space-3);
+    width: 100%;
+    padding: var(--space-2) var(--space-3);
+    font: inherit;
+    text-align: start;
+    color: var(--text-title);
+    background: none;
+    border: 0;
+    border-radius: var(--radius-control);
+    cursor: pointer;
+  }
+  .matches :global(.match:hover),
+  .matches :global(.match:focus-visible) {
+    background: var(--bg-app);
+  }
+  .matches :global(.none) {
+    padding: var(--space-2) var(--space-3);
+  }
+</style>

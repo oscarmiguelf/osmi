@@ -1,0 +1,334 @@
+---
+// Search-as-you-type picker for one record (a person, a customer). The endpoint returns [{ id, title, subtitle }].
+// The choice travels in a hidden input `name` (and `<name>_label`, so the form can re-render after a server error).
+// Set it from script with: el.dispatchEvent(new CustomEvent('picker:set', { detail: { id, title, subtitle } | null }))
+// Listen to 'picker:choose' to react when the person picks a result.
+import Icon from './Icon.astro';
+
+interface Props {
+  /** id of the search input, for <label for>. */
+  id: string;
+  name: string;
+  endpoint: string;
+  placeholder: string;
+  hint: string;
+  noResults: string;
+  clearLabel: string;
+  /** When set, the form can't be submitted without a choice, and this is the message shown. */
+  requiredMessage?: string;
+  /** ids never offered (e.g. people who already have access). */
+  exclude?: string[];
+  /** Selector inside the form to focus after choosing; defaults to the clear button. */
+  focusAfter?: string;
+  value?: { id: string; title: string; subtitle?: string } | null;
+  autofocus?: boolean;
+}
+
+const { id, name, endpoint, placeholder, hint, noResults, clearLabel, requiredMessage, exclude = [], focusAfter, value,
+  autofocus } = Astro.props;
+---
+
+<div
+  class="picker"
+  data-picker
+  data-endpoint={endpoint}
+  data-exclude={JSON.stringify(exclude)}
+  data-hint={hint}
+  data-no-results={noResults}
+  data-required={requiredMessage}
+  data-focus-after={focusAfter}
+>
+  <input type="hidden" name={name} value={value?.id ?? ''} data-value />
+  <input type="hidden" name={`${name}_label`} value={value?.title ?? ''} data-label />
+  <div class="box search" data-search hidden={!!value}>
+    <Icon name="search" size={18} />
+    <input
+      id={id}
+      type="search"
+      placeholder={placeholder}
+      autocomplete="off"
+      spellcheck="false"
+      aria-describedby={`${id}-status`}
+      aria-controls={`${id}-results`}
+      maxlength={100}
+      autofocus={autofocus}
+    />
+  </div>
+  <div class="box selected" data-selected hidden={!value}>
+    <span class="title" data-title>{value?.title}</span>
+    <span class="subtitle" data-subtitle>{value?.subtitle}</span>
+    <button type="button" class="clear" aria-label={clearLabel} data-clear>
+      <Icon name="x" size={16} />
+    </button>
+  </div>
+  <ul id={`${id}-results`} class="results" role="list" data-results hidden></ul>
+  <p id={`${id}-status`} class="status" aria-live="polite" data-status>{value ? '' : hint}</p>
+</div>
+
+<script>
+  type Item = { id: string; title: string; subtitle?: string };
+
+  document.querySelectorAll<HTMLElement>('[data-picker]').forEach((root) => {
+    const $ = <T extends Element>(sel: string) => root.querySelector<T>(sel)!;
+    const input = $<HTMLInputElement>('input[type=search]');
+    const value = $<HTMLInputElement>('[data-value]');
+    const label = $<HTMLInputElement>('[data-label]');
+    const searchBox = $<HTMLElement>('[data-search]');
+    const selected = $<HTMLElement>('[data-selected]');
+    const results = $<HTMLUListElement>('[data-results]');
+    const status = $<HTMLElement>('[data-status]');
+    const exclude = new Set<string>(JSON.parse(root.dataset.exclude!));
+    const form = root.closest('form');
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let latest = '';
+
+    function set(item: Item | null) {
+      clearTimeout(timer); // a search still on its way must not reopen the results
+      latest = '';
+      value.value = item?.id ?? '';
+      label.value = item?.title ?? '';
+      $('[data-title]').textContent = item?.title ?? '';
+      $('[data-subtitle]').textContent = item?.subtitle ?? '';
+      selected.hidden = !item;
+      searchBox.hidden = !!item;
+      results.hidden = true;
+      input.value = '';
+      status.textContent = item ? '' : root.dataset.hint!;
+    }
+
+    function choose(item: Item) {
+      set(item);
+      root.dispatchEvent(new CustomEvent('picker:choose', { detail: item })); // the whole result, extra fields included
+      const next = root.dataset.focusAfter && form?.querySelector<HTMLElement>(root.dataset.focusAfter);
+      (next || $<HTMLElement>('[data-clear]')).focus();
+    }
+
+    async function search(q: string) {
+      latest = q;
+      const url = new URL(root.dataset.endpoint!, location.origin); // the endpoint may already carry params (?mode=...)
+      url.searchParams.set('q', q);
+      // A slow answer shows the shape of the results (fast ones never flash it)
+      const slow = setTimeout(() => {
+        if (q !== latest) return;
+        results.replaceChildren(...[0, 1, 2].map(() => {
+          const li = document.createElement('li');
+          li.className = 'result-skeleton';
+          li.setAttribute('aria-hidden', 'true');
+          li.innerHTML = '<span class="ui-skel"></span><span class="ui-skel"></span>';
+          return li;
+        }));
+        results.hidden = false;
+        results.setAttribute('aria-busy', 'true');
+      }, 150);
+      const res = await fetch(url).catch(() => undefined);
+      clearTimeout(slow);
+      results.removeAttribute('aria-busy');
+      const items: Item[] = res?.ok ? await res.json() : [];
+      if (q !== latest) return; // a newer search is on its way
+      const shown = items.filter((item) => !exclude.has(item.id));
+      results.replaceChildren(
+        ...shown.map((item) => {
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.className = 'result';
+          const title = document.createElement('span');
+          title.className = 'result-title';
+          title.textContent = item.title;
+          const subtitle = document.createElement('span');
+          subtitle.className = 'result-subtitle';
+          subtitle.textContent = item.subtitle ?? '';
+          button.append(title, subtitle);
+          button.addEventListener('click', () => choose(item));
+          const li = document.createElement('li');
+          li.append(button);
+          return li;
+        }),
+      );
+      results.hidden = shown.length === 0;
+      status.textContent = shown.length === 0 ? root.dataset.noResults! : '';
+    }
+
+    input.addEventListener('input', () => {
+      clearTimeout(timer);
+      const q = input.value.trim();
+      if (q.length < 2) {
+        latest = '';
+        results.hidden = true;
+        status.textContent = root.dataset.hint!;
+        return;
+      }
+      timer = setTimeout(() => search(q), 200);
+    });
+
+    $('[data-clear]').addEventListener('click', () => {
+      set(null);
+      input.focus();
+    });
+
+    root.addEventListener('picker:set', (e) => set((e as CustomEvent<Item | null>).detail));
+
+    // Arrow keys move between the search box and the results
+    root.addEventListener('keydown', (e) => {
+      if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+      const items = [...results.querySelectorAll<HTMLButtonElement>('.result')];
+      if (results.hidden || items.length === 0) return;
+      const index = items.indexOf(document.activeElement as HTMLButtonElement);
+      if (document.activeElement !== input && index === -1) return;
+      e.preventDefault();
+      const next = e.key === 'ArrowDown' ? index + 1 : index - 1;
+      (next < 0 ? input : items[Math.min(next, items.length - 1)]).focus();
+    });
+
+    if (root.dataset.required) {
+      form?.addEventListener('submit', (e) => {
+        if (value.value) return;
+        e.preventDefault();
+        status.textContent = root.dataset.required!;
+        input.focus();
+      });
+    }
+  });
+</script>
+
+<style>
+  .picker {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--space-2);
+  }
+
+  .box {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    min-height: var(--control-height);
+    padding: 0 var(--space-1) 0 var(--space-3);
+    background: var(--bg-input);
+    border: 1px solid var(--border-input);
+    border-radius: var(--radius-control);
+  }
+
+  .box[hidden],
+  .results[hidden] {
+    display: none;
+  }
+
+  .search :global(svg) {
+    flex-shrink: 0;
+    color: var(--text-muted);
+  }
+
+  .search:focus-within {
+    border-color: var(--color-primary);
+    box-shadow: 0 0 0 3px var(--focus-ring);
+  }
+
+  .search input {
+    flex: 1;
+    min-width: 0;
+    padding: 0; /* the box sets the height: same as every other control */
+    background: none;
+    border: 0;
+    outline: none;
+  }
+
+  .selected {
+    background: color-mix(in srgb, var(--color-primary) 6%, var(--bg-app));
+    border-color: var(--color-primary);
+  }
+
+  .title {
+    color: var(--text-title);
+    font-weight: var(--weight-bold);
+    white-space: nowrap;
+  }
+
+  .subtitle {
+    flex: 1;
+    overflow: hidden;
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .clear {
+    display: grid;
+    flex-shrink: 0;
+    place-items: center;
+    width: 2rem;
+    height: 2rem;
+    background: none;
+    border: 0;
+    border-radius: var(--radius-control);
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+
+  .clear:hover {
+    background: var(--color-primary-tint);
+    color: var(--color-primary);
+  }
+
+  .results {
+    display: grid;
+    gap: 2px;
+    max-height: 13rem;
+    overflow-y: auto;
+    padding: var(--space-1);
+    background: var(--bg-app);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-control);
+    box-shadow: var(--shadow-overlay);
+    list-style: none;
+  }
+
+  .results :global(.result) {
+    display: grid;
+    width: 100%;
+    padding: var(--space-2) var(--space-3);
+    background: none;
+    border: 0;
+    border-radius: var(--radius-control);
+    text-align: start;
+    cursor: pointer;
+  }
+
+  .results :global(.result:hover),
+  .results :global(.result:focus-visible) {
+    background: var(--color-primary-tint);
+    outline: none;
+  }
+
+  .results :global(.result-title) {
+    color: var(--text-title);
+    font-weight: var(--weight-bold);
+  }
+
+  .results :global(.result-subtitle) {
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+  }
+
+  .results :global(.result-skeleton) {
+    display: grid;
+    gap: var(--space-1);
+    padding: var(--space-2) var(--space-3);
+  }
+  .results :global(.result-skeleton .ui-skel:first-child) {
+    width: 60%;
+  }
+  .results :global(.result-skeleton .ui-skel:last-child) {
+    width: 35%;
+    height: 0.75em;
+  }
+
+  .status {
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+  }
+
+  .status:empty {
+    display: none;
+  }
+</style>
